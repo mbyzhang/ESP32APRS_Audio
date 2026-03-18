@@ -651,7 +651,11 @@ void I2S_Init(i2s_mode_t MODE, i2s_bits_per_sample_t BPS)
   adc_set_i2s_data_len(ADC_UNIT_1, 1);
 
   i2s_set_pin(I2S_NUM_0, NULL);
+#ifdef KV4P_HT
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN); // IO25
+#else
   i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN); // IO26
+#endif
   i2s_zero_dma_buffer(I2S_NUM_0);
   // i2s_start(I2S_NUM_0);
   //  dac_output_enable(DAC_CHANNEL_1);

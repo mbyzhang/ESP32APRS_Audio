@@ -8,6 +8,7 @@
 */
 
 #include <Arduino.h>
+#include <driver/dac.h>
 #include <esp_task_wdt.h>
 #include "main.h"
 #include <LibAPRSesp.h>
@@ -1421,7 +1422,7 @@ void defaultConfig()
     config.mic = 8;
     config.modem_type = 1;
 
-#ifdef ESP32C3_MINI
+#if defined(ESP32C3_MINI)
     // config.wifi_power = 74;
     config.rf_tx_gpio = -1;
     config.rf_rx_gpio = -1;
@@ -1433,6 +1434,20 @@ void defaultConfig()
     config.rf_pd_active = 1;
     config.rf_pwr_active = 1;
     config.rf_ptt_active = 0;
+#elif defined(KV4P_HT)
+    config.rf_tx_gpio = 17;
+    config.rf_rx_gpio = 16;
+    config.rf_sql_gpio = 4;
+    config.rf_pd_gpio = 19;
+    config.rf_pwr_gpio = -1;
+    config.rf_ptt_gpio = 18;
+    config.rf_sql_active = 0;
+    config.rf_pd_active = 1;
+    config.rf_pwr_active = 1;
+    config.rf_ptt_active = 0;
+    config.adc_gpio = 34;
+    config.dac_gpio = 25;
+    config.adc_atten = 4;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
     config.rf_tx_gpio = 17;
     config.rf_rx_gpio = 18;
@@ -7521,6 +7536,10 @@ void taskAPRSPoll(void *pvParameters)
 
     // afskSetDCOffset(config.adc_dc_offset);
     afskSetADCAtten(config.adc_atten);
+#ifdef KV4P_HT
+    dac_output_enable(DAC_CHANNEL_2);  // GPIO26 (DAC1)
+    dac_output_voltage(DAC_CHANNEL_2, (255.0 / 3.3) * 1.75);
+#endif
 
 #ifdef STRIP_PIN
     AFSK_init(config.adc_gpio, config.dac_gpio, config.rf_ptt_gpio, config.rf_sql_gpio, config.rf_pwr_gpio, -1, -1, STRIP_PIN, config.rf_ptt_active, config.rf_sql_active, config.rf_pwr_active);
