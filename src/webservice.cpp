@@ -12761,14 +12761,25 @@ void handle_app_commit(AsyncWebServerRequest *request)
 	serveAppAsset(request, "/app/commit.txt", "text/plain");
 }
 
+void handle_legacy_index(AsyncWebServerRequest *request)
+{
+	serveAppAsset(request, "/legacy/index.html", "text/html");
+}
+
+void handle_legacy_commit(AsyncWebServerRequest *request)
+{
+	serveAppAsset(request, "/legacy/commit.txt", "text/plain");
+}
+
 void handle_legacy_route(AsyncWebServerRequest *request)
 {
-	if (!ensureWebAuth(request))
+	const String url = request->url();
+	if (!(url == "/legacy" || url == "/legacy/"))
+	{
+		request->send(404, "text/plain", "Not found");
 		return;
-	AsyncWebServerResponse *response = request->beginResponse(302);
-	response->addHeader("Location", "/app/");
-	response->addHeader("Cache-Control", "no-store");
-	request->send(response);
+	}
+	handle_legacy_index(request);
 }
 
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -12885,6 +12896,10 @@ void webService()
 					{ handle_app_commit(request); });
 	async_server.on("/app", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_app_root(request); });
+	async_server.on("/legacy/index.html", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_legacy_index(request); });
+	async_server.on("/legacy/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_legacy_commit(request); });
 	async_server.on("/legacy", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_legacy_route(request); });
 	async_server.on("/legacy/", HTTP_GET, [](AsyncWebServerRequest *request)

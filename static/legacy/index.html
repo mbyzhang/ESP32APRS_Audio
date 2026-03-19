@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>ESP32 APRS Audio - Legacy</title>
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .legacy-wrap { max-width: 980px; margin: 0 auto; padding: 12px; }
+    .legacy-card { background: #fff; border: 1px solid #9dc3d9; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    .legacy-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .legacy-btn { border: 1px solid #0f7cb0; border-radius: 8px; padding: 7px 10px; background: linear-gradient(180deg,#1692cf 0%,#0d6f9f 100%); color: #fff; cursor: pointer; }
+    .legacy-note { font-size: 12px; color: #415f72; margin: 0; }
+    pre { margin: 10px 0 0; padding: 10px; border: 1px solid #b7d3e2; border-radius: 8px; background: #f7fbfe; overflow-x: auto; font-size: 12px; }
+  </style>
+  <script src="/jquery-3.7.1.js"></script>
+</head>
+<body>
+  <div class="legacy-wrap">
+    <div class="legacy-card">
+      <h2>Legacy UI (Static Safe Mode)</h2>
+      <p class="legacy-note">This page is served from LittleFS static files to avoid heap spikes from dynamic HTML generation.</p>
+      <p class="legacy-note">Build: <span id="buildCommit">unknown</span></p>
+      <p class="legacy-note">Legacy dynamic HTML has been moved out of firmware RAM paths for stability on ESP32 without PSRAM.</p>
+      <div class="legacy-row">
+        <button class="legacy-btn" id="goModern">Open Modern UI</button>
+        <button class="legacy-btn" id="refreshStatus">Refresh Status</button>
+      </div>
+      <pre id="statusDump">Loading status...</pre>
+    </div>
+  </div>
+  <script>
+    (() => {
+      const statusDump = document.getElementById("statusDump");
+      const refreshStatus = () => {
+        fetch("/api/status", { cache: "no-store" })
+          .then((r) => r.ok ? r.json() : Promise.reject(new Error("status fetch failed")))
+          .then((j) => { statusDump.textContent = JSON.stringify(j, null, 2); })
+          .catch((e) => { statusDump.textContent = `Status unavailable: ${e.message}`; });
+      };
+      document.getElementById("goModern").addEventListener("click", () => { location.href = "/app/"; });
+      document.getElementById("refreshStatus").addEventListener("click", refreshStatus);
+      refreshStatus();
+      fetch("/legacy/commit.txt", { cache: "no-store" })
+        .then((r) => r.ok ? r.text() : "")
+        .then((t) => {
+          const c = (t || "").trim();
+          if (c && !c.startsWith("<")) document.getElementById("buildCommit").textContent = c;
+        })
+        .catch(() => {});
+    })();
+  </script>
+</body>
+</html>

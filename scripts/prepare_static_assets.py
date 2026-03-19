@@ -7,8 +7,8 @@ import subprocess
 
 
 PROJECT_DIR = Path(env["PROJECT_DIR"])
-STATIC_APP_DIR = PROJECT_DIR / "static" / "app"
-DATA_APP_DIR = PROJECT_DIR / "data" / "app"
+STATIC_DIR = PROJECT_DIR / "static"
+DATA_DIR = PROJECT_DIR / "data"
 
 
 def _gzip_file(src_path: Path, dst_path: Path) -> None:
@@ -42,30 +42,52 @@ def _read_git_commit() -> str:
     return sha
 
 
-def _prepare_static_assets(*_args, **_kwargs) -> None:
-    DATA_APP_DIR.mkdir(parents=True, exist_ok=True)
+def _sync_static_subdir(subdir: str, commit_text: str) -> int:
+    src_dir = STATIC_DIR / subdir
+    if not src_dir.exists():
+        return 0
 
-    if not STATIC_APP_DIR.exists():
-        print("[static] static/app not found; skipping asset prep")
+    dst_dir = DATA_DIR / subdir
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for src_file in sorted(p for p in src_dir.rglob("*") if p.is_file()):
+        rel = src_file.relative_to(src_dir)
+        dst_file = dst_dir / rel
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dst_file)
+        _gzip_file(dst_file, dst_file.with_name(dst_file.name + ".gz"))
+        count += 1
+
+    commit_file = dst_dir / "commit.txt"
+    commit_file.write_text(commit_text, encoding="utf-8")
+    _gzip_file(commit_file, dst_dir / "commit.txt.gz")
+    return count
+
+
+def _prepare_static_assets(*_args, **_kwargs) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not STATIC_DIR.exists():
+        print("[static] static directory not found; skipping asset prep")
         return
 
-    source_files = sorted(p for p in STATIC_APP_DIR.iterdir() if p.is_file())
-
-    for old in DATA_APP_DIR.iterdir():
-        if old.is_file():
-            old.unlink()
-
-    for src_file in source_files:
-        dst_file = DATA_APP_DIR / src_file.name
-        shutil.copy2(src_file, dst_file)
-        _gzip_file(dst_file, DATA_APP_DIR / f"{src_file.name}.gz")
-
     commit_text = _read_git_commit() + "\n"
-    commit_file = DATA_APP_DIR / "commit.txt"
-    commit_file.write_text(commit_text, encoding="utf-8")
-    _gzip_file(commit_file, DATA_APP_DIR / "commit.txt.gz")
+    total_files = 0
+    synced = []
+    for subdir in ("app", "legacy"):
+        copied = _sync_static_subdir(subdir, commit_text)
+        if copied > 0:
+            synced.append(subdir)
+            total_files += copied
 
-    print(f"[static] prepared {len(source_files)} assets + commit.txt ({commit_text.strip()})")
+    if not synced:
+        print("[static] no static subdirectories (app/legacy) found; skipping asset prep")
+        return
+
+    print(f"[static] prepared {total_files} assets in {','.join(synced)} + commit.txt ({commit_text.strip()})")
 
 
 env.AddPreAction("buildprog", _prepare_static_assets)
