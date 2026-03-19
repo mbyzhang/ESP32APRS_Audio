@@ -18,9 +18,9 @@ def _parse_dotenv(path):
     return values
 
 
-def _c_string_literal(value):
+def _cpp_define_string(name, value):
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return f'{name}=\\"{escaped}\\"'
 
 
 project_dir = env.subst("$PROJECT_DIR")
@@ -36,13 +36,13 @@ if os.path.isfile(dotenv_path):
 
     defines = []
     if sta_ssid:
-        defines.append(("DEFAULT_WIFI_STA_SSID", _c_string_literal(sta_ssid)))
+        defines.append(_cpp_define_string("DEFAULT_WIFI_STA_SSID", sta_ssid))
     if sta_pass:
-        defines.append(("DEFAULT_WIFI_STA_PASS", _c_string_literal(sta_pass)))
+        defines.append(_cpp_define_string("DEFAULT_WIFI_STA_PASS", sta_pass))
     if ap_ssid:
-        defines.append(("DEFAULT_WIFI_AP_SSID", _c_string_literal(ap_ssid)))
+        defines.append(_cpp_define_string("DEFAULT_WIFI_AP_SSID", ap_ssid))
     if ap_pass:
-        defines.append(("DEFAULT_WIFI_AP_PASS", _c_string_literal(ap_pass)))
+        defines.append(_cpp_define_string("DEFAULT_WIFI_AP_PASS", ap_pass))
 
     if defines:
         env.Append(CPPDEFINES=defines)
