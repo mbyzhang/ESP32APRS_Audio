@@ -238,7 +238,7 @@ extern volatile int8_t dacEn;
 extern volatile bool pttOff;
 extern volatile uint32_t adcIsrCount;
 extern volatile int fifoSampleCount;
-extern volatile uint32_t frameDecodeCount;
+// extern volatile uint32_t frameDecodeCount;
 
 long timeNetwork, timeAprs, timeGui;
 long autoResetTimeout = 0;
@@ -3228,11 +3228,11 @@ void setup()
     pinMode(LED_TX, OUTPUT);
 
     // Set up serial port
-#ifdef CORE_DEBUG_LEVEL
+// #ifdef CORE_DEBUG_LEVEL
     Serial.begin(115200); // debug
-#else
-    Serial.begin(9600); // monitor
-#endif
+// #else
+//     Serial.begin(9600); // monitor
+// #endif
 
     if (!LITTLEFS.begin(FORMAT_LITTLEFS_IF_FAILED))
     {
@@ -6168,7 +6168,7 @@ void taskAPRS(void *pvParameters)
         {
             setPtt(false);
             pttOff = false;
-            log_i("[TX-END] PTT released, fifo=%d frames=%u", fifoSampleCount, frameDecodeCount);
+            log_i("[TX-END] PTT released, fifo=%d", fifoSampleCount);
         }
         long now = millis();
         // wdtSensorTimer = now;
