@@ -307,6 +307,7 @@ EspSoftwareSerial::UART SerialRF;
 
 bool firstGpsTime = true;
 time_t startTime = 0;
+volatile bool rfModuleReinitPending = false;
 
 #ifdef BLUETOOTH
 #if !defined(CONFIG_IDF_TARGET_ESP32)
@@ -2678,15 +2679,19 @@ bool pkgTxSend()
                     {
                         if ((config.rf_type == RF_SR_1WV) || (config.rf_type == RF_SR_1WU) || (config.rf_type == RF_SR_1W350))
                         {
-                            digitalWrite(config.rf_pwr_gpio, LOW);
-                            if (config.rf_power ^ !config.rf_pwr_active)
-                                pinMode(config.rf_pwr_gpio, OPEN_DRAIN);
-                            else
-                                pinMode(config.rf_pwr_gpio, OUTPUT);
+                            if (config.rf_pwr_gpio >= 0)
+                            {
+                                digitalWrite(config.rf_pwr_gpio, LOW);
+                                if (config.rf_power ^ !config.rf_pwr_active)
+                                    pinMode(config.rf_pwr_gpio, OPEN_DRAIN);
+                                else
+                                    pinMode(config.rf_pwr_gpio, OUTPUT);
+                            }
                         }
                         else
                         {
-                            digitalWrite(config.rf_pwr_gpio, config.rf_power ^ !config.rf_pwr_active); // ON RF Power H/L
+                            if (config.rf_pwr_gpio >= 0)
+                                digitalWrite(config.rf_pwr_gpio, config.rf_power ^ !config.rf_pwr_active); // ON RF Power H/L
                         }
                     }
                     status.txCount++;
@@ -2886,10 +2891,17 @@ String FRS_getVERSION()
 
 unsigned long SA818_Timeout = 0;
 
+void requestRFModuleReinit()
+{
+    rfModuleReinitPending = true;
+}
+
 void RF_MODULE_SLEEP()
 {
-    digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
-    digitalWrite(config.rf_pd_gpio, LOW);
+    if (config.rf_pwr_gpio >= 0)
+        digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
+    if (config.rf_pd_gpio >= 0)
+        digitalWrite(config.rf_pd_gpio, LOW);
     // PMU.disableDC3();
 }
 
@@ -2952,8 +2964,11 @@ void RF_MODULE(bool boot)
     //! DC3 Radio & Pixels VDD , Don't change
     // PMU.setDC3Voltage(3400);
     // PMU.disableDC3();
-    pinMode(config.rf_pwr_gpio, OUTPUT);
-    digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active); // RF POWER LOW
+    if (config.rf_pwr_gpio >= 0)
+    {
+        pinMode(config.rf_pwr_gpio, OUTPUT);
+        digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active); // RF POWER LOW
+    }
 
     // pinMode(config.rf_ptt_gpio, OUTPUT);
     // digitalWrite(config.rf_ptt_gpio, !config.rf_ptt_active); // PTT HIGH
@@ -3114,8 +3129,10 @@ void RF_MODULE_CHECK()
     else
     {
         log_d("RF Module %s sleep", RF_TYPE[config.rf_type]);
-        digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
-        digitalWrite(config.rf_pd_gpio, LOW);
+        if (config.rf_pwr_gpio >= 0)
+            digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
+        if (config.rf_pd_gpio >= 0)
+            digitalWrite(config.rf_pd_gpio, LOW);
         delay(500);
         RF_MODULE(true);
     }
@@ -4814,6 +4831,12 @@ void msgBox(String msg)
 
 void loop()
 {
+    if (rfModuleReinitPending)
+    {
+        rfModuleReinitPending = false;
+        RF_MODULE(false);
+    }
+
     if (millis() > timeTask)
     {
         timeTask = millis() + 10000;

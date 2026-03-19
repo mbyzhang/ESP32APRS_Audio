@@ -445,5 +445,6 @@ void wifiDisp();
 void sensorDisp();
 void convertSecondsToDHMS(char *dmhs,unsigned long totalSeconds);
 void wifiConnection();
+void requestRFModuleReinit();
 
 #endif

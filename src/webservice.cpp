@@ -2218,18 +2218,17 @@ void handle_radio(AsyncWebServerRequest *request)
 		config.rf_en = radioEnable;
 		// Using dynamic memory allocation instead of String
 		char *html = allocateStringMemory(64); // Small buffer for "OK"
-		if (html)
-		{
-			strcpy(html, "OK");
-			request->send(200, "text/html", html); // send to someones browser when asked
-			free(html);							   // Free the allocated memory
+			if (html)
+			{
+				strcpy(html, "OK");
+				request->send(200, "text/html", html); // send to someones browser when asked
+				free(html);							   // Free the allocated memory
+			}
+			saveConfiguration("/default.cfg", config);
+			requestRFModuleReinit();
 		}
-		saveConfiguration("/default.cfg", config);
-		delay(500);
-		RF_MODULE(false);
-	}
-	else if (request->hasArg("commitTNC"))
-	{
+		else if (request->hasArg("commitTNC"))
+		{
 		bool hpf = 0;
 		bool lpf = 0;
 		for (uint8_t i = 0; i < request->args(); i++)
