@@ -13,11 +13,16 @@
 #include "wireguard_vpn.h"
 #include <LibAPRSesp.h>
 #include <parse_aprs.h>
+#include "AFSK.h"
 #include "jquery_min_js.h"
 #include <ESPCPUTemp.h>
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include <memory>
+#if defined(CONFIG_IDF_TARGET_ESP32)
+#include <driver/dac.h>
+#endif
 
 extern SemaphoreHandle_t psramMutex;
 extern bool psramLock(TickType_t timeout = portMAX_DELAY);
@@ -161,6 +166,107 @@ static constexpr size_t AUDIO_MONITOR_CHUNK = 320; // 40ms at 8kHz
 static uint8_t audioMonitorBuffer[AUDIO_MONITOR_CHUNK];
 static size_t audioMonitorBufferLen = 0;
 static uint32_t audioMonitorAccumulator = 0;
+
+static constexpr uint16_t AUDIO_TX_RATE = 8000;
+static constexpr size_t AUDIO_TX_BUFFER_SIZE = 16384;
+static uint8_t audioTxBuffer[AUDIO_TX_BUFFER_SIZE];
+static volatile size_t audioTxHead = 0;
+static volatile size_t audioTxTail = 0;
+static portMUX_TYPE audioTxMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool audioTxPttActive = false;
+static volatile uint32_t audioTxOwnerId = 0;
+static TaskHandle_t taskAudioTxHandle = nullptr;
+
+static inline int16_t muLawToLinear(uint8_t uVal)
+{
+	uVal = static_cast<uint8_t>(~uVal);
+	const uint8_t sign = uVal & 0x80;
+	const uint8_t exponent = (uVal >> 4) & 0x07;
+	const uint8_t mantissa = uVal & 0x0F;
+	int16_t sample = static_cast<int16_t>(((mantissa << 3) + 0x84) << exponent);
+	sample = static_cast<int16_t>(sample - 0x84);
+	return sign ? -sample : sample;
+}
+
+static inline void audioTxClearBuffer()
+{
+	portENTER_CRITICAL(&audioTxMux);
+	audioTxHead = 0;
+	audioTxTail = 0;
+	portEXIT_CRITICAL(&audioTxMux);
+}
+
+static inline bool audioTxPopSample(uint8_t &sample)
+{
+	bool ok = false;
+	portENTER_CRITICAL(&audioTxMux);
+	if (audioTxTail != audioTxHead)
+	{
+		sample = audioTxBuffer[audioTxTail];
+		audioTxTail = (audioTxTail + 1) % AUDIO_TX_BUFFER_SIZE;
+		ok = true;
+	}
+	portEXIT_CRITICAL(&audioTxMux);
+	return ok;
+}
+
+static inline void audioTxPushSamples(const uint8_t *data, size_t len)
+{
+	if (data == nullptr || len == 0)
+		return;
+
+	portENTER_CRITICAL(&audioTxMux);
+	for (size_t i = 0; i < len; ++i)
+	{
+		const size_t nextHead = (audioTxHead + 1) % AUDIO_TX_BUFFER_SIZE;
+		if (nextHead == audioTxTail)
+		{
+			audioTxTail = (audioTxTail + 1) % AUDIO_TX_BUFFER_SIZE; // drop oldest
+		}
+		audioTxBuffer[audioTxHead] = data[i];
+		audioTxHead = nextHead;
+	}
+	portEXIT_CRITICAL(&audioTxMux);
+}
+
+void taskAudioTx(void *pvParameters)
+{
+#if defined(CONFIG_IDF_TARGET_ESP32)
+	dac_output_enable(DAC_CHAN_1);
+	dac_output_voltage(DAC_CHAN_1, 128);
+#endif
+	int64_t nextUs = esp_timer_get_time();
+	for (;;)
+	{
+		if (!audioTxPttActive)
+		{
+			vTaskDelay(pdMS_TO_TICKS(5));
+			nextUs = esp_timer_get_time();
+			continue;
+		}
+
+		uint8_t ulaw = 0xFF; // silence
+		(void)audioTxPopSample(ulaw);
+		const int16_t pcm = muLawToLinear(ulaw);
+		const uint8_t dacSample = static_cast<uint8_t>((static_cast<int32_t>(pcm) + 32768) >> 8);
+#if defined(CONFIG_IDF_TARGET_ESP32)
+		dac_output_voltage(DAC_CHAN_1, dacSample);
+#else
+		(void)dacSample;
+#endif
+
+		nextUs += (1000000 / AUDIO_TX_RATE);
+		const int64_t nowUs = esp_timer_get_time();
+		if (nextUs > nowUs)
+		{
+			delayMicroseconds(static_cast<uint32_t>(nextUs - nowUs));
+		}
+		else
+		{
+			nextUs = nowUs;
+		}
+	}
+}
 
 static inline int16_t clampToInt16(int32_t value)
 {
@@ -11623,29 +11729,38 @@ void handle_audio(AsyncWebServerRequest *request)
 	}
 
 	const char *audioPage = R"HTML(
-<div style="max-width:860px;margin:auto;">
-<table>
-<th colspan="2"><span><b>Browser Audio Monitor</b></span></th>
-<tr><td align="right"><b>Status:</b></td><td align="left"><span id="audioStatus" style="color:#c0392b;font-weight:600;">Stopped</span></td></tr>
-<tr><td align="right"><b>Listen:</b></td><td align="left">
-<button class="button" id="audioToggleBtn" type="button">Start Listening</button>
-<button class="button" id="audioMuteBtn" type="button">Mute</button>
-</td></tr>
+	<div style="max-width:860px;margin:auto;">
+	<table>
+	<th colspan="2"><span><b>Browser RX/TX Audio</b></span></th>
+	<tr><td align="right"><b>Status:</b></td><td align="left"><span id="audioStatus" style="color:#c0392b;font-weight:600;">Stopped</span></td></tr>
+	<tr><td align="right"><b>Listen:</b></td><td align="left">
+	<button class="button" id="audioToggleBtn" type="button">Start Listening</button>
+	<button class="button" id="audioMuteBtn" type="button">Mute</button>
+	</td></tr>
 <tr><td align="right"><b>Volume:</b></td><td align="left"><input id="audioVolume" type="range" min="0" max="100" value="70" style="width:260px;"> <span id="audioVolumeValue">70%</span></td></tr>
 <tr><td align="right"><b>Buffer:</b></td><td align="left"><span id="audioQueue">0 ms</span></td></tr>
 <tr><td align="right"><b>Level:</b></td><td align="left">
 <div style="width:300px;height:12px;border:1px solid #888;border-radius:10px;overflow:hidden;background:#f1f1f1;">
 <div id="audioLevelBar" style="height:100%;width:0%;background:linear-gradient(90deg,#2ecc71,#f1c40f,#e74c3c);transition:width .08s linear;"></div>
-</div>
-</td></tr>
-<tr><td align="right"><b>Format:</b></td><td align="left"><span id="audioCodec">8kHz mu-law mono</span></td></tr>
-</table>
-<div style="font-size:9pt;color:#555;margin-top:8px;">
-Open this tab and click <b>Start Listening</b> to monitor RX audio in your browser.
-</div>
-</div>
-<script type="text/javascript">
-(function(){
+	</div>
+	</td></tr>
+	<tr><td align="right"><b>Format:</b></td><td align="left"><span id="audioCodec">8kHz mu-law mono</span></td></tr>
+	<tr><td align="right"><b>Audio RX/TX:</b></td><td align="left">
+	RX <input id="audioFreqRx" type="number" min="100" max="1000" step="0.0001" style="width:120px;"> MHz
+	TX <input id="audioFreqTx" type="number" min="100" max="1000" step="0.0001" style="width:120px;"> MHz
+	<button class="button" id="audioFreqApplyBtn" type="button">Apply</button>
+	</td></tr>
+	<tr><td align="right"><b>TX Mic:</b></td><td align="left"><span id="audioMicStatus" style="font-weight:600;color:#7f8c8d;">Idle</span></td></tr>
+	</table>
+	<div style="margin-top:12px;">
+	<button id="audioPttBtn" type="button" style="width:100%;height:140px;font-size:38px;font-weight:800;border-radius:14px;border:2px solid #922;background:#c0392b;color:#fff;">HOLD TO TALK</button>
+	</div>
+	<div style="font-size:9pt;color:#555;margin-top:8px;">
+	Press and hold PTT to transmit browser microphone audio. Release to stop TX.
+	</div>
+	</div>
+	<script type="text/javascript">
+	(function(){
   if (window.__audioMonitor && typeof window.__audioMonitor.stop === "function") {
     window.__audioMonitor.stop();
   }
@@ -11656,39 +11771,70 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     ws: null,
     audioCtx: null,
     gainNode: null,
-    procNode: null,
-    queue: [],
-    queueOffset: 0,
-    queuedSamples: 0,
-    sampleRate: 8000,
+	    procNode: null,
+	    queue: [],
+	    queueOffset: 0,
+	    queuedSamples: 0,
+	    sampleRate: 8000,
     currentSample: 0,
-    resampleAcc: 0,
-    level: 0
-  };
+	    resampleAcc: 0,
+	    level: 0,
+	    txActive: false,
+	    micStream: null,
+	    micCtx: null,
+	    micSrc: null,
+	    micProc: null,
+	    micMute: null
+	  };
 
   const elStatus = document.getElementById("audioStatus");
   const elToggle = document.getElementById("audioToggleBtn");
   const elMute = document.getElementById("audioMuteBtn");
   const elVol = document.getElementById("audioVolume");
   const elVolVal = document.getElementById("audioVolumeValue");
-  const elQueue = document.getElementById("audioQueue");
-  const elLevel = document.getElementById("audioLevelBar");
-  const elCodec = document.getElementById("audioCodec");
+	  const elQueue = document.getElementById("audioQueue");
+	  const elLevel = document.getElementById("audioLevelBar");
+	  const elCodec = document.getElementById("audioCodec");
+	  const elFreqRx = document.getElementById("audioFreqRx");
+	  const elFreqTx = document.getElementById("audioFreqTx");
+	  const elFreqApply = document.getElementById("audioFreqApplyBtn");
+	  const elPtt = document.getElementById("audioPttBtn");
+	  const elMic = document.getElementById("audioMicStatus");
 
-  function setStatus(txt, color) {
-    elStatus.textContent = txt;
-    elStatus.style.color = color || "#2c3e50";
-  }
+	  function setStatus(txt, color) {
+	    elStatus.textContent = txt;
+	    elStatus.style.color = color || "#2c3e50";
+	  }
 
-  function mulawToLinear(uVal) {
-    uVal = (~uVal) & 0xFF;
-    const sign = uVal & 0x80;
+	  function setMicStatus(txt, color) {
+	    elMic.textContent = txt;
+	    elMic.style.color = color || "#7f8c8d";
+	  }
+
+	  function mulawToLinear(uVal) {
+	    uVal = (~uVal) & 0xFF;
+	    const sign = uVal & 0x80;
     const exponent = (uVal >> 4) & 0x07;
     const mantissa = uVal & 0x0F;
     let sample = ((mantissa << 3) + 0x84) << exponent;
-    sample -= 0x84;
-    return sign ? -sample : sample;
-  }
+	    sample -= 0x84;
+	    return sign ? -sample : sample;
+	  }
+
+	  function linearToMulaw(v) {
+	    let pcm = Math.max(-1, Math.min(1, v));
+	    pcm = (pcm * 32767) | 0;
+	    let sign = (pcm < 0) ? 0x80 : 0;
+	    if (pcm < 0) pcm = -pcm;
+	    if (pcm > 32635) pcm = 32635;
+	    pcm += 0x84;
+	    let exponent = 7;
+	    for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; expMask >>= 1) {
+	      exponent--;
+	    }
+	    const mantissa = (pcm >> (exponent + 3)) & 0x0F;
+	    return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
+	  }
 
   function setVolume(vol) {
     const gain = Math.max(0, Math.min(1, vol));
@@ -11742,14 +11888,19 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     setVolume(parseInt(elVol.value, 10) / 100.0);
   }
 
-  function stop() {
-    monitor.running = false;
-    elToggle.textContent = "Start Listening";
-    setStatus("Stopped", "#c0392b");
-    if (monitor.ws) {
-      monitor.ws.onopen = null;
-      monitor.ws.onclose = null;
-      monitor.ws.onmessage = null;
+	  function stop() {
+	    monitor.running = false;
+	    elToggle.textContent = "Start Listening";
+	    setStatus("Stopped", "#c0392b");
+	    monitor.txActive = false;
+	    elPtt.style.background = "#c0392b";
+	    if (monitor.ws) {
+	      if (monitor.ws.readyState === WebSocket.OPEN) {
+	        monitor.ws.send("tx_stop");
+	      }
+	      monitor.ws.onopen = null;
+	      monitor.ws.onclose = null;
+	      monitor.ws.onmessage = null;
       monitor.ws.onerror = null;
       monitor.ws.close();
       monitor.ws = null;
@@ -11760,20 +11911,20 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     }
   }
 
-  async function start() {
-    ensureAudioPath();
-    await monitor.audioCtx.resume();
+	  async function start() {
+	    ensureAudioPath();
+	    await monitor.audioCtx.resume();
     clearQueue();
 
     const wsProto = (window.location.protocol === "https:") ? "wss://" : "ws://";
     monitor.ws = new WebSocket(wsProto + location.host + "/ws_audio");
     monitor.ws.binaryType = "arraybuffer";
 
-    monitor.ws.onopen = function() {
-      monitor.running = true;
-      elToggle.textContent = "Stop Listening";
-      setStatus("Connected", "#27ae60");
-    };
+	    monitor.ws.onopen = function() {
+	      monitor.running = true;
+	      elToggle.textContent = "Stop Listening";
+	      setStatus("Connected", "#27ae60");
+	    };
 
     monitor.ws.onclose = function() {
       if (monitor.running) {
@@ -11789,13 +11940,22 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     monitor.ws.onmessage = function(event) {
       if (typeof event.data === "string") {
         try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "cfg") {
-            monitor.sampleRate = parseInt(msg.rate || 8000, 10);
-            elCodec.textContent = (monitor.sampleRate + "Hz " + (msg.codec || "mu-law") + " mono");
-          }
-        } catch (_) {}
-        return;
+	          const msg = JSON.parse(event.data);
+	          if (msg.type === "cfg") {
+	            monitor.sampleRate = parseInt(msg.rate || 8000, 10);
+	            elCodec.textContent = (monitor.sampleRate + "Hz " + (msg.codec || "mu-law") + " mono");
+	            if (msg.tx) elFreqTx.value = parseFloat(msg.tx).toFixed(4);
+	            if (msg.rx) elFreqRx.value = parseFloat(msg.rx).toFixed(4);
+	          } else if (msg.type === "freq" && msg.ok) {
+	            if (msg.tx) elFreqTx.value = parseFloat(msg.tx).toFixed(4);
+	            if (msg.rx) elFreqRx.value = parseFloat(msg.rx).toFixed(4);
+	          } else if (msg.type === "tx" && msg.state === "off") {
+	            monitor.txActive = false;
+	            elPtt.style.background = "#c0392b";
+	            setMicStatus("Idle", "#7f8c8d");
+	          }
+	        } catch (_) {}
+	        return;
       }
 
       const ulaw = new Uint8Array(event.data);
@@ -11820,40 +11980,137 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     };
   }
 
-  function toggle() {
-    if (monitor.running) {
-      stop();
-    } else {
+	  function toggle() {
+	    if (monitor.running) {
+	      stop();
+	    } else {
       start().catch(function() {
         setStatus("Audio start failed", "#e74c3c");
       });
     }
   }
 
-  function toggleMute() {
+	  function toggleMute() {
     monitor.muted = !monitor.muted;
     elMute.textContent = monitor.muted ? "Unmute" : "Mute";
     setVolume(parseInt(elVol.value, 10) / 100.0);
-  }
+	  }
 
-  elToggle.addEventListener("click", toggle);
-  elMute.addEventListener("click", toggleMute);
-  elVol.addEventListener("input", function() {
-    elVolVal.textContent = elVol.value + "%";
-    setVolume(parseInt(elVol.value, 10) / 100.0);
-  });
+	  async function ensureMicPath() {
+	    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+	      throw new Error("mic_api_missing");
+	    }
+	    if (!monitor.micStream) {
+	      monitor.micStream = await navigator.mediaDevices.getUserMedia({
+	        audio: {
+	          echoCancellation: false,
+	          noiseSuppression: false,
+	          autoGainControl: false
+	        }
+	      });
+	      monitor.micCtx = new (window.AudioContext || window.webkitAudioContext)();
+	      monitor.micSrc = monitor.micCtx.createMediaStreamSource(monitor.micStream);
+	      monitor.micProc = monitor.micCtx.createScriptProcessor(1024, 1, 1);
+	      monitor.micMute = monitor.micCtx.createGain();
+	      monitor.micMute.gain.value = 0;
+	      monitor.micProc.onaudioprocess = function(e) {
+	        if (!monitor.txActive || !monitor.ws || monitor.ws.readyState !== WebSocket.OPEN) {
+	          return;
+	        }
+	        const input = e.inputBuffer.getChannelData(0);
+	        const inRate = monitor.micCtx.sampleRate || 48000;
+	        const step = inRate / monitor.sampleRate;
+	        const outLen = Math.max(1, Math.floor(input.length / step));
+	        const out = new Uint8Array(outLen);
+	        let src = 0;
+	        for (let i = 0; i < outLen; i++) {
+	          const idx = Math.min(input.length - 1, Math.floor(src));
+	          out[i] = linearToMulaw(input[idx] || 0);
+	          src += step;
+	        }
+	        monitor.ws.send(out.buffer);
+	      };
+	      monitor.micSrc.connect(monitor.micProc);
+	      monitor.micProc.connect(monitor.micMute);
+	      monitor.micMute.connect(monitor.micCtx.destination);
+	    }
+	    if (monitor.micCtx && monitor.micCtx.state === "suspended") {
+	      await monitor.micCtx.resume();
+	    }
+	  }
 
-  setInterval(function() {
+	  async function startTx() {
+	    if (!monitor.running) {
+	      await start();
+	    }
+	    await ensureMicPath();
+	    if (monitor.ws && monitor.ws.readyState === WebSocket.OPEN) {
+	      monitor.ws.send("tx_start");
+	      monitor.txActive = true;
+	      elPtt.style.background = "#27ae60";
+	      setMicStatus("TX Active", "#27ae60");
+	    }
+	  }
+
+	  function stopTx() {
+	    if (monitor.ws && monitor.ws.readyState === WebSocket.OPEN) {
+	      monitor.ws.send("tx_stop");
+	    }
+	    monitor.txActive = false;
+	    elPtt.style.background = "#c0392b";
+	    setMicStatus("Idle", "#7f8c8d");
+	  }
+
+	  function applyFreq() {
+	    const tx = parseFloat(elFreqTx.value);
+	    const rx = parseFloat(elFreqRx.value);
+	    if (!Number.isFinite(tx) || !Number.isFinite(rx)) {
+	      return;
+	    }
+	    if (!monitor.ws || monitor.ws.readyState !== WebSocket.OPEN) {
+	      start().then(function() {
+	        monitor.ws.send("set_freq:" + tx.toFixed(4) + "," + rx.toFixed(4));
+	      }).catch(function(){});
+	      return;
+	    }
+	    monitor.ws.send("set_freq:" + tx.toFixed(4) + "," + rx.toFixed(4));
+	  }
+
+	  elToggle.addEventListener("click", toggle);
+	  elMute.addEventListener("click", toggleMute);
+	  elFreqApply.addEventListener("click", applyFreq);
+	  elVol.addEventListener("input", function() {
+	    elVolVal.textContent = elVol.value + "%";
+	    setVolume(parseInt(elVol.value, 10) / 100.0);
+	  });
+
+	  ["mousedown", "touchstart"].forEach(function(evt) {
+	    elPtt.addEventListener(evt, function(e) {
+	      e.preventDefault();
+	      startTx().catch(function() {
+	        setMicStatus("Mic denied/error", "#c0392b");
+	      });
+	    }, { passive: false });
+	  });
+	  ["mouseup", "mouseleave", "touchend", "touchcancel"].forEach(function(evt) {
+	    elPtt.addEventListener(evt, function(e) {
+	      e.preventDefault();
+	      stopTx();
+	    }, { passive: false });
+	  });
+
+	  setInterval(function() {
     const qMs = monitor.sampleRate > 0 ? Math.round((monitor.queuedSamples * 1000) / monitor.sampleRate) : 0;
     elQueue.textContent = qMs + " ms";
     elLevel.style.width = Math.min(100, Math.round(monitor.level * 100)) + "%";
     monitor.level *= 0.85;
-  }, 100);
+	  }, 100);
 
-  window.__audioMonitor = { stop: stop };
-})();
-</script>
-)HTML";
+	  window.__audioMonitor = { stop: stop };
+	  setMicStatus("Idle", "#7f8c8d");
+	})();
+	</script>
+	)HTML";
 
 	const size_t requiredLen = strlen(audioPage) + 1;
 	char *webString = allocateStringMemory(requiredLen + 64);
@@ -12348,6 +12605,17 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     }
 }
 
+static void stopAudioTxSession()
+{
+	if (audioTxPttActive)
+	{
+		audioTxPttActive = false;
+		audioTxClearBuffer();
+		setPtt(false);
+	}
+	audioTxOwnerId = 0;
+}
+
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
 {
 
@@ -12356,12 +12624,17 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 		log_d("Websocket client connection received");
 		if (server == &ws_audio)
 		{
-			client->text("{\"type\":\"cfg\",\"codec\":\"mulaw\",\"rate\":8000}");
+			char cfgMsg[160];
+			snprintf(cfgMsg, sizeof(cfgMsg), "{\"type\":\"cfg\",\"codec\":\"mulaw\",\"rate\":%u,\"tx\":%.4f,\"rx\":%.4f}", AUDIO_TX_RATE, config.freq_tx, config.freq_rx);
+			client->text(cfgMsg);
 		}
 	}
 	else if (type == WS_EVT_DISCONNECT)
 	{
-
+		if (server == &ws_audio && audioTxOwnerId == client->id())
+		{
+			stopAudioTxSession();
+		}
 		log_d("Client disconnected");
 	}
 	else if (type == WS_EVT_DATA && server == &ws_audio)
@@ -12369,9 +12642,71 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 		AwsFrameInfo *info = (AwsFrameInfo *)arg;
 		if (info && info->opcode == WS_TEXT && info->final && info->index == 0)
 		{
-			if (len == 4 && strncmp((const char *)data, "ping", 4) == 0)
+			char cmd[160];
+			const size_t cmdLen = (len < (sizeof(cmd) - 1)) ? len : (sizeof(cmd) - 1);
+			memcpy(cmd, data, cmdLen);
+			cmd[cmdLen] = '\0';
+
+			if (strcmp(cmd, "ping") == 0)
 			{
 				client->text("pong");
+			}
+			else if (strcmp(cmd, "tx_start") == 0)
+			{
+				if (!config.rf_en || config.rf_type == RF_NONE)
+				{
+					client->text("{\"type\":\"tx\",\"ok\":0,\"reason\":\"rf_disabled\"}");
+				}
+				else if (audioTxOwnerId != 0 && audioTxOwnerId != client->id())
+				{
+					client->text("{\"type\":\"tx\",\"ok\":0,\"reason\":\"busy\"}");
+				}
+				else if (getTransmit() && !audioTxPttActive)
+				{
+					client->text("{\"type\":\"tx\",\"ok\":0,\"reason\":\"modem_busy\"}");
+				}
+				else
+				{
+					audioTxOwnerId = client->id();
+					audioTxClearBuffer();
+					audioTxPttActive = true;
+					setPtt(true);
+					client->text("{\"type\":\"tx\",\"ok\":1,\"state\":\"on\"}");
+				}
+			}
+			else if (strcmp(cmd, "tx_stop") == 0)
+			{
+				if (audioTxOwnerId == 0 || audioTxOwnerId == client->id())
+				{
+					stopAudioTxSession();
+					client->text("{\"type\":\"tx\",\"ok\":1,\"state\":\"off\"}");
+				}
+			}
+			else if (strncmp(cmd, "set_freq:", 9) == 0)
+			{
+				float txf = 0.0f;
+				float rxf = 0.0f;
+				if (sscanf(cmd + 9, "%f,%f", &txf, &rxf) == 2 && txf >= 100.0f && txf <= 1000.0f && rxf >= 100.0f && rxf <= 1000.0f)
+				{
+					config.freq_tx = txf;
+					config.freq_rx = rxf;
+					saveConfiguration("/default.cfg", config);
+					requestRFModuleReinit();
+					char ack[120];
+					snprintf(ack, sizeof(ack), "{\"type\":\"freq\",\"ok\":1,\"tx\":%.4f,\"rx\":%.4f}", config.freq_tx, config.freq_rx);
+					client->text(ack);
+				}
+				else
+				{
+					client->text("{\"type\":\"freq\",\"ok\":0,\"reason\":\"invalid\"}");
+				}
+			}
+		}
+		else if (info && info->opcode == WS_BINARY && info->final && info->index == 0)
+		{
+			if (audioTxPttActive && audioTxOwnerId == client->id())
+			{
+				audioTxPushSamples(data, len);
 			}
 		}
 	}
@@ -12415,6 +12750,10 @@ void webService()
 	}
 	ws.onEvent(onWsEvent);
 	ws_audio.onEvent(onWsEvent);
+	if (taskAudioTxHandle == nullptr)
+	{
+		xTaskCreate(taskAudioTx, "AudioTx", 4096, nullptr, 1, &taskAudioTxHandle);
+	}
 
 	// web client handlers
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
