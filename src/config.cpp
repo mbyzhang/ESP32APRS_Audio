@@ -25,6 +25,8 @@ extern TaskHandle_t taskAPRSPollHandle;
 extern volatile int8_t adcEn;
 extern volatile int8_t dacEn;
 
+static constexpr uint16_t CONFIG_SCHEMA_VERSION = 2;
+
 // Saves the configuration to a file
 bool saveConfiguration(const char *filename, const Configuration &config)
 {
@@ -530,6 +532,10 @@ bool saveConfiguration(const char *filename, const Configuration &config)
     doc["msgAESKey"] = config.msg_key;
     doc["msgRetry"] = config.msg_retry;
     doc["msgInterval"] = config.msg_interval;
+    doc["cfgVersion"] = config.cfg_version;
+    doc["msgWebhookEnable"] = config.msg_webhook_enable;
+    doc["msgWebhookURL"] = config.msg_webhook_url;
+    doc["msgWebhookTimeout"] = config.msg_webhook_timeout_ms;
 
     // Serialize JSON to file
     File file = LITTLEFS.open(filename, FILE_WRITE);
@@ -1022,6 +1028,17 @@ bool loadConfiguration(const char *filename, Configuration &config)
         config.at_cmd_bluetooth = doc["cmdOnBluetooth"];
         config.at_cmd_uart = doc["cmdOnUart"];
 
+        const uint16_t loadedCfgVersion = doc["cfgVersion"] | 1;
+        config.cfg_version = loadedCfgVersion;
+        config.msg_webhook_enable = doc["msgWebhookEnable"] | false;
+        strlcpy(config.msg_webhook_url, doc["msgWebhookURL"] | "", sizeof(config.msg_webhook_url));
+        config.msg_webhook_timeout_ms = doc["msgWebhookTimeout"] | 1500;
+
+        if (config.msg_webhook_timeout_ms < 200)
+            config.msg_webhook_timeout_ms = 200;
+        if (config.msg_webhook_timeout_ms > 10000)
+            config.msg_webhook_timeout_ms = 10000;
+
         if(doc["msgEnable"].isNull()){ //old version compatibility
             config.msg_enable = true;
             config.msg_encrypt = false;
@@ -1042,6 +1059,21 @@ bool loadConfiguration(const char *filename, Configuration &config)
             config.msg_interval = doc["msgInterval"];
             strlcpy(config.msg_key, doc["msgAESKey"] | "", sizeof(config.msg_key));
             strlcpy(config.msg_mycall, doc["msgMycall"] | "", sizeof(config.msg_mycall));
+        }
+
+        if (loadedCfgVersion < CONFIG_SCHEMA_VERSION)
+        {
+            config.cfg_version = CONFIG_SCHEMA_VERSION;
+            if (loadedCfgVersion < 2)
+            {
+                config.msg_webhook_enable = false;
+                config.msg_webhook_timeout_ms = 1500;
+                config.msg_webhook_url[0] = 0;
+            }
+        }
+        else
+        {
+            config.cfg_version = loadedCfgVersion;
         }
 
         // Close the file (Curiously, File's destructor doesn't close the file)

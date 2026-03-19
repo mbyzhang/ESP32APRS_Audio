@@ -18,10 +18,13 @@
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include <memory>
+#include <strings.h>
+#include <ArduinoJson.h>
 
 extern SemaphoreHandle_t psramMutex;
 extern bool psramLock(TickType_t timeout = portMAX_DELAY);
 extern void psramUnlock();
+extern int mVrms;
 
 // Helper function to allocate memory with PSRAM support
 char *allocateStringMemory(size_t size)
@@ -165,10 +168,22 @@ static constexpr uint32_t AUDIO_TUNE_IDLE_TIMEOUT_MS = 120000; // 2 minutes
 static bool audioTuneActive = false;
 static float audioTuneAprsFreqRx = 0.0F;
 static uint32_t audioTuneLastUserMs = 0;
+static bool webPttActive = false;
+static uint32_t webPttExpireMs = 0;
 
 static inline float absFloat(float v)
 {
 	return (v < 0.0F) ? -v : v;
+}
+
+static void serviceWebPttTimeout()
+{
+	if (webPttActive && (int32_t)(millis() - webPttExpireMs) >= 0)
+	{
+		setPtt(false);
+		webPttActive = false;
+		webPttExpireMs = 0;
+	}
 }
 
 static void getRfRangeForType(uint8_t rfType, float &freqMin, float &freqMax)
@@ -1525,409 +1540,24 @@ void handle_sysinfo(AsyncWebServerRequest *request)
 
 void event_lastHeard(bool gethtml)
 {
-	// log_d("Event count: %d",lastheard_events.count());
-	// if (lastheard_events.count() == 0)
-	//	return;
-
-	struct pbuf_t aprs;
-	ParseAPRS aprsParse;
-	struct tm tmstruct, tmNow;
-
-	// Using dynamic memory allocation instead of String
-	char temp_html[100];
-	char *html = allocateStringMemory(16384); // Initial buffer size, adjust as needed
-	if (html==nullptr)
+	(void)gethtml;
+	if (lastheard_events.count() > 0)
 	{
-		return; // Memory allocation failed
+		lastheard_events.send("[]", "lastHeard", millis() / 1000, 1000);
 	}
-	time_t timeNow = time(NULL);
-
-	// log_d("Create html last heard");
-	localtime_r(&timeNow, &tmNow);
-//strcat(webString, "  { time: \"21:54:23\", icon: \"91-1.png\", callsign: \"HS5TQA-7\", path: \"RF: WIDE1-1\", dx: 0.0, packet: 2, audio: -19.6 },\n");
-	strcpy(html, "[");
-	for (int i = 0; i < PKGLISTSIZE; i++)
-	{
-		if (i >= PKGLISTSIZE)
-			break;
-		pkgListType pkg = getPkgList(i);
-		if (pkg.time > 0)
-		{
-			int packet = pkg.pkg;
-			char *pos_gt = strchr(pkg.raw, '>'); // Find first position of '>'
-			int start_val = pos_gt ? (pos_gt - pkg.raw) : -1;
-			if (start_val > 3)
-			{
-				// Extract src_call substring
-				char src_call[11];
-				strncpy(src_call, pkg.raw, start_val);
-				src_call[start_val] = '\0';
-
-				memset(&aprs, 0, sizeof(pbuf_t));
-				aprs.buf_len = 300;
-				aprs.packet_len = pkg.length;
-				strncpy((char *)aprs.data, pkg.raw, aprs.packet_len < sizeof(aprs.data) ? aprs.packet_len : sizeof(aprs.data) - 1);
-
-				char *pos_colon = strchr(pkg.raw, ':');
-				char *pos_comma = strchr(pkg.raw, ',');
-				char *pos_gt2 = strstr(pkg.raw + 2, ">"); // Find '>' starting from position 2
-				char *pos_dash = pos_gt2 ? strchr(pos_gt2, '-') : NULL;
-
-				int start_info = pos_colon ? (pos_colon - pkg.raw) : -1;
-				int end_ssid = pos_comma ? (pos_comma - pkg.raw) : -1;
-				int start_dst = pos_gt2 ? (pos_gt2 - pkg.raw) : -1;
-				int start_dstssid = pos_dash ? (pos_dash - pkg.raw) : -1;
-
-				char path[256] = "";
-
-				if ((end_ssid > start_dst) && (end_ssid < start_info) && (end_ssid < (int)strlen(pkg.raw)))
-				{
-					int path_len = start_info - end_ssid - 1;
-					strncpy(path, pkg.raw + end_ssid + 1, path_len);
-					path[path_len] = '\0';
-				}
-				if (end_ssid < 5)
-					end_ssid = start_info;
-				if ((start_dstssid > start_dst) && (start_dstssid < start_dst + 10))
-				{
-					aprs.dstcall_end_or_ssid = &aprs.data[start_dstssid];
-				}
-				else
-				{
-					aprs.dstcall_end_or_ssid = &aprs.data[end_ssid];
-				}
-				aprs.info_start = &aprs.data[start_info + 1];
-				aprs.dstname = &aprs.data[start_dst + 1];
-				aprs.dstname_len = end_ssid - start_dst;
-				aprs.dstcall_end = &aprs.data[end_ssid];
-				aprs.srccall_end = &aprs.data[start_dst];
-
-				// Serial.println(aprs.info_start);
-				if (aprsParse.parse_aprs(&aprs))
-				{
-					pkg.calsign[10] = 0;
-					// time_t tm = pkg.time;
-					localtime_r(&pkg.time, &tmstruct);
-					char strTime[20];
-					//if (tmNow.tm_mday == tmstruct.tm_mday)
-					//	sprintf(strTime, "%02d:%02d:%02d", tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
-					//else
-						sprintf(strTime, "%02d %02d:%02d:%02d", tmstruct.tm_mday, tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
-					// String str = String(tmstruct.tm_hour, DEC) + ":" + String(tmstruct.tm_min, DEC) + ":" + String(tmstruct.tm_sec, DEC);
-
-					// Append to html
-					// strcat(html, "  { time: \"21:54:23\", icon: \"91-1.png\", callsign: \"HS5TQA-7\", path: \"RF: WIDE1-1\", dx: 0.0, packet: 2, rssi: -19.6 },\n");
-					
-					snprintf(temp_html, sizeof(temp_html), "{\"time\":\"%s\",", strTime);
-					strcat(html, temp_html);
-					char fileImg[64] = "";
-					uint8_t sym = (uint8_t)aprs.symbol[1];
-					if (sym > 31 && sym < 127)
-					{
-						if (aprs.symbol[0] > 64 && aprs.symbol[0] < 91) // table A-Z
-						{
-							snprintf(fileImg, sizeof(fileImg), "%d", sym);
-							// if (aprs.symbol[0] == 92)
-							// {
-							// 	strcat(fileImg, "-2.png");
-							// }
-							// else if (aprs.symbol[0] == 47)
-							// {
-								strcat(fileImg, "-1.png");
-							//}
-
-							//snprintf(temp_html, sizeof(temp_html), "<td><b>%c</b></td>", aprs.symbol[0]);
-							snprintf(temp_html, sizeof(temp_html), "\"icon\":\"%s\",", fileImg);
-							strcat(html, temp_html);
-						}
-						else
-						{
-							snprintf(fileImg, sizeof(fileImg), "%d", sym);
-							if (aprs.symbol[0] == 92)
-							{
-								strcat(fileImg, "-2.png");
-							}
-							else if (aprs.symbol[0] == 47)
-							{
-								strcat(fileImg, "-1.png");
-							}
-							else
-							{
-								strcpy(fileImg, "dot.png");
-							}
-							//snprintf(temp_html, sizeof(temp_html), "<td><img src=\"http://aprs.dprns.com/symbols/icons/%s\"></td>", fileImg);
-							snprintf(temp_html, sizeof(temp_html), "\"icon\":\"%s\",", fileImg);
-							strcat(html, temp_html);
-						}
-					}
-					else
-					{
-						//strcat(html, "<td><img src=\"http://aprs.dprns.com/symbols/icons/dot.png\"></td>");
-						strcat(html, "\"icon\":\"dot.png\",");
-					}
-					
-					if (aprs.srcname_len > 0 && aprs.srcname_len < 10) // Get Item/Object
-					{
-						char itemname[10];
-						memset(&itemname, 0, 10);
-						memcpy(&itemname, aprs.srcname, aprs.srcname_len);
-						snprintf(temp_html, sizeof(temp_html), "\"callsign\":\"%s(%s)\",", itemname, src_call);
-						strcat(html, temp_html);
-					}else{
-						snprintf(temp_html, sizeof(temp_html), "\"callsign\":\"%s\",", src_call);
-						strcat(html, temp_html);
-					}
-					//strcat(html, "</td>");
-					if (strlen(path) == 0)
-					{
-						strcat(html, "\"path\":\"RF: DIRECT\",");
-					}
-					else
-					{
-						// Find last occurrence of ','
-						char *last_comma = strrchr(path, ',');
-						char LPath[256] = "";
-						if (last_comma != NULL)
-						{
-							strncpy(LPath, last_comma + 1, sizeof(LPath) - 1);
-							LPath[sizeof(LPath) - 1] = '\0';
-						}
-						else
-						{
-							strncpy(LPath, path, sizeof(LPath) - 1);
-							LPath[sizeof(LPath) - 1] = '\0';
-						}
-						// if(path.indexOf("qAR")>=0 || path.indexOf("qAS")>=0 || path.indexOf("qAC")>=0){ //Via from Internet Server
-						if (strstr(path, "qA") != NULL || strstr(path, "TCPIP") != NULL)
-						{
-							snprintf(temp_html, sizeof(temp_html), "\"path\":\"INET:%s\",", LPath);
-							strcat(html, temp_html);
-						}
-						else
-						{
-							if (strchr(path, '*') != NULL)
-							{
-								snprintf(temp_html, sizeof(temp_html), "\"path\":\"DIGI: %s\",", path);
-								strcat(html, temp_html);
-							}
-							else
-							{
-								snprintf(temp_html, sizeof(temp_html), "\"path\":\"RF: %s\",", path);
-								strcat(html, temp_html);
-							}
-						}
-					}
-					// html += "<td>" + path + "</td>";
-					if (aprs.flags & F_HASPOS)
-					{
-						double lat, lon;
-						if (gps.location.isValid())
-						{
-							lat = gps.location.lat();
-							lon = gps.location.lng();
-						}
-						else
-						{
-							lat = config.igate_lat;
-							lon = config.igate_lon;
-						}
-						double dtmp = aprsParse.direction(lon, lat, aprs.lng, aprs.lat);
-						double dist = aprsParse.distance(lon, lat, aprs.lng, aprs.lat);
-						snprintf(temp_html, sizeof(temp_html), "\"dx\":\"%.1fkm/%.0f°\",", dist, dtmp);
-						strcat(html, temp_html);
-					}
-					else
-					{
-						strcat(html, "\"dx\":\"-\",");
-					}
-					snprintf(temp_html, sizeof(temp_html), "\"packet\":\"%d\",", packet);
-					strcat(html, temp_html);
-					if (pkg.audio_level == 0)
-					{
-						strcat(html, "\"audio\":\"-\"},");
-					}
-					else
-					{
-						double Vrms = (double)pkg.audio_level / 1000;
-						double audBV = 20.0F * log10(Vrms);
-						// if (audBV < -20.0F)
-						// {
-						// 	strcat(html, " audio:\"");
-						// }
-						// else if (audBV > -5.0F)
-						// {
-						// 	strcat(html, "<td style=\"color: #f00000;\">");
-						// }
-						// else
-						// {
-						// 	strcat(html, "<td style=\"color: #008000;\">");
-						// }
-						snprintf(temp_html, sizeof(temp_html), "\"audio\":\"%.1f\"},", audBV);
-						strcat(html, temp_html);
-						//strcat(html, "dBV</td></tr>\n");
-					}
-				}
-			}
-		}
-	}
-	html[strlen(html) - 1] = '\0'; // Remove the last comma
-	if (html[0] == '[')
-	strcat(html, "]");
-
-	size_t len = strlen(html);
-	// char *info = (char *)calloc(len + 1, sizeof(char));
-	// if (info)
-	// {
-	// 	strcpy(info, html);
-	if (len > 10)
-		lastheard_events.send(html, "lastHeard", millis() / 1000, 1000);
-	// 	free(info);
-	// }
-
-	free(html);
 }
 
 String event_chatMessage(bool gethtml)
 {
-	// log_d("Event count: %d",lastheard_events.count());
-	// if (message_events.count() == 0)
-	//	return "NO";
-
-	struct tm tmstruct, tmNow;
-
-	// Using dynamic memory allocation instead of String
-	char *html = allocateStringMemory(4096); // Initial buffer size, adjust as needed
-	if (!html)
-	{
-		return String(""); // Memory allocation failed
-	}
-
-	time_t timen = time(NULL);
-	localtime_r(&timen, &tmNow);
-
-	strcpy(html, "<tr>\n");
-	strcat(html, "<th style=\"width:60pt\"><span><b>Time (");
-	if (config.timeZone >= 0)
-		strcat(html, "+");
-
-	// Convert timezone to string
-	char temp_buffer[64];
-	if (config.timeZone == (int)config.timeZone)
-	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "%d", (int)config.timeZone);
-		strcat(html, temp_buffer);
-		strcat(html, ")</b></span></th>\n");
-	}
-	else
-	{
-		snprintf(temp_buffer, sizeof(temp_buffer), "%.1f", config.timeZone);
-		strcat(html, temp_buffer);
-		strcat(html, ")</b></span></th>\n");
-	}
-	// strcat(html, "<th style=\"min-width:16px\">ICON</th>\n");
-
-	strcat(html, "<th style=\"width:70pt\">Callsign</th>\n");
-	strcat(html, "<th>Message</th>\n");
-	strcat(html, "<th style=\"width:10pt\">ACK</th>\n");
-	strcat(html, "<th style=\"width:20pt\">msgID</th>\n");
-	strcat(html, "</tr>\n");
-
-	pkgMsgSort(msgQueue);
-	for (int i = 0; i < PKGLISTSIZE; i++)
-	{
-		if (i >= PKGLISTSIZE)
-			break;
-		msgType pkg = getMsgList(i);
-		if (pkg.time > 0)
-		{
-			// String line = String(pkg.text); // Not needed anymore
-
-			pkg.callsign[10] = 0;
-			// time_t tm = pkg.time;
-			localtime_r(&pkg.time, &tmstruct);
-			char strTime[10];
-			// sprintf(strTime, "%02d:%02d:%02d", tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
-			if (tmNow.tm_mday == tmstruct.tm_mday)
-				sprintf(strTime, "%02d:%02d:%02d", tmstruct.tm_hour, tmstruct.tm_min, tmstruct.tm_sec);
-			else
-				sprintf(strTime, "%dd %02d:%02d", tmstruct.tm_mday, tmstruct.tm_hour, tmstruct.tm_min);
-			// String str = String(tmstruct.tm_hour, DEC) + ":" + String(tmstruct.tm_min, DEC) + ":" + String(tmstruct.tm_sec, DEC);
-
-			if (pkg.ack > 0)
-			{
-				strcat(html, "<tr style=\"background-color: #f1697dff;\">\n");
-			}
-			else if (pkg.ack == -1)
-			{
-				strcat(html, "<tr style=\"background-color: #7ff1c5ff;\">\n");
-			}
-			else if (pkg.ack == -2)
-			{
-				strcat(html, "<tr style=\"background-color: #73caf0ff;\">\n");
-			}
-			else
-			{
-				strcat(html, "<tr style=\"background-color: #f55353ff;\">\n");
-			}
-
-			strcat(html, "<td>");
-			strcat(html, strTime);
-			strcat(html, "</td>");
-
-			strcat(html, "<td>");
-			strcat(html, pkg.callsign);
-			strcat(html, "</td>");
-
-			strcat(html, "<td style=\"text-align: left;\">");
-			strcat(html, pkg.text);
-			strcat(html, "</td>");
-
-			if (pkg.ack > 0)
-			{
-				snprintf(temp_buffer, sizeof(temp_buffer), "<td>%d/%d</td>", pkg.ack, config.msg_retry);
-				strcat(html, temp_buffer);
-			}
-			else if (pkg.ack == -1)
-			{
-				strcat(html, "<td>RX</td>");
-			}
-			else if (pkg.ack == -2)
-			{
-				strcat(html, "<td>TX</td>");
-			}
-			else
-			{
-				strcat(html, "<td>TF</td>");
-			}
-
-			snprintf(temp_buffer, sizeof(temp_buffer), "<td>%d</td></tr>\n", pkg.msgID);
-			strcat(html, temp_buffer);
-		}
-	}
-
-	size_t html_len = strlen(html);
-	log_d("HTML Length=%d Byte gethtml:%d event_cnt:%d", html_len, gethtml, message_events.count());
-
 	if (gethtml)
 	{
-		String result = String(html); // Convert back to String for return
-		free(html);					  // Free the allocated memory
-		return result;
+		return String("[]");
 	}
-
 	if (message_events.count() > 0)
 	{
-		char *info = (char *)calloc(html_len + 1, sizeof(char)); // +1 for null terminator
-		if (info)
-		{
-			strcpy(info, html);
-			message_events.send(info, "chatMsg", time(NULL), 5000);
-			free(info);
-		}
+		message_events.send("[]", "chatMsg", time(NULL), 5000);
 	}
-
-	free(html); // Free the allocated memory
-	return String("");
+	return String("[]");
 }
 
 void handle_storage(AsyncWebServerRequest *request)
@@ -11744,6 +11374,8 @@ void handle_ws(char *Raw, size_t len, uint16_t mVrms)
 
 void handle_ws_audio_samples(const float *samples, size_t len, uint16_t sampleRate)
 {
+	serviceWebPttTimeout();
+
 	if (samples == nullptr || len == 0 || sampleRate == 0)
 	{
 		return;
@@ -11826,102 +11458,11 @@ void handle_ws_gnss(char *nmea, size_t size)
 
 void handle_test(AsyncWebServerRequest *request)
 {
-	// if (request->hasArg("sendBeacon"))
-	// {
-	// 	String tnc2Raw = send_fix_location();
-	// 	if (config.rf_en)
-	// 		pkgTxPush(tnc2Raw.c_str(), tnc2Raw.length(), 0);
-	// 	// APRS_sendTNC2Pkt(tnc2Raw); // Send packet to RF
-	// }
-	// else if (request->hasArg("sendRaw"))
-	// {
-	// 	for (uint8_t i = 0; i < request->args(); i++)
-	// 	{
-	// 		if (request->argName(i) == "raw")
-	// 		{
-	// 			if (request->arg(i) != "")
-	// 			{
-	// 				String tnc2Raw = request->arg(i);
-	// 				if (config.rf_en)
-	// 				{
-	// 					pkgTxPush(tnc2Raw.c_str(), tnc2Raw.length(), 0);
-	// 					// APRS_sendTNC2Pkt(request->arg(i)); // Send packet to RF
-	// 					// Serial.println("Send RAW: " + tnc2Raw);
-	// 				}
-	// 			}
-	// 			break;
-	// 		}
-	// 	}
-	// }
-	// setHTML(6);
-
-	// Allocate memory for HTML content
-	char *webString = allocateStringMemory(8192); // Start with 8KB buffer
-	if (!webString)
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
-		request->send(500, "text/html", "Memory allocation failed");
-		return;
+		return request->requestAuthentication();
 	}
-	strcpy(webString, "<html>\n<head>\n");
-	strcat(webString, "<script src=\"https://apps.bdimg.com/libs/jquery/2.1.4/jquery.min.js\"></script>\n");
-	strcat(webString, "<script src=\"https://code.highcharts.com/highcharts.js\"></script>\n");
-	strcat(webString, "<script src=\"https://code.highcharts.com/highcharts-more.js\"></script>\n");
-	strcat(webString, "<script language=\"JavaScript\">");
-	strcat(webString, "$(document).ready(function() {\nvar chart = {\ntype: 'gauge',plotBorderWidth: 1,plotBackgroundColor: {linearGradient: { x1: 0, y1: 0, x2: 0, y2: 1 },stops: [[0, '#FFFFC6'],[0.3, '#FFFFFF'],[1, '#FFF4C6']]},plotBackgroundImage: null,height: 200};\n");
-	strcat(webString, "var credits = {enabled: false};\n");
-	strcat(webString, "var title = {text: 'RX/AUDIO VU Meter'};\n");
-	strcat(webString, "var pane = [{startAngle: -45,endAngle: 45,background: null,center: ['50%', '145%'],size: 300}];\n");
-	strcat(webString, "var yAxis = [{min: -40,max: 1,minorTickPosition: 'outside',tickPosition: 'outside',labels: {rotation: 'auto',distance: 20},\n");
-	strcat(webString, "plotBands: [{from: -10,to: 1,color: '#C02316',innerRadius: '100%',outerRadius: '105%'},{from: -20,to: -10,color: '#00C000',innerRadius: '100%',outerRadius: '105%'},{from: -30,to: -20,color: '#AFFF0F',innerRadius: '100%',outerRadius: '105%'},{from: -40,to: -30,color: '#C0A316',innerRadius: '100%',outerRadius: '105%'}],\n");
-	strcat(webString, "pane: 0,title: {text: '<span style=\"font-size:12px\">dBV</span>',y: -40}}];\n");
-	strcat(webString, "var plotOptions = {gauge: {dataLabels: {enabled: false},dial: {radius: '100%'}}};\n");
-	strcat(webString, "var series= [{data: [-40],yAxis: 0}];\n");
-	strcat(webString, "var json = {};\n json.chart = chart;\n json.credits = credits;\n json.title = title;\n json.pane = pane;\n json.yAxis = yAxis;\n json.plotOptions = plotOptions;\n json.series = series;\n");
-	// Add some life
-	strcat(webString, "var chartFunction = function (chart) { \n"); // the chart may be destroyed
-	strcat(webString, "var Vrms=0;\nvar dBV=-40;\nvar active=0;var raw=\"\";var timeStamp;\n");
-	strcat(webString, "if (chart.series) {\n");
-	strcat(webString, "var left = chart.series[0].points[0];\n");
-	strcat(webString, "var host='ws://'+location.hostname+':81/ws'\n");
-	strcat(webString, "const ws = new WebSocket(host);\n");
-	strcat(webString, "ws.onopen = function() { console.log('Connection opened');};\n ws.onclose = function() { console.log('Connection closed');};\n");
-	strcat(webString, "ws.onmessage = function(event) {\n  console.log(event.data);\n");
-	strcat(webString, "const jsonR=JSON.parse(event.data);\n");
-	strcat(webString, "active=parseInt(jsonR.Active);\n");
-	strcat(webString, "Vrms=parseFloat(jsonR.mVrms)/1000;\n");
-	strcat(webString, "dBV=20.0*Math.log10(Vrms);\n");
-	strcat(webString, "if(dBV<-40) dBV=-40;\n");
-	strcat(webString, "raw=jsonR.RAW;\n");
-	strcat(webString, "timeStamp=Number(jsonR.timeStamp);\n");
-	strcat(webString, "if(active==1){\nleft.update(dBV,false);\nchart.redraw();\n");
-	strcat(webString, "var date=new Date(timeStamp * 1000);\n");
-	strcat(webString, "var head=date+\"[\"+Vrms.toFixed(3)+\"Vrms,\"+dBV.toFixed(1)+\"dBV]\\n\";\n");
-	// strcat(webString, "document.getElementById(\"raw_txt\").value+=head+atob(raw)+\"\\n\";\n");
-	strcat(webString, "var textArea=document.getElementById(\"raw_txt\");\n");
-	strcat(webString, "textArea.value+=head+atob(raw)+\"\\n\";\n");
-	strcat(webString, "textArea.scrollTop = textArea.scrollHeight;\n");
-	strcat(webString, "}\n");
-	strcat(webString, "}\n");
-	strcat(webString, "}};\n");
-	strcat(webString, "$('#vumeter').highcharts(json, chartFunction);\n");
-	strcat(webString, "});\n</script>\n");
-	strcat(webString, "</head><body>\n<table>\n");
-	// strcat(webString, "<tr><td><form accept-charset=\"UTF-8\" action=\"/test\" class=\"form-horizontal\" id=\"test_form\" method=\"post\">\n");
-	// strcat(webString, "<div style=\"margin-left: 20px;\"><input type='submit' class=\"btn btn-danger\" name=\"sendBeacon\" value='SEND BEACON'></div><br />\n");
-	// strcat(webString, "<div style=\"margin-left: 20px;\">TNC2 RAW: <input id=\"raw\" name=\"raw\" type=\"text\" size=\"60\" value=\"" + String(config.aprs_mycall) + ">APE32I,WIDE1-1:>Test Status\"/></div>\n");
-	// strcat(webString, "<div style=\"margin-left: 20px;\"><input type='submit' class=\"btn btn-primary\" name=\"sendRaw\" value='SEND RAW'></div> <br />\n");
-	// strcat(webString, "</form></td></tr>\n");
-	// strcat(webString, "<tr><td><hr width=\"80%\" /></td></tr>\n");
-	strcat(webString, "<tr><td><div id=\"vumeter\" style=\"width: 300px; height: 200px; margin: 10px;\"></div></td>\n");
-	strcat(webString, "<tr><td><div style=\"margin: 15px;\">Terminal<br /><textarea id=\"raw_txt\" name=\"raw_txt\" rows=\"50\" cols=\"80\" /></textarea></div></td></tr>\n");
-	strcat(webString, "</table>\n");
-
-	strcat(webString, "</body></html>\n");
-
-	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
-	response->addHeader("Test", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
+	request->redirect("/app/");
 }
 
 void handle_audio(AsyncWebServerRequest *request)
@@ -11930,365 +11471,7 @@ void handle_audio(AsyncWebServerRequest *request)
 	{
 		return request->requestAuthentication();
 	}
-
-	const char *audioPage = R"HTML(
-<div style="max-width:860px;margin:auto;">
-<table>
-<th colspan="2"><span><b>Browser Audio Monitor</b></span></th>
-<tr><td align="right"><b>Status:</b></td><td align="left"><span id="audioStatus" style="color:#c0392b;font-weight:600;">Stopped</span></td></tr>
-<tr><td align="right"><b>Listen:</b></td><td align="left">
-<button class="button" id="audioToggleBtn" type="button">Start Listening</button>
-<button class="button" id="audioMuteBtn" type="button">Mute</button>
-</td></tr>
-<tr><td align="right"><b>Volume:</b></td><td align="left"><input id="audioVolume" type="range" min="0" max="100" value="70" style="width:260px;"> <span id="audioVolumeValue">70%</span></td></tr>
-<tr><td align="right"><b>Buffer:</b></td><td align="left"><span id="audioQueue">0 ms</span></td></tr>
-<tr><td align="right"><b>Level:</b></td><td align="left">
-<div style="width:300px;height:12px;border:1px solid #888;border-radius:10px;overflow:hidden;background:#f1f1f1;">
-<div id="audioLevelBar" style="height:100%;width:0%;background:linear-gradient(90deg,#2ecc71,#f1c40f,#e74c3c);transition:width .08s linear;"></div>
-</div>
-</td></tr>
-<tr><td align="right"><b>Format:</b></td><td align="left"><span id="audioCodec">8kHz mu-law mono</span></td></tr>
-<tr><td align="right"><b>Tuner RX:</b></td><td align="left">
-<input id="audioTuneFreq" type="number" step="0.0001" value="144.3900" style="width:150px;"> MHz
-<button class="button" id="audioTuneBtn" type="button">Tune RX</button>
-<button class="button" id="audioAprsBtn" type="button">Back To APRS</button>
-</td></tr>
-<tr><td align="right"><b>Tuner State:</b></td><td align="left">
-<span id="audioTuneState" style="font-weight:600;color:#27ae60;">APRS locked</span>
-<span style="margin-left:8px;">RX: <span id="audioTuneNow">-</span></span>
-<span style="margin-left:8px;">APRS: <span id="audioTuneAprs">-</span></span>
-</td></tr>
-<tr><td align="right"><b>Auto Return:</b></td><td align="left"><span id="audioTuneAuto">Idle return enabled</span></td></tr>
-</table>
-<div style="font-size:9pt;color:#555;margin-top:8px;">
-Tune temporarily for audio monitoring; when this interface is idle it automatically returns RX to APRS.
-</div>
-</div>
-<script type="text/javascript">
-(function(){
-  if (window.__audioMonitor && typeof window.__audioMonitor.stop === "function") {
-    window.__audioMonitor.stop();
-  }
-
-  const monitor = {
-    running: false,
-    muted: false,
-    ws: null,
-    audioCtx: null,
-    gainNode: null,
-    procNode: null,
-    queue: [],
-    queueOffset: 0,
-    queuedSamples: 0,
-    sampleRate: 8000,
-    currentSample: 0,
-    resampleAcc: 0,
-    level: 0
-  };
-
-  const elStatus = document.getElementById("audioStatus");
-  const elToggle = document.getElementById("audioToggleBtn");
-  const elMute = document.getElementById("audioMuteBtn");
-  const elVol = document.getElementById("audioVolume");
-  const elVolVal = document.getElementById("audioVolumeValue");
-  const elQueue = document.getElementById("audioQueue");
-  const elLevel = document.getElementById("audioLevelBar");
-  const elCodec = document.getElementById("audioCodec");
-  const elTuneFreq = document.getElementById("audioTuneFreq");
-  const elTuneBtn = document.getElementById("audioTuneBtn");
-  const elAprsBtn = document.getElementById("audioAprsBtn");
-  const elTuneState = document.getElementById("audioTuneState");
-  const elTuneNow = document.getElementById("audioTuneNow");
-  const elTuneAprs = document.getElementById("audioTuneAprs");
-  const elTuneAuto = document.getElementById("audioTuneAuto");
-
-  function setStatus(txt, color) {
-    elStatus.textContent = txt;
-    elStatus.style.color = color || "#2c3e50";
-  }
-
-  async function tuneApi(action, freqValue) {
-    let url = "/audio_tune?action=" + encodeURIComponent(action);
-    if (typeof freqValue === "number" && Number.isFinite(freqValue)) {
-      url += "&freq=" + encodeURIComponent(freqValue.toFixed(4));
-    }
-    const resp = await fetch(url, { method: "GET", cache: "no-store" });
-    let data = null;
-    try { data = await resp.json(); } catch (_) {}
-    if (!resp.ok || !data || data.ok === false) {
-      const msg = (data && data.message) ? data.message : ("HTTP " + resp.status);
-      throw new Error(msg);
-    }
-    return data;
-  }
-
-  function renderTuneStatus(st) {
-    if (!st) return;
-    const rxFreq = Number(st.rx || 0);
-    const aprsFreq = Number(st.aprs || 0);
-    if (Number.isFinite(rxFreq) && rxFreq > 0) {
-      elTuneNow.textContent = rxFreq.toFixed(4) + " MHz";
-    }
-    if (Number.isFinite(aprsFreq) && aprsFreq > 0) {
-      elTuneAprs.textContent = aprsFreq.toFixed(4) + " MHz";
-    }
-    if (st.active) {
-      elTuneState.textContent = "Temporary tuned";
-      elTuneState.style.color = "#d35400";
-    } else {
-      elTuneState.textContent = "APRS locked";
-      elTuneState.style.color = "#27ae60";
-    }
-    if (!(document.activeElement === elTuneFreq) && Number.isFinite(rxFreq) && rxFreq > 0) {
-      elTuneFreq.value = rxFreq.toFixed(4);
-    }
-    const idleSec = Number(st.idleSec || 0);
-    const timeoutSec = Number(st.timeoutSec || 0);
-    const minF = Number(st.min || 0);
-    const maxF = Number(st.max || 0);
-    if (Number.isFinite(timeoutSec) && timeoutSec > 0) {
-      elTuneAuto.textContent = "Return to APRS after " + timeoutSec + "s idle (idle now " + idleSec + "s, range " + minF.toFixed(4) + "-" + maxF.toFixed(4) + " MHz)";
-    }
-  }
-
-  function mulawToLinear(uVal) {
-    uVal = (~uVal) & 0xFF;
-    const sign = uVal & 0x80;
-    const exponent = (uVal >> 4) & 0x07;
-    const mantissa = uVal & 0x0F;
-    let sample = ((mantissa << 3) + 0x84) << exponent;
-    sample -= 0x84;
-    return sign ? -sample : sample;
-  }
-
-  function setVolume(vol) {
-    const gain = Math.max(0, Math.min(1, vol));
-    if (monitor.gainNode) {
-      monitor.gainNode.gain.value = monitor.muted ? 0 : gain;
-    }
-  }
-
-  function clearQueue() {
-    monitor.queue = [];
-    monitor.queueOffset = 0;
-    monitor.queuedSamples = 0;
-    monitor.currentSample = 0;
-    monitor.resampleAcc = 0;
-  }
-
-  function popQueueSample() {
-    if (monitor.queue.length === 0) {
-      return 0;
-    }
-    const chunk = monitor.queue[0];
-    const sample = chunk[monitor.queueOffset++];
-    monitor.queuedSamples--;
-    if (monitor.queueOffset >= chunk.length) {
-      monitor.queue.shift();
-      monitor.queueOffset = 0;
-    }
-    return sample;
-  }
-
-  function ensureAudioPath() {
-    if (!monitor.audioCtx) {
-      monitor.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      monitor.gainNode = monitor.audioCtx.createGain();
-      monitor.procNode = monitor.audioCtx.createScriptProcessor(1024, 1, 1);
-      monitor.procNode.onaudioprocess = function(e) {
-        const out = e.outputBuffer.getChannelData(0);
-        const outputRate = monitor.audioCtx.sampleRate;
-        for (let i = 0; i < out.length; i++) {
-          monitor.resampleAcc += monitor.sampleRate;
-          while (monitor.resampleAcc >= outputRate) {
-            monitor.currentSample = popQueueSample();
-            monitor.resampleAcc -= outputRate;
-          }
-          out[i] = monitor.currentSample;
-        }
-      };
-      monitor.procNode.connect(monitor.gainNode);
-      monitor.gainNode.connect(monitor.audioCtx.destination);
-    }
-    setVolume(parseInt(elVol.value, 10) / 100.0);
-  }
-
-  function stop() {
-    monitor.running = false;
-    elToggle.textContent = "Start Listening";
-    setStatus("Stopped", "#c0392b");
-    if (monitor.ws) {
-      monitor.ws.onopen = null;
-      monitor.ws.onclose = null;
-      monitor.ws.onmessage = null;
-      monitor.ws.onerror = null;
-      monitor.ws.close();
-      monitor.ws = null;
-    }
-    clearQueue();
-    if (monitor.audioCtx && monitor.audioCtx.state !== "closed") {
-      monitor.audioCtx.suspend();
-    }
-  }
-
-  async function start() {
-    ensureAudioPath();
-    await monitor.audioCtx.resume();
-    clearQueue();
-
-    const wsProto = (window.location.protocol === "https:") ? "wss://" : "ws://";
-    monitor.ws = new WebSocket(wsProto + location.host + "/ws_audio");
-    monitor.ws.binaryType = "arraybuffer";
-
-    monitor.ws.onopen = function() {
-      monitor.running = true;
-      elToggle.textContent = "Stop Listening";
-      setStatus("Connected", "#27ae60");
-      tuneApi("touch").then(renderTuneStatus).catch(function(){});
-    };
-
-    monitor.ws.onclose = function() {
-      if (monitor.running) {
-        setStatus("Disconnected", "#e67e22");
-      }
-      stop();
-    };
-
-    monitor.ws.onerror = function() {
-      setStatus("Socket error", "#e74c3c");
-    };
-
-    monitor.ws.onmessage = function(event) {
-      if (typeof event.data === "string") {
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "cfg") {
-            monitor.sampleRate = parseInt(msg.rate || 8000, 10);
-            elCodec.textContent = (monitor.sampleRate + "Hz " + (msg.codec || "mu-law") + " mono");
-          }
-        } catch (_) {}
-        return;
-      }
-
-      const ulaw = new Uint8Array(event.data);
-      const pcm = new Float32Array(ulaw.length);
-      let peak = 0;
-      for (let i = 0; i < ulaw.length; i++) {
-        const s = mulawToLinear(ulaw[i]) / 32768.0;
-        pcm[i] = s;
-        const a = Math.abs(s);
-        if (a > peak) peak = a;
-      }
-      monitor.level = peak;
-      monitor.queue.push(pcm);
-      monitor.queuedSamples += pcm.length;
-
-      const maxSamples = monitor.sampleRate * 2; // keep <= 2 seconds queued
-      while (monitor.queuedSamples > maxSamples && monitor.queue.length > 0) {
-        monitor.queuedSamples -= monitor.queue[0].length;
-        monitor.queue.shift();
-        monitor.queueOffset = 0;
-      }
-    };
-  }
-
-  function toggle() {
-    if (monitor.running) {
-      stop();
-    } else {
-      start().catch(function() {
-        setStatus("Audio start failed", "#e74c3c");
-      });
-    }
-  }
-
-  function toggleMute() {
-    monitor.muted = !monitor.muted;
-    elMute.textContent = monitor.muted ? "Unmute" : "Mute";
-    setVolume(parseInt(elVol.value, 10) / 100.0);
-  }
-
-  async function setTune() {
-    const f = parseFloat(elTuneFreq.value);
-    if (!Number.isFinite(f)) {
-      setStatus("Invalid tune frequency", "#e74c3c");
-      return;
-    }
-    try {
-      const st = await tuneApi("set", f);
-      renderTuneStatus(st);
-      setStatus("Tuned RX " + f.toFixed(4) + " MHz", "#27ae60");
-    } catch (err) {
-      setStatus("Tune failed: " + err.message, "#e74c3c");
-    }
-  }
-
-  async function resetTune() {
-    try {
-      const st = await tuneApi("reset");
-      renderTuneStatus(st);
-      setStatus("Returned to APRS", "#2c3e50");
-    } catch (err) {
-      setStatus("Retune failed: " + err.message, "#e74c3c");
-    }
-  }
-
-  async function refreshTuneStatus() {
-    try {
-      const st = await tuneApi("status");
-      renderTuneStatus(st);
-    } catch (_) {}
-  }
-
-  elToggle.addEventListener("click", toggle);
-  elMute.addEventListener("click", toggleMute);
-  elTuneBtn.addEventListener("click", setTune);
-  elAprsBtn.addEventListener("click", resetTune);
-  elTuneFreq.addEventListener("keydown", function(ev) {
-    if (ev.key === "Enter") {
-      ev.preventDefault();
-      setTune();
-    }
-  });
-  elVol.addEventListener("input", function() {
-    elVolVal.textContent = elVol.value + "%";
-    setVolume(parseInt(elVol.value, 10) / 100.0);
-  });
-
-  setInterval(function() {
-    const qMs = monitor.sampleRate > 0 ? Math.round((monitor.queuedSamples * 1000) / monitor.sampleRate) : 0;
-    elQueue.textContent = qMs + " ms";
-    elLevel.style.width = Math.min(100, Math.round(monitor.level * 100)) + "%";
-    monitor.level *= 0.85;
-  }, 100);
-
-  setInterval(function() {
-    if (monitor.running && monitor.ws && monitor.ws.readyState === WebSocket.OPEN) {
-      monitor.ws.send("ping");
-    }
-  }, 10000);
-
-  setInterval(refreshTuneStatus, 5000);
-  refreshTuneStatus();
-
-  window.__audioMonitor = { stop: stop };
-})();
-</script>
-)HTML";
-
-	const size_t requiredLen = strlen(audioPage) + 1;
-	char *webString = allocateStringMemory(requiredLen + 64);
-	if (!webString)
-	{
-		request->send(500, "text/html", "Memory allocation failed");
-		return;
-	}
-	strcpy(webString, audioPage);
-
-	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
-	response->addHeader("Audio", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
+	request->redirect("/app/");
 }
 
 void handle_audio_tune(AsyncWebServerRequest *request)
@@ -12840,6 +12023,733 @@ void handle_default()
 	defaultSetting = false;
 }
 
+static bool ensureWebAuth(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		request->requestAuthentication();
+		return false;
+	}
+	return true;
+}
+
+static bool isTruthyValue(const String &v)
+{
+	return (v == "1" || v.equalsIgnoreCase("true") || v.equalsIgnoreCase("on") || v.equalsIgnoreCase("ok"));
+}
+
+static void sendJsonDoc(AsyncWebServerRequest *request, int code, JsonDocument &doc)
+{
+	String body;
+	serializeJson(doc, body);
+	request->send(code, "application/json", body);
+}
+
+static int getSqlState()
+{
+	if (config.rf_sql_gpio < 0)
+	{
+		return -1;
+	}
+	const int raw = digitalRead(config.rf_sql_gpio);
+	return ((raw ^ (config.rf_sql_active ? 1 : 0)) == 0) ? 1 : 0;
+}
+
+static void fillRadioStatus(JsonDocument &doc)
+{
+	doc["ok"] = true;
+	doc["rf_en"] = config.rf_en;
+	doc["rf_type"] = config.rf_type;
+	doc["freq_rx"] = config.freq_rx;
+	doc["freq_tx"] = config.freq_tx;
+	doc["tone_rx"] = config.tone_rx;
+	doc["tone_tx"] = config.tone_tx;
+	doc["sql_level"] = config.sql_level;
+	doc["volume"] = config.volume;
+	doc["band"] = config.band;
+	doc["rf_power"] = config.rf_power ? 1 : 0;
+	doc["ptt"] = getTransmit() ? 1 : 0;
+	doc["sq"] = getSqlState();
+	doc["dcss_supported"] = false;
+	doc["ctcss_count"] = (sizeof(ctcss) / sizeof(ctcss[0]));
+}
+
+void handle_api_status(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	serviceWebPttTimeout();
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	doc["host_name"] = config.host_name;
+	doc["fw_version"] = VERSION;
+	doc["schema_version"] = config.cfg_version;
+	doc["wifi_mode"] = config.wifi_mode;
+	doc["ap_ssid"] = config.wifi_ap_ssid;
+	doc["ap_ip"] = WiFi.softAPIP().toString();
+	doc["sta_connected"] = (WiFi.status() == WL_CONNECTED);
+	doc["sta_ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+	doc["mac"] = WiFi.macAddress();
+	doc["rf_en"] = config.rf_en;
+	doc["audio_tune_active"] = audioTuneActive;
+	doc["audio_rx_freq"] = config.freq_rx;
+	doc["audio_aprs_freq"] = audioTuneActive ? audioTuneAprsFreqRx : config.freq_rx;
+	doc["ws_audio_clients"] = ws_audio.count();
+	sendJsonDoc(request, 200, doc);
+}
+
+typedef struct
+{
+	char call[11];
+	time_t lastHeard;
+	time_t lastMsg;
+	time_t lastActive;
+} ContactRecord;
+
+static int findContact(ContactRecord *contacts, int count, const char *call)
+{
+	for (int i = 0; i < count; i++)
+	{
+		if (strcasecmp(contacts[i].call, call) == 0)
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+void handle_api_contacts(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+
+	ContactRecord contacts[PKGLISTSIZE * 2];
+	memset(contacts, 0, sizeof(contacts));
+	int contactCount = 0;
+
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		pkgListType pkg = getPkgList(i);
+		if (pkg.time <= 0 || pkg.calsign[0] == 0)
+		{
+			continue;
+		}
+		char call[11];
+		memset(call, 0, sizeof(call));
+		strlcpy(call, pkg.calsign, sizeof(call));
+		int idx = findContact(contacts, contactCount, call);
+		if (idx < 0)
+		{
+			if (contactCount < (PKGLISTSIZE * 2))
+			{
+				strlcpy(contacts[contactCount].call, call, sizeof(contacts[contactCount].call));
+				contacts[contactCount].lastHeard = pkg.time;
+				contacts[contactCount].lastMsg = 0;
+				contacts[contactCount].lastActive = pkg.time;
+				contactCount++;
+			}
+		}
+		else
+		{
+			if (pkg.time > contacts[idx].lastHeard)
+				contacts[idx].lastHeard = pkg.time;
+			if (pkg.time > contacts[idx].lastActive)
+				contacts[idx].lastActive = pkg.time;
+		}
+	}
+
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		msgType msg = getMsgList(i);
+		if (msg.time <= 0 || msg.callsign[0] == 0)
+		{
+			continue;
+		}
+		char call[11];
+		memset(call, 0, sizeof(call));
+		strlcpy(call, msg.callsign, sizeof(call));
+		int idx = findContact(contacts, contactCount, call);
+		if (idx < 0)
+		{
+			if (contactCount < (PKGLISTSIZE * 2))
+			{
+				strlcpy(contacts[contactCount].call, call, sizeof(contacts[contactCount].call));
+				contacts[contactCount].lastHeard = 0;
+				contacts[contactCount].lastMsg = msg.time;
+				contacts[contactCount].lastActive = msg.time;
+				contactCount++;
+			}
+		}
+		else
+		{
+			if (msg.time > contacts[idx].lastMsg)
+				contacts[idx].lastMsg = msg.time;
+			if (msg.time > contacts[idx].lastActive)
+				contacts[idx].lastActive = msg.time;
+		}
+	}
+
+	for (int i = 0; i < contactCount - 1; i++)
+	{
+		for (int j = i + 1; j < contactCount; j++)
+		{
+			if (contacts[j].lastActive > contacts[i].lastActive)
+			{
+				ContactRecord tmp = contacts[i];
+				contacts[i] = contacts[j];
+				contacts[j] = tmp;
+			}
+		}
+	}
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	JsonArray arr = doc["contacts"].to<JsonArray>();
+	for (int i = 0; i < contactCount; i++)
+	{
+		JsonObject row = arr.add<JsonObject>();
+		row["call"] = contacts[i].call;
+		row["last_active"] = (uint32_t)contacts[i].lastActive;
+		row["last_heard"] = (uint32_t)contacts[i].lastHeard;
+		row["last_msg"] = (uint32_t)contacts[i].lastMsg;
+	}
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_messages(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+
+	String contact = request->arg("contact");
+	contact.trim();
+	contact.toUpperCase();
+
+	typedef struct
+	{
+		time_t time;
+		int8_t ack;
+		bool rxtx;
+		uint16_t msgID;
+		char call[11];
+		char text[241];
+	} MsgRow;
+
+	MsgRow rows[PKGLISTSIZE];
+	memset(rows, 0, sizeof(rows));
+	int rowCount = 0;
+
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		msgType m = getMsgList(i);
+		if (m.time <= 0 || m.callsign[0] == 0 || m.text == nullptr)
+		{
+			continue;
+		}
+		char call[11];
+		memset(call, 0, sizeof(call));
+		strlcpy(call, m.callsign, sizeof(call));
+		String callUpper = String(call);
+		callUpper.toUpperCase();
+		if (contact.length() > 0 && callUpper != contact)
+		{
+			continue;
+		}
+		if (rowCount >= PKGLISTSIZE)
+		{
+			continue;
+		}
+		rows[rowCount].time = m.time;
+		rows[rowCount].ack = m.ack;
+		rows[rowCount].rxtx = m.rxtx;
+		rows[rowCount].msgID = m.msgID;
+		strlcpy(rows[rowCount].call, call, sizeof(rows[rowCount].call));
+		strlcpy(rows[rowCount].text, m.text, sizeof(rows[rowCount].text));
+		rowCount++;
+	}
+
+	for (int i = 0; i < rowCount - 1; i++)
+	{
+		for (int j = i + 1; j < rowCount; j++)
+		{
+			if (rows[j].time < rows[i].time)
+			{
+				MsgRow tmp = rows[i];
+				rows[i] = rows[j];
+				rows[j] = tmp;
+			}
+		}
+	}
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	JsonArray arr = doc["messages"].to<JsonArray>();
+	for (int i = 0; i < rowCount; i++)
+	{
+		JsonObject row = arr.add<JsonObject>();
+		row["ts"] = (uint32_t)rows[i].time;
+		row["call"] = rows[i].call;
+		row["dir"] = rows[i].rxtx ? "rx" : "tx";
+		row["ack"] = rows[i].ack;
+		row["msg_id"] = rows[i].msgID;
+		row["text"] = rows[i].text;
+	}
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_send_message(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+
+	String to = request->arg("to");
+	String text = request->arg("text");
+	to.trim();
+	text.trim();
+	to.toUpperCase();
+	if (to.length() == 0 || text.length() == 0)
+	{
+		JsonDocument doc;
+		doc["ok"] = false;
+		doc["message"] = "to/text required";
+		sendJsonDoc(request, 400, doc);
+		return;
+	}
+
+	bool encrypt = config.msg_encrypt;
+	if (request->hasArg("encrypt"))
+	{
+		encrypt = isTruthyValue(request->arg("encrypt"));
+	}
+	sendAPRSMessage(to, text, encrypt);
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	doc["message"] = "queued";
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_radio_status(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	serviceWebPttTimeout();
+	JsonDocument doc;
+	fillRadioStatus(doc);
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_radio_set(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	serviceWebPttTimeout();
+
+	bool changed = false;
+	float freqMin = 0.0F;
+	float freqMax = 0.0F;
+	getRfRangeForType(config.rf_type, freqMin, freqMax);
+
+	auto clampInt = [](int v, int minV, int maxV)
+	{
+		if (v < minV)
+			return minV;
+		if (v > maxV)
+			return maxV;
+		return v;
+	};
+
+	if (request->hasArg("freq_rx"))
+	{
+		const float v = request->arg("freq_rx").toFloat();
+		if (v >= freqMin && v <= freqMax && absFloat(config.freq_rx - v) > 0.00005F)
+		{
+			config.freq_rx = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("freq_tx"))
+	{
+		const float v = request->arg("freq_tx").toFloat();
+		if (v >= freqMin && v <= freqMax && absFloat(config.freq_tx - v) > 0.00005F)
+		{
+			config.freq_tx = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("tone_rx"))
+	{
+		const int v = clampInt(request->arg("tone_rx").toInt(), 0, (int)(sizeof(ctcss) / sizeof(ctcss[0])) - 1);
+		if (v != config.tone_rx)
+		{
+			config.tone_rx = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("tone_tx"))
+	{
+		const int v = clampInt(request->arg("tone_tx").toInt(), 0, (int)(sizeof(ctcss) / sizeof(ctcss[0])) - 1);
+		if (v != config.tone_tx)
+		{
+			config.tone_tx = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("sql_level"))
+	{
+		const int v = clampInt(request->arg("sql_level").toInt(), 0, 8);
+		if (v != config.sql_level)
+		{
+			config.sql_level = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("volume"))
+	{
+		const int v = clampInt(request->arg("volume").toInt(), 1, 8);
+		if (v != config.volume)
+		{
+			config.volume = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("band"))
+	{
+		const int v = clampInt(request->arg("band").toInt(), 0, 1);
+		if (v != config.band)
+		{
+			config.band = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("rf_power"))
+	{
+		const bool v = isTruthyValue(request->arg("rf_power"));
+		if (v != config.rf_power)
+		{
+			config.rf_power = v;
+			changed = true;
+		}
+	}
+	if (request->hasArg("rf_en"))
+	{
+		const bool v = isTruthyValue(request->arg("rf_en"));
+		if (v != config.rf_en)
+		{
+			config.rf_en = v;
+			changed = true;
+		}
+	}
+
+	if (changed)
+	{
+		RF_MODULE(false);
+	}
+	if (request->hasArg("save") && isTruthyValue(request->arg("save")))
+	{
+		saveConfiguration("/default.cfg", config);
+	}
+
+	JsonDocument doc;
+	fillRadioStatus(doc);
+	doc["changed"] = changed;
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_radio_ptt(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	serviceWebPttTimeout();
+
+	if (!request->hasArg("state"))
+	{
+		JsonDocument doc;
+		doc["ok"] = false;
+		doc["message"] = "state required";
+		sendJsonDoc(request, 400, doc);
+		return;
+	}
+
+	const bool state = isTruthyValue(request->arg("state"));
+	const uint32_t holdMs = request->hasArg("hold_ms") ? (uint32_t)request->arg("hold_ms").toInt() : 1500UL;
+
+	if (state)
+	{
+		if (!config.rf_en)
+		{
+			JsonDocument doc;
+			doc["ok"] = false;
+			doc["message"] = "radio disabled";
+			sendJsonDoc(request, 409, doc);
+			return;
+		}
+		webPttActive = true;
+		webPttExpireMs = millis() + holdMs;
+		setPtt(true);
+	}
+	else if (webPttActive)
+	{
+		setPtt(false);
+		webPttActive = false;
+		webPttExpireMs = 0;
+	}
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	doc["ptt"] = getTransmit() ? 1 : 0;
+	doc["web_ptt"] = webPttActive ? 1 : 0;
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_diag_rf(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	serviceWebPttTimeout();
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	doc["ptt"] = getTransmit() ? 1 : 0;
+	doc["sq"] = getSqlState();
+	doc["tx_audio_activity"] = webPttActive ? 1 : 0;
+	doc["rx_audio_mv"] = mVrms;
+	doc["sta_connected"] = (WiFi.status() == WL_CONNECTED);
+	doc["sta_ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+	doc["ap_ip"] = WiFi.softAPIP().toString();
+	doc["rf_en"] = config.rf_en;
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_selftest(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	serviceWebPttTimeout();
+
+	JsonDocument doc;
+	doc["ok"] = true;
+
+#if defined(KV4P_HT)
+	bool allOk = true;
+	JsonArray checks = doc["checks"].to<JsonArray>();
+	auto addCheck = [&](const char *name, int current, int expected)
+	{
+		JsonObject item = checks.add<JsonObject>();
+		item["name"] = name;
+		item["current"] = current;
+		item["expected"] = expected;
+		const bool ok = (current == expected);
+		item["ok"] = ok;
+		if (!ok)
+			allOk = false;
+	};
+
+	addCheck("rf_tx_gpio", config.rf_tx_gpio, 17);
+	addCheck("rf_rx_gpio", config.rf_rx_gpio, 16);
+	addCheck("rf_sql_gpio", config.rf_sql_gpio, 4);
+	addCheck("rf_pd_gpio", config.rf_pd_gpio, 19);
+	addCheck("rf_ptt_gpio", config.rf_ptt_gpio, 18);
+	addCheck("adc_gpio", config.adc_gpio, 34);
+	addCheck("dac_gpio", config.dac_gpio, 25);
+	doc["kv4p_2_0d_pass"] = allOk;
+#else
+	doc["kv4p_2_0d_pass"] = false;
+	doc["message"] = "Self-test profile currently implemented for KV4P_HT build.";
+#endif
+
+	doc["ptt_state"] = getTransmit() ? 1 : 0;
+	doc["sql_state"] = getSqlState();
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_config(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+
+	if (request->method() == HTTP_POST)
+	{
+		if (request->hasArg("msg_webhook_enable"))
+		{
+			config.msg_webhook_enable = isTruthyValue(request->arg("msg_webhook_enable"));
+		}
+		if (request->hasArg("msg_webhook_timeout_ms"))
+		{
+			uint16_t timeout = request->arg("msg_webhook_timeout_ms").toInt();
+			if (timeout < 200)
+				timeout = 200;
+			if (timeout > 10000)
+				timeout = 10000;
+			config.msg_webhook_timeout_ms = timeout;
+		}
+		if (request->hasArg("msg_webhook_url"))
+		{
+			strlcpy(config.msg_webhook_url, request->arg("msg_webhook_url").c_str(), sizeof(config.msg_webhook_url));
+		}
+		config.cfg_version = 2;
+		saveConfiguration("/default.cfg", config);
+	}
+
+	JsonDocument doc;
+	doc["ok"] = true;
+	doc["cfg_version"] = config.cfg_version;
+	doc["msg_webhook_enable"] = config.msg_webhook_enable;
+	doc["msg_webhook_url"] = config.msg_webhook_url;
+	doc["msg_webhook_timeout_ms"] = config.msg_webhook_timeout_ms;
+	sendJsonDoc(request, 200, doc);
+}
+
+void handle_api_config_backup(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	if (!LITTLEFS.exists("/default.cfg"))
+	{
+		request->send(404, "application/json", "{\"ok\":false,\"message\":\"default.cfg missing\"}");
+		return;
+	}
+	AsyncWebServerResponse *response = request->beginResponse(LITTLEFS, "/default.cfg", "application/json", true);
+	response->addHeader("Content-Disposition", "attachment; filename=\"default.cfg\"");
+	request->send(response);
+}
+
+static bool configRestoreUploadOk = true;
+void handleConfigRestoreUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
+{
+	(void)filename;
+	if (index == 0)
+	{
+		if (!request->authenticate(config.http_username, config.http_password))
+		{
+			configRestoreUploadOk = false;
+			return;
+		}
+		configRestoreUploadOk = true;
+		if (LITTLEFS.exists("/default.cfg.upload"))
+		{
+			LITTLEFS.remove("/default.cfg.upload");
+		}
+		request->_tempFile = LITTLEFS.open("/default.cfg.upload", "w");
+		if (!request->_tempFile)
+		{
+			configRestoreUploadOk = false;
+			return;
+		}
+	}
+
+	if (!configRestoreUploadOk)
+	{
+		return;
+	}
+
+	if (request->_tempFile && len > 0)
+	{
+		if (request->_tempFile.write(data, len) != len)
+		{
+			configRestoreUploadOk = false;
+		}
+	}
+
+	if (final)
+	{
+		if (request->_tempFile)
+		{
+			request->_tempFile.close();
+		}
+		if (!configRestoreUploadOk)
+		{
+			LITTLEFS.remove("/default.cfg.upload");
+			return;
+		}
+		if (LITTLEFS.exists("/default.cfg"))
+		{
+			LITTLEFS.remove("/default.cfg");
+		}
+		if (!LITTLEFS.rename("/default.cfg.upload", "/default.cfg"))
+		{
+			configRestoreUploadOk = false;
+			LITTLEFS.remove("/default.cfg.upload");
+		}
+	}
+}
+
+void handle_api_config_restore(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+
+	JsonDocument doc;
+	if (!configRestoreUploadOk)
+	{
+		doc["ok"] = false;
+		doc["message"] = "upload failed";
+		sendJsonDoc(request, 500, doc);
+		return;
+	}
+	if (!loadConfiguration("/default.cfg", config))
+	{
+		doc["ok"] = false;
+		doc["message"] = "invalid config";
+		sendJsonDoc(request, 422, doc);
+		return;
+	}
+
+	saveConfiguration("/default.cfg", config);
+	RF_MODULE(false);
+	doc["ok"] = true;
+	doc["message"] = "config restored";
+	sendJsonDoc(request, 200, doc);
+}
+
+static void serveAppAsset(AsyncWebServerRequest *request, const char *path, const char *contentType)
+{
+	if (!ensureWebAuth(request))
+		return;
+
+	String gzPath = String(path) + ".gz";
+	AsyncWebServerResponse *response = nullptr;
+	if (LITTLEFS.exists(gzPath))
+	{
+		response = request->beginResponse(LITTLEFS, gzPath, contentType);
+		response->addHeader("Content-Encoding", "gzip");
+	}
+	else if (LITTLEFS.exists(path))
+	{
+		response = request->beginResponse(LITTLEFS, path, contentType);
+	}
+	else
+	{
+		request->send(404, "text/plain", "Static asset not found");
+		return;
+	}
+	response->addHeader("Cache-Control", "no-cache");
+	request->send(response);
+}
+
+void handle_app_root(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	request->redirect("/app/");
+}
+
+void handle_app_index(AsyncWebServerRequest *request)
+{
+	serveAppAsset(request, "/app/index.html", "text/html");
+}
+
+void handle_app_js(AsyncWebServerRequest *request)
+{
+	serveAppAsset(request, "/app/app.js", "application/javascript");
+}
+
+void handle_app_css(AsyncWebServerRequest *request)
+{
+	serveAppAsset(request, "/app/app.css", "text/css");
+}
+
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
     if (!index) {
         // Open the file in write mode on the first chunk
@@ -12864,6 +12774,7 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
 
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
 {
+	serviceWebPttTimeout();
 
 	if (type == WS_EVT_CONNECT)
 	{
@@ -12934,90 +12845,67 @@ void webService()
 
 	// web client handlers
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ setMainPage(request); });
-	async_server.on("/symbol", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_symbol(request); });
-	// async_server.on("/symbol2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-	// 				{ handle_symbol2(request); });
+					{ handle_app_root(request); });
+	async_server.on("/app", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_root(request); });
+	async_server.on("/legacy", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_root(request); });
+	async_server.on("/app/", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_index(request); });
+	async_server.on("/app/index.html", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_index(request); });
+	async_server.on("/app/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_js(request); });
+	async_server.on("/app/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_css(request); });
 	async_server.on("/logout", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_logout(request); });
-	async_server.on("/radio", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_radio(request); });
-	async_server.on("/vpn", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_vpn(request); });
-#ifdef MQTT
-	async_server.on("/mqtt", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_mqtt(request); });
-#endif
-	async_server.on("/msg", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_msg(request); });
-	async_server.on("/mod", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_mod(request); });
-	async_server.on("/default", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_default(); });
-	async_server.on("/igate", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_igate(request); });
-	async_server.on("/digi", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_digi(request); });
-	async_server.on("/tracker", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_tracker(request); });
-	async_server.on("/wx", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_wx(request); });
-	async_server.on("/tlm", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_tlm(request); });
-	async_server.on("/sensor", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_sensor(request); });
-	async_server.on("/audio", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_audio(request); });
 	async_server.on("/audio_tune", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_audio_tune(request); });
-	async_server.on("/system", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_system(request); });
-	async_server.on("/wireless", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_wireless(request); });
-	async_server.on("/tnc2", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_test(request); });
-	async_server.on("/gnss", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_gnss(request); });
-	// async_server.on("/realtime", HTTP_GET, [](AsyncWebServerRequest *request)
-	// 				{ handle_realtime(request); });
-	async_server.on("/about", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_about(request); });
-	async_server.on("/dashboard", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_dashboard(request); });
-	async_server.on("/sidebarInfo", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_sidebar(request); });
-	async_server.on("/sysinfo", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_sysinfo(request); });
-	// async_server.on("/lastHeard", HTTP_GET, [](AsyncWebServerRequest *request)
-	// 				{ handle_lastHeard(request); });
-	async_server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_css(request); });
-	async_server.on("/jquery-3.7.1.js", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_jquery(request); });
-	async_server.on("/storage", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_storage(request); });
-	async_server.on("/download", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_download(request); });
-	async_server.on("/delete", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_delete(request); });
-	async_server.on("/format", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
-					{ handle_format(request); });
-	// Route to handle the file upload
-    async_server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request) {
-        request->send(200, "text/plain", "File uploaded successfully!");
-    }, handleUpload); // Pass the handleUpload function as the upload handler
+	async_server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_status(request); });
+	async_server.on("/api/contacts", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_contacts(request); });
+	async_server.on("/api/messages", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_messages(request); });
+	async_server.on("/api/message/send", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_api_send_message(request); });
+	async_server.on("/api/radio/status", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_radio_status(request); });
+	async_server.on("/api/radio/set", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_api_radio_set(request); });
+	async_server.on("/api/radio/ptt", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_api_radio_ptt(request); });
+	async_server.on("/api/diag/rf", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_diag_rf(request); });
+	async_server.on("/api/selftest", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_selftest(request); });
+	async_server.on("/api/config", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_api_config(request); });
+	async_server.on("/api/config/backup", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_api_config_backup(request); });
+	async_server.on("/api/config/restore", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_api_config_restore(request); },
+					handleConfigRestoreUpload);
 
 	// async_server.on("/api/vpnreq", HTTP_GET, handle_vpn_request);
 	async_server.on(
 		"/update", HTTP_POST, [](AsyncWebServerRequest *request)
 		{
+		if (!request->authenticate(config.http_username, config.http_password))
+		{
+			return request->requestAuthentication();
+		}
   		bool espShouldReboot = !Update.hasError();
-  		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", espShouldReboot ? "<h1><strong>Update DONE</strong></h1><br><a href='/'>Return Home</a>" : "<h1><strong>Update FAILED</strong></h1><br><a href='/updt'>Retry?</a>");
+  		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", espShouldReboot ? "<h1><strong>Update DONE</strong></h1><br><a href='/app/'>Return Home</a>" : "<h1><strong>Update FAILED</strong></h1><br><a href='/app/'>Retry?</a>");
   		response->addHeader("Connection", "close");
   		request->send(response); },
 		[](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
 		{
+			if (!request->authenticate(config.http_username, config.http_password))
+			{
+				return;
+			}
 			if (!index)
 			{
 				log_d("Update Start: %s\n", filename.c_str());

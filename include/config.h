@@ -489,6 +489,10 @@ typedef struct Config_Struct
 	char msg_key[33];
 	uint8_t msg_retry;
 	uint16_t msg_interval;
+	uint16_t cfg_version;
+	bool msg_webhook_enable;
+	uint16_t msg_webhook_timeout_ms;
+	char msg_webhook_url[128];
 
 } Configuration;
 

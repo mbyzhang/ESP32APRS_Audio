@@ -1985,6 +1985,10 @@ void defaultConfig()
     config.msg_path = 9;
     sprintf(config.msg_key, "8EC8233E91D59B0164C24E771BA66307");
     sprintf(config.msg_mycall, "NOCALL");
+    config.cfg_version = 2;
+    config.msg_webhook_enable = false;
+    config.msg_webhook_timeout_ms = 1500;
+    memset(config.msg_webhook_url, 0, sizeof(config.msg_webhook_url));
 
     config.log = 0;
 #ifdef MQTT

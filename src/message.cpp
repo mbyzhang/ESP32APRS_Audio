@@ -6,6 +6,9 @@
 #include <parse_aprs.h>
 #include "webservice.h"
 #include <MD5Builder.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
 
 #define AES_BLOCK_SIZE 16
 
@@ -17,6 +20,85 @@ extern Configuration config;
 extern SemaphoreHandle_t psramMutex;
 extern bool psramLock(TickType_t timeout = portMAX_DELAY);
 extern void psramUnlock();
+
+static String jsonEscape(const String &value)
+{
+    String out;
+    out.reserve(value.length() + 8);
+    for (size_t i = 0; i < value.length(); i++)
+    {
+        const char c = value.charAt(i);
+        switch (c)
+        {
+        case '\"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            out += c;
+            break;
+        }
+    }
+    return out;
+}
+
+static void postIncomingMessageWebhook(const String &fromCall, const String &toCall, const String &message, const String &msgNo)
+{
+    if (!config.msg_webhook_enable || strlen(config.msg_webhook_url) == 0)
+        return;
+    if (WiFi.status() != WL_CONNECTED)
+        return;
+
+    const uint16_t timeoutMs = (config.msg_webhook_timeout_ms < 200) ? 200 : config.msg_webhook_timeout_ms;
+    HTTPClient http;
+    const String url = String(config.msg_webhook_url);
+    bool beginOk = false;
+
+    if (url.startsWith("https://"))
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
+        beginOk = http.begin(client, url);
+    }
+    else
+    {
+        beginOk = http.begin(url);
+    }
+
+    if (!beginOk)
+    {
+        log_w("Webhook begin failed");
+        return;
+    }
+
+    http.setConnectTimeout(timeoutMs);
+    http.setTimeout(timeoutMs);
+    http.addHeader("Content-Type", "application/json");
+
+    String body = "{";
+    body += "\"type\":\"aprs_message\",";
+    body += "\"from\":\"" + jsonEscape(fromCall) + "\",";
+    body += "\"to\":\"" + jsonEscape(toCall) + "\",";
+    body += "\"message\":\"" + jsonEscape(message) + "\",";
+    body += "\"msgId\":\"" + jsonEscape(msgNo) + "\",";
+    body += "\"ts\":" + String((uint32_t)time(NULL));
+    body += "}";
+
+    int code = http.POST(body);
+    log_d("Webhook POST code=%d", code);
+    http.end();
+}
 
 // แปลง bytes → HEX string
 String bytesToHexString(const uint8_t *data, size_t len)
@@ -596,6 +678,7 @@ void handleIncomingAPRS(const String &line)
                     if (decrypted == "")
                         return;
                     pkgMsgUpdate(fromCall.c_str(), decrypted.c_str(), msgNo.toInt(), -1, true); // RX Message
+                    postIncomingMessageWebhook(fromCall, toCall, decrypted, msgNo);
                     sendAPRSAck(fromCall, msgNo);
                     if (config.at_cmd_msg)
                     {
