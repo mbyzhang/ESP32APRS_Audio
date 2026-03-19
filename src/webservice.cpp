@@ -756,6 +756,24 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	else
 		strcat(webString, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disconnect</td>\n");
 	strcat(webString, "</tr>\n");
+	strcat(webString, "<tr>\n");
+	strcat(webString, "<td>STA IP</td>\n");
+	IPAddress staIp = WiFi.localIP();
+	bool staHasIp = WiFi.isConnected() && (staIp[0] || staIp[1] || staIp[2] || staIp[3]);
+	if (staHasIp)
+	{
+		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background:#d8ffd8; color:#034f03;\"><b>%s</b></td>\n", staIp.toString().c_str());
+		strcat(webString, temp_buffer);
+	}
+	else if (config.wifi_mode & WIFI_STA_FIX)
+	{
+		strcat(webString, "<td style=\"background:#fff6cc; color:#7a5d00;\">Waiting DHCP</td>\n");
+	}
+	else
+	{
+		strcat(webString, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">STA disabled</td>\n");
+	}
+	strcat(webString, "</tr>\n");
 	strcat(webString, "</table>\n");
 	strcat(webString, "<br />\n");
 #ifdef BLUETOOTH
@@ -863,6 +881,7 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	{
 		return; // Memory allocation failed
 	}
+	char temp_buffer[64];
 
 	strcpy(html, "<table style=\"background:white;border-collapse: unset;\">\n");
 	strcat(html, "<tr>\n");
@@ -928,13 +947,42 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	strcat(html, "<br />\n");
 	strcat(html, "<table>\n");
 	strcat(html, "<tr>\n");
+	strcat(html, "<th colspan=\"2\">WiFi STA</th>\n");
+	strcat(html, "</tr>\n");
+	strcat(html, "<tr>\n");
+	strcat(html, "<td style=\"width: 60px;text-align: right;\">LINK:</td>\n");
+	IPAddress staIp = WiFi.localIP();
+	bool staEnabled = (config.wifi_mode & WIFI_STA_FIX);
+	bool staHasIp = WiFi.isConnected() && (staIp[0] || staIp[1] || staIp[2] || staIp[3]);
+	if (staHasIp)
+		strcat(html, "<td style=\"background:#0b0; color:#030;\"><b>Connected</b></td>\n");
+	else if (staEnabled)
+		strcat(html, "<td style=\"background:#fff6cc; color:#7a5d00;\">Connecting...</td>\n");
+	else
+		strcat(html, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disabled</td>\n");
+	strcat(html, "</tr>\n");
+	strcat(html, "<tr>\n");
+	strcat(html, "<td style=\"width: 60px;text-align: right;\">IP:</td>\n");
+	if (staHasIp)
+	{
+		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background:#d8ffd8; color:#034f03;\"><b>%s</b></td>\n", staIp.toString().c_str());
+		strcat(html, temp_buffer);
+	}
+	else
+	{
+		strcat(html, "<td style=\"background:#ffffff; color:#999999;\">-</td>\n");
+	}
+	strcat(html, "</tr>\n");
+	strcat(html, "</table>\n");
+	strcat(html, "<br />\n");
+	strcat(html, "<table>\n");
+	strcat(html, "<tr>\n");
 	strcat(html, "<th colspan=\"2\">STATISTICS</th>\n");
 	strcat(html, "</tr>\n");
 	strcat(html, "<tr>\n");
 	strcat(html, "<td style=\"width: 60px;text-align: right;\">RADIO RX:</td>\n");
 
 	// Convert numeric values to strings using temporary buffers
-	char temp_buffer[64];
 	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.rxCount);
 	strcat(html, temp_buffer);
 
@@ -11710,7 +11758,8 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     await monitor.audioCtx.resume();
     clearQueue();
 
-    monitor.ws = new WebSocket("ws://" + location.hostname + ":81/ws_audio");
+    const wsProto = (window.location.protocol === "https:") ? "wss://" : "ws://";
+    monitor.ws = new WebSocket(wsProto + location.host + "/ws_audio");
     monitor.ws.binaryType = "arraybuffer";
 
     monitor.ws.onopen = function() {
@@ -12516,6 +12565,6 @@ void webService()
 	async_server.begin();
 	async_websocket.addHandler(&ws);
 	async_websocket.addHandler(&ws_gnss);
-	async_websocket.addHandler(&ws_audio);
+	async_server.addHandler(&ws_audio);
 	async_websocket.begin();
 }
