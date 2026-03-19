@@ -208,6 +208,12 @@ const char *str_status[] = {
     "DISCONNECTED"};
 
 WiFiMulti wifiMulti;
+volatile bool wifiReconfigureRequested = false;
+
+void requestWifiReconfigure()
+{
+    wifiReconfigureRequested = true;
+}
 
 time_t systemUptime = 0;
 time_t wifiUptime = 0;
@@ -8137,6 +8143,39 @@ void taskNetwork(void *pvParameters)
         timerNetwork = micros() - timerNetwork_old;
         vTaskDelay(10 / portTICK_PERIOD_MS);
         timerNetwork_old = micros();
+
+        if (wifiReconfigureRequested)
+        {
+            wifiReconfigureRequested = false;
+            log_d("Applying WiFi config requested by WebUI");
+            if (config.wifi_mode & WIFI_STA_FIX)
+            {
+                wifiConnection();
+            }
+            else
+            {
+                WiFi.disconnect(true, true, 500);
+                WiFi.persistent(false);
+                WiFi.mode(WIFI_OFF);
+                delay(100);
+                if (config.wifi_mode == WIFI_AP_FIX)
+                {
+                    WiFi.mode(WIFI_MODE_AP);
+                }
+                else
+                {
+                    WiFi.mode(WIFI_MODE_NULL);
+                }
+                WiFi.setTxPower((wifi_power_t)config.wifi_power);
+            }
+
+            if (config.wifi_mode & WIFI_AP_FIX)
+            {
+                WiFi.AP.begin();
+                WiFi.AP.config(ap_ip, ap_ip, ap_mask, ap_leaseStart, ap_dns);
+                WiFi.AP.create(config.wifi_ap_ssid, config.wifi_ap_pass);
+            }
+        }
 
 #ifdef PPPOS
         if (config.ppp_enable)

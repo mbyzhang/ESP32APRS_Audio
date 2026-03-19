@@ -813,7 +813,7 @@ void AsyncWebServerRequest::redirect(const String& url){
 bool AsyncWebServerRequest::authenticate(const char * username, const char * password, const char * realm, bool passwordIsHash){
   if(_authorization.length()){
     if(_isDigest)
-      return checkDigestAuthentication(_authorization.c_str(), methodToString(), username, password, realm, passwordIsHash, NULL, NULL, NULL);
+      return false; // Digest disabled: avoids MD5 stack pressure in async_tcp task.
     else if(!passwordIsHash)
       return checkBasicAuthentication(_authorization.c_str(), username, password);
     else
@@ -827,18 +827,7 @@ bool AsyncWebServerRequest::authenticate(const char * hash){
     return false;
 
   if(_isDigest){
-    String hStr = String(hash);
-    int separator = hStr.indexOf(":");
-    if(separator <= 0)
-      return false;
-    String username = hStr.substring(0, separator);
-    hStr = hStr.substring(separator + 1);
-    separator = hStr.indexOf(":");
-    if(separator <= 0)
-      return false;
-    String realm = hStr.substring(0, separator);
-    hStr = hStr.substring(separator + 1);
-    return checkDigestAuthentication(_authorization.c_str(), methodToString(), username.c_str(), hStr.c_str(), realm.c_str(), true, NULL, NULL, NULL);
+    return false; // Digest disabled: avoids MD5 stack pressure in async_tcp task.
   }
 
   return (_authorization.equals(hash));

@@ -397,6 +397,7 @@ const char MIC_E_MSG[8][10] = {"Emergency", "Priority", "Special", "Committed", 
 uint8_t checkSum(uint8_t *ptr, size_t count);
 //void saveEEPROM();
 void defaultConfig();
+void requestWifiReconfigure();
 String getValue(String data, char separator, int index);
 boolean isValidNumber(String str);
 void taskSerial(void *pvParameters);

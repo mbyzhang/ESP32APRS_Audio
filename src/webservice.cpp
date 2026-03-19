@@ -298,6 +298,7 @@ extern Adafruit_SSD1306 display;
 #endif // OLED
 
 bool defaultSetting = false;
+static bool ensureWebAuth(AsyncWebServerRequest *request);
 
 void saveConfig(AsyncWebServerRequest *request)
 {
@@ -339,9 +340,9 @@ void handle_logout(AsyncWebServerRequest *request)
 
 void setMainPage(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 
 	// Using dynamic memory allocation instead of String
@@ -1192,9 +1193,9 @@ void handle_dashboard(AsyncWebServerRequest *request)
 
 void handle_sidebar(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 
 	// Using dynamic memory allocation instead of String
@@ -1562,9 +1563,9 @@ String event_chatMessage(bool gethtml)
 
 void handle_storage(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	adcEn = -1;
 	dacEn = -1;
@@ -1864,9 +1865,9 @@ void handle_storage(AsyncWebServerRequest *request)
 
 void handle_download(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	String dataType = "";
 	String path = "";
@@ -1952,9 +1953,9 @@ void handle_download(AsyncWebServerRequest *request)
 
 void handle_delete(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	String html = "FAIL";
 	String dataType = "text/plain";
@@ -1992,9 +1993,9 @@ void handle_delete(AsyncWebServerRequest *request)
 
 void handle_format(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	String html = "FAIL";
 	if (request->args() > 0)
@@ -2018,9 +2019,9 @@ void handle_format(AsyncWebServerRequest *request)
 
 void handle_radio(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	// bool noiseEn=false;
 	bool radioEnable = false;
@@ -2600,9 +2601,9 @@ void handle_radio(AsyncWebServerRequest *request)
 
 void handle_vpn(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -2881,9 +2882,9 @@ void handle_vpn(AsyncWebServerRequest *request)
 #ifdef MQTT
 void handle_mqtt(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -3232,9 +3233,9 @@ void handle_mqtt(AsyncWebServerRequest *request)
 
 void handle_msg(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -3561,9 +3562,9 @@ void handle_msg(AsyncWebServerRequest *request)
 
 void handle_mod(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -5644,9 +5645,9 @@ void handle_mod(AsyncWebServerRequest *request)
 
 void handle_system(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -6845,9 +6846,9 @@ void handle_system(AsyncWebServerRequest *request)
 
 void handle_igate(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -7826,9 +7827,9 @@ void handle_igate(AsyncWebServerRequest *request)
 
 void handle_digi(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -8602,9 +8603,9 @@ void handle_digi(AsyncWebServerRequest *request)
 
 void handle_wx(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -9047,9 +9048,9 @@ void handle_wx(AsyncWebServerRequest *request)
 
 void handle_tlm(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -9567,9 +9568,9 @@ extern TaskHandle_t taskSensorHandle;
 
 void handle_sensor(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 	String arg = "";
@@ -10092,9 +10093,9 @@ void handle_sensor(AsyncWebServerRequest *request)
 
 void handle_tracker(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -10869,9 +10870,9 @@ void handle_tracker(AsyncWebServerRequest *request)
 
 void handle_wireless(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	StandByTick = millis() + (config.pwr_stanby_delay * 1000);
 
@@ -11458,27 +11459,27 @@ void handle_ws_gnss(char *nmea, size_t size)
 
 void handle_test(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	request->redirect("/app/");
 }
 
 void handle_audio(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	request->redirect("/app/");
 }
 
 void handle_audio_tune(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 
 	float freqMin = 0.0F;
@@ -11569,9 +11570,9 @@ void handle_audio_tune(AsyncWebServerRequest *request)
 
 void handle_about(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (!ensureWebAuth(request))
 	{
-		return request->requestAuthentication();
+		return;
 	}
 	char strCID[50];
 	uint64_t chipid = ESP.getEfuseMac();
@@ -12025,12 +12026,16 @@ void handle_default()
 
 static bool ensureWebAuth(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (config.http_username[0] == '\0' && config.http_password[0] == '\0')
 	{
-		request->requestAuthentication();
-		return false;
+		return true;
 	}
-	return true;
+	if (request->authenticate(config.http_username, config.http_password, "Login Required", false))
+	{
+		return true;
+	}
+	request->requestAuthentication("Login Required", false);
+	return false;
 }
 
 static bool isTruthyValue(const String &v)
@@ -12124,8 +12129,15 @@ void handle_api_contacts(AsyncWebServerRequest *request)
 	if (!ensureWebAuth(request))
 		return;
 
-	ContactRecord contacts[PKGLISTSIZE * 2];
-	memset(contacts, 0, sizeof(contacts));
+	const size_t maxContacts = (size_t)PKGLISTSIZE * 2U;
+	std::unique_ptr<ContactRecord, decltype(&free)> contacts(
+		(ContactRecord *)calloc(maxContacts, sizeof(ContactRecord)),
+		&free);
+	if (!contacts)
+	{
+		request->send(503, "application/json", "{\"ok\":false,\"message\":\"oom\"}");
+		return;
+	}
 	int contactCount = 0;
 
 	for (int i = 0; i < PKGLISTSIZE; i++)
@@ -12138,26 +12150,26 @@ void handle_api_contacts(AsyncWebServerRequest *request)
 		char call[11];
 		memset(call, 0, sizeof(call));
 		strlcpy(call, pkg.calsign, sizeof(call));
-		int idx = findContact(contacts, contactCount, call);
-		if (idx < 0)
-		{
-			if (contactCount < (PKGLISTSIZE * 2))
+			int idx = findContact(contacts.get(), contactCount, call);
+			if (idx < 0)
 			{
-				strlcpy(contacts[contactCount].call, call, sizeof(contacts[contactCount].call));
-				contacts[contactCount].lastHeard = pkg.time;
-				contacts[contactCount].lastMsg = 0;
-				contacts[contactCount].lastActive = pkg.time;
-				contactCount++;
+				if ((size_t)contactCount < maxContacts)
+				{
+					strlcpy(contacts.get()[contactCount].call, call, sizeof(contacts.get()[contactCount].call));
+					contacts.get()[contactCount].lastHeard = pkg.time;
+					contacts.get()[contactCount].lastMsg = 0;
+					contacts.get()[contactCount].lastActive = pkg.time;
+					contactCount++;
+				}
+			}
+			else
+			{
+				if (pkg.time > contacts.get()[idx].lastHeard)
+					contacts.get()[idx].lastHeard = pkg.time;
+				if (pkg.time > contacts.get()[idx].lastActive)
+					contacts.get()[idx].lastActive = pkg.time;
 			}
 		}
-		else
-		{
-			if (pkg.time > contacts[idx].lastHeard)
-				contacts[idx].lastHeard = pkg.time;
-			if (pkg.time > contacts[idx].lastActive)
-				contacts[idx].lastActive = pkg.time;
-		}
-	}
 
 	for (int i = 0; i < PKGLISTSIZE; i++)
 	{
@@ -12169,39 +12181,39 @@ void handle_api_contacts(AsyncWebServerRequest *request)
 		char call[11];
 		memset(call, 0, sizeof(call));
 		strlcpy(call, msg.callsign, sizeof(call));
-		int idx = findContact(contacts, contactCount, call);
-		if (idx < 0)
-		{
-			if (contactCount < (PKGLISTSIZE * 2))
+			int idx = findContact(contacts.get(), contactCount, call);
+			if (idx < 0)
 			{
-				strlcpy(contacts[contactCount].call, call, sizeof(contacts[contactCount].call));
-				contacts[contactCount].lastHeard = 0;
-				contacts[contactCount].lastMsg = msg.time;
-				contacts[contactCount].lastActive = msg.time;
-				contactCount++;
+				if ((size_t)contactCount < maxContacts)
+				{
+					strlcpy(contacts.get()[contactCount].call, call, sizeof(contacts.get()[contactCount].call));
+					contacts.get()[contactCount].lastHeard = 0;
+					contacts.get()[contactCount].lastMsg = msg.time;
+					contacts.get()[contactCount].lastActive = msg.time;
+					contactCount++;
+				}
+			}
+			else
+			{
+				if (msg.time > contacts.get()[idx].lastMsg)
+					contacts.get()[idx].lastMsg = msg.time;
+				if (msg.time > contacts.get()[idx].lastActive)
+					contacts.get()[idx].lastActive = msg.time;
 			}
 		}
-		else
-		{
-			if (msg.time > contacts[idx].lastMsg)
-				contacts[idx].lastMsg = msg.time;
-			if (msg.time > contacts[idx].lastActive)
-				contacts[idx].lastActive = msg.time;
-		}
-	}
 
 	for (int i = 0; i < contactCount - 1; i++)
 	{
 		for (int j = i + 1; j < contactCount; j++)
 		{
-			if (contacts[j].lastActive > contacts[i].lastActive)
-			{
-				ContactRecord tmp = contacts[i];
-				contacts[i] = contacts[j];
-				contacts[j] = tmp;
+				if (contacts.get()[j].lastActive > contacts.get()[i].lastActive)
+				{
+					ContactRecord tmp = contacts.get()[i];
+					contacts.get()[i] = contacts.get()[j];
+					contacts.get()[j] = tmp;
+				}
 			}
 		}
-	}
 
 	JsonDocument doc;
 	doc["ok"] = true;
@@ -12209,11 +12221,11 @@ void handle_api_contacts(AsyncWebServerRequest *request)
 	for (int i = 0; i < contactCount; i++)
 	{
 		JsonObject row = arr.add<JsonObject>();
-		row["call"] = contacts[i].call;
-		row["last_active"] = (uint32_t)contacts[i].lastActive;
-		row["last_heard"] = (uint32_t)contacts[i].lastHeard;
-		row["last_msg"] = (uint32_t)contacts[i].lastMsg;
-	}
+			row["call"] = contacts.get()[i].call;
+			row["last_active"] = (uint32_t)contacts.get()[i].lastActive;
+			row["last_heard"] = (uint32_t)contacts.get()[i].lastHeard;
+			row["last_msg"] = (uint32_t)contacts.get()[i].lastMsg;
+		}
 	sendJsonDoc(request, 200, doc);
 }
 
@@ -12236,8 +12248,15 @@ void handle_api_messages(AsyncWebServerRequest *request)
 		char text[241];
 	} MsgRow;
 
-	MsgRow rows[PKGLISTSIZE];
-	memset(rows, 0, sizeof(rows));
+	const size_t maxRows = (size_t)PKGLISTSIZE;
+	std::unique_ptr<MsgRow, decltype(&free)> rows(
+		(MsgRow *)calloc(maxRows, sizeof(MsgRow)),
+		&free);
+	if (!rows)
+	{
+		request->send(503, "application/json", "{\"ok\":false,\"message\":\"oom\"}");
+		return;
+	}
 	int rowCount = 0;
 
 	for (int i = 0; i < PKGLISTSIZE; i++)
@@ -12256,16 +12275,16 @@ void handle_api_messages(AsyncWebServerRequest *request)
 		{
 			continue;
 		}
-		if (rowCount >= PKGLISTSIZE)
+		if ((size_t)rowCount >= maxRows)
 		{
 			continue;
 		}
-		rows[rowCount].time = m.time;
-		rows[rowCount].ack = m.ack;
-		rows[rowCount].rxtx = m.rxtx;
-		rows[rowCount].msgID = m.msgID;
-		strlcpy(rows[rowCount].call, call, sizeof(rows[rowCount].call));
-		strlcpy(rows[rowCount].text, m.text, sizeof(rows[rowCount].text));
+		rows.get()[rowCount].time = m.time;
+		rows.get()[rowCount].ack = m.ack;
+		rows.get()[rowCount].rxtx = m.rxtx;
+		rows.get()[rowCount].msgID = m.msgID;
+		strlcpy(rows.get()[rowCount].call, call, sizeof(rows.get()[rowCount].call));
+		strlcpy(rows.get()[rowCount].text, m.text, sizeof(rows.get()[rowCount].text));
 		rowCount++;
 	}
 
@@ -12273,14 +12292,14 @@ void handle_api_messages(AsyncWebServerRequest *request)
 	{
 		for (int j = i + 1; j < rowCount; j++)
 		{
-			if (rows[j].time < rows[i].time)
-			{
-				MsgRow tmp = rows[i];
-				rows[i] = rows[j];
-				rows[j] = tmp;
+				if (rows.get()[j].time < rows.get()[i].time)
+				{
+					MsgRow tmp = rows.get()[i];
+					rows.get()[i] = rows.get()[j];
+					rows.get()[j] = tmp;
+				}
 			}
 		}
-	}
 
 	JsonDocument doc;
 	doc["ok"] = true;
@@ -12288,13 +12307,13 @@ void handle_api_messages(AsyncWebServerRequest *request)
 	for (int i = 0; i < rowCount; i++)
 	{
 		JsonObject row = arr.add<JsonObject>();
-		row["ts"] = (uint32_t)rows[i].time;
-		row["call"] = rows[i].call;
-		row["dir"] = rows[i].rxtx ? "rx" : "tx";
-		row["ack"] = rows[i].ack;
-		row["msg_id"] = rows[i].msgID;
-		row["text"] = rows[i].text;
-	}
+			row["ts"] = (uint32_t)rows.get()[i].time;
+			row["call"] = rows.get()[i].call;
+			row["dir"] = rows.get()[i].rxtx ? "rx" : "tx";
+			row["ack"] = rows.get()[i].ack;
+			row["msg_id"] = rows.get()[i].msgID;
+			row["text"] = rows.get()[i].text;
+		}
 	sendJsonDoc(request, 200, doc);
 }
 
@@ -12347,6 +12366,7 @@ void handle_api_radio_set(AsyncWebServerRequest *request)
 	serviceWebPttTimeout();
 
 	bool changed = false;
+	bool hasValidFreqRxArg = false;
 	float freqMin = 0.0F;
 	float freqMax = 0.0F;
 	getRfRangeForType(config.rf_type, freqMin, freqMax);
@@ -12363,10 +12383,14 @@ void handle_api_radio_set(AsyncWebServerRequest *request)
 	if (request->hasArg("freq_rx"))
 	{
 		const float v = request->arg("freq_rx").toFloat();
-		if (v >= freqMin && v <= freqMax && absFloat(config.freq_rx - v) > 0.00005F)
+		if (v >= freqMin && v <= freqMax)
 		{
-			config.freq_rx = v;
-			changed = true;
+			hasValidFreqRxArg = true;
+			if (absFloat(config.freq_rx - v) > 0.00005F)
+			{
+				config.freq_rx = v;
+				changed = true;
+			}
 		}
 	}
 	if (request->hasArg("freq_tx"))
@@ -12445,6 +12469,11 @@ void handle_api_radio_set(AsyncWebServerRequest *request)
 	if (changed)
 	{
 		RF_MODULE(false);
+	}
+	if (hasValidFreqRxArg)
+	{
+		// Keep APRS "home" frequency in sync with explicit UI/API RX frequency changes.
+		audioTuneAprsFreqRx = config.freq_rx;
 	}
 	if (request->hasArg("save") && isTruthyValue(request->arg("save")))
 	{
@@ -12571,6 +12600,7 @@ void handle_api_config(AsyncWebServerRequest *request)
 
 	if (request->method() == HTTP_POST)
 	{
+		bool wifiChanged = false;
 		if (request->hasArg("msg_webhook_enable"))
 		{
 			config.msg_webhook_enable = isTruthyValue(request->arg("msg_webhook_enable"));
@@ -12588,6 +12618,91 @@ void handle_api_config(AsyncWebServerRequest *request)
 		{
 			strlcpy(config.msg_webhook_url, request->arg("msg_webhook_url").c_str(), sizeof(config.msg_webhook_url));
 		}
+
+		if (request->hasArg("wifi_ap_enable") || request->hasArg("wifi_sta_enable"))
+		{
+			uint8_t newMode = config.wifi_mode;
+			if (request->hasArg("wifi_ap_enable"))
+			{
+				if (isTruthyValue(request->arg("wifi_ap_enable")))
+					newMode |= WIFI_AP_FIX;
+				else
+					newMode &= ~WIFI_AP_FIX;
+			}
+			if (request->hasArg("wifi_sta_enable"))
+			{
+				const bool staEnable = isTruthyValue(request->arg("wifi_sta_enable"));
+				if (staEnable)
+					newMode |= WIFI_STA_FIX;
+				else
+					newMode &= ~WIFI_STA_FIX;
+				if (config.wifi_sta[0].enable != staEnable)
+				{
+					config.wifi_sta[0].enable = staEnable;
+					wifiChanged = true;
+				}
+			}
+			if (newMode != config.wifi_mode)
+			{
+				config.wifi_mode = newMode;
+				wifiChanged = true;
+			}
+		}
+
+		if (request->hasArg("wifi_ap_ssid"))
+		{
+			const String v = request->arg("wifi_ap_ssid");
+			if (v.length() > 0 && strncmp(config.wifi_ap_ssid, v.c_str(), sizeof(config.wifi_ap_ssid)) != 0)
+			{
+				strlcpy(config.wifi_ap_ssid, v.c_str(), sizeof(config.wifi_ap_ssid));
+				wifiChanged = true;
+			}
+		}
+		if (request->hasArg("wifi_ap_pass"))
+		{
+			const String v = request->arg("wifi_ap_pass");
+			if (strncmp(config.wifi_ap_pass, v.c_str(), sizeof(config.wifi_ap_pass)) != 0)
+			{
+				strlcpy(config.wifi_ap_pass, v.c_str(), sizeof(config.wifi_ap_pass));
+				wifiChanged = true;
+			}
+		}
+		if (request->hasArg("wifi_sta_ssid"))
+		{
+			const String v = request->arg("wifi_sta_ssid");
+			if (v.length() > 0 && strncmp(config.wifi_sta[0].wifi_ssid, v.c_str(), sizeof(config.wifi_sta[0].wifi_ssid)) != 0)
+			{
+				strlcpy(config.wifi_sta[0].wifi_ssid, v.c_str(), sizeof(config.wifi_sta[0].wifi_ssid));
+				wifiChanged = true;
+			}
+		}
+		if (request->hasArg("wifi_sta_pass"))
+		{
+			const String v = request->arg("wifi_sta_pass");
+			if (strncmp(config.wifi_sta[0].wifi_pass, v.c_str(), sizeof(config.wifi_sta[0].wifi_pass)) != 0)
+			{
+				strlcpy(config.wifi_sta[0].wifi_pass, v.c_str(), sizeof(config.wifi_sta[0].wifi_pass));
+				wifiChanged = true;
+			}
+		}
+		if (request->hasArg("wifi_power"))
+		{
+			int p = request->arg("wifi_power").toInt();
+			if (p < -4)
+				p = -4;
+			if (p > 84)
+				p = 84;
+			if (config.wifi_power != p)
+			{
+				config.wifi_power = p;
+				wifiChanged = true;
+			}
+		}
+
+		if (wifiChanged)
+		{
+			requestWifiReconfigure();
+		}
 		config.cfg_version = 2;
 		saveConfiguration("/default.cfg", config);
 	}
@@ -12598,6 +12713,17 @@ void handle_api_config(AsyncWebServerRequest *request)
 	doc["msg_webhook_enable"] = config.msg_webhook_enable;
 	doc["msg_webhook_url"] = config.msg_webhook_url;
 	doc["msg_webhook_timeout_ms"] = config.msg_webhook_timeout_ms;
+	doc["wifi_mode"] = config.wifi_mode;
+	doc["wifi_power"] = config.wifi_power;
+	doc["wifi_ap_enable"] = (config.wifi_mode & WIFI_AP_FIX) ? 1 : 0;
+	doc["wifi_sta_enable"] = (config.wifi_mode & WIFI_STA_FIX) ? 1 : 0;
+	doc["wifi_ap_ssid"] = config.wifi_ap_ssid;
+	doc["wifi_ap_pass"] = config.wifi_ap_pass;
+	doc["wifi_sta_ssid"] = config.wifi_sta[0].wifi_ssid;
+	doc["wifi_sta_pass"] = config.wifi_sta[0].wifi_pass;
+	doc["wifi_sta_connected"] = (WiFi.status() == WL_CONNECTED);
+	doc["wifi_sta_ip"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+	doc["wifi_ap_ip"] = WiFi.softAPIP().toString();
 	sendJsonDoc(request, 200, doc);
 }
 
@@ -12619,13 +12745,13 @@ static bool configRestoreUploadOk = true;
 void handleConfigRestoreUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
 {
 	(void)filename;
-	if (index == 0)
-	{
-		if (!request->authenticate(config.http_username, config.http_password))
+		if (index == 0)
 		{
-			configRestoreUploadOk = false;
-			return;
-		}
+			if (!ensureWebAuth(request))
+			{
+				configRestoreUploadOk = false;
+				return;
+			}
 		configRestoreUploadOk = true;
 		if (LITTLEFS.exists("/default.cfg.upload"))
 		{
@@ -12703,83 +12829,24 @@ void handle_api_config_restore(AsyncWebServerRequest *request)
 	sendJsonDoc(request, 200, doc);
 }
 
-static void serveAppAsset(AsyncWebServerRequest *request, const char *path, const char *contentType)
-{
-	if (!ensureWebAuth(request))
-		return;
-
-	String gzPath = String(path) + ".gz";
-	AsyncWebServerResponse *response = nullptr;
-	if (LITTLEFS.exists(gzPath))
-	{
-		response = request->beginResponse(LITTLEFS, gzPath, contentType);
-		response->addHeader("Content-Encoding", "gzip");
-	}
-	else if (LITTLEFS.exists(path))
-	{
-		response = request->beginResponse(LITTLEFS, path, contentType);
-	}
-	else
-	{
-		request->send(404, "text/plain", "Static asset not found");
-		return;
-	}
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-}
-
-void handle_app_index(AsyncWebServerRequest *request);
-
 void handle_app_root(AsyncWebServerRequest *request)
 {
 	const String url = request->url();
-	if (!(url == "/" || url == "/app"))
+	if (url != "/")
 	{
 		request->send(404, "text/plain", "Not found");
 		return;
 	}
-	handle_app_index(request);
-}
-
-void handle_app_index(AsyncWebServerRequest *request)
-{
-	serveAppAsset(request, "/app/index.html", "text/html");
-}
-
-void handle_app_js(AsyncWebServerRequest *request)
-{
-	serveAppAsset(request, "/app/app.js", "application/javascript");
-}
-
-void handle_app_css(AsyncWebServerRequest *request)
-{
-	serveAppAsset(request, "/app/app.css", "text/css");
-}
-
-void handle_app_commit(AsyncWebServerRequest *request)
-{
-	serveAppAsset(request, "/app/commit.txt", "text/plain");
-}
-
-void handle_legacy_index(AsyncWebServerRequest *request)
-{
-	serveAppAsset(request, "/legacy/index.html", "text/html");
-}
-
-void handle_legacy_commit(AsyncWebServerRequest *request)
-{
-	serveAppAsset(request, "/legacy/commit.txt", "text/plain");
-}
-
-void handle_legacy_route(AsyncWebServerRequest *request)
-{
-	const String url = request->url();
-	if (!(url == "/legacy" || url == "/legacy/"))
-	{
-		request->send(404, "text/plain", "Not found");
+	if (!ensureWebAuth(request))
 		return;
-	}
-	handle_legacy_index(request);
+	request->redirect("/app/");
+}
+
+void handle_static_compat_redirect(AsyncWebServerRequest *request, const char *to)
+{
+	if (!ensureWebAuth(request))
+		return;
+	request->redirect(to);
 }
 
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -12877,33 +12944,29 @@ void webService()
 	// web client handlers
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_app_root(request); });
-	async_server.on("/app/", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_index(request); });
-	async_server.on("/app/index.html", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_index(request); });
-	async_server.on("/app/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_js(request); });
-	async_server.on("/app/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_css(request); });
-	async_server.on("/app/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_commit(request); });
+	auto &appStatic = async_server.serveStatic("/app/", LITTLEFS, "/app/");
+	appStatic.setDefaultFile("index.html");
+	appStatic.setCacheControl("no-cache");
+	if (config.http_username[0] != '\0' || config.http_password[0] != '\0')
+	{
+		appStatic.setAuthentication(config.http_username, config.http_password);
+	}
+
+	auto &legacyStatic = async_server.serveStatic("/legacy/", LITTLEFS, "/legacy/");
+	legacyStatic.setDefaultFile("index.html");
+	legacyStatic.setCacheControl("no-cache");
+	if (config.http_username[0] != '\0' || config.http_password[0] != '\0')
+	{
+		legacyStatic.setAuthentication(config.http_username, config.http_password);
+	}
+
 	// Compatibility routes for stale cached HTML that references root-level assets.
 	async_server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_js(request); });
+					{ handle_static_compat_redirect(request, "/app/app.js"); });
 	async_server.on("/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_css(request); });
+					{ handle_static_compat_redirect(request, "/app/app.css"); });
 	async_server.on("/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_commit(request); });
-	async_server.on("/app", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_root(request); });
-	async_server.on("/legacy/index.html", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_legacy_index(request); });
-	async_server.on("/legacy/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_legacy_commit(request); });
-	async_server.on("/legacy", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_legacy_route(request); });
-	async_server.on("/legacy/", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_legacy_route(request); });
+					{ handle_static_compat_redirect(request, "/app/commit.txt"); });
 	async_server.on("/logout", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_logout(request); });
 	async_server.on("/audio_tune", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12938,9 +13001,9 @@ void webService()
 	async_server.on(
 		"/update", HTTP_POST, [](AsyncWebServerRequest *request)
 		{
-		if (!request->authenticate(config.http_username, config.http_password))
+		if (!ensureWebAuth(request))
 		{
-			return request->requestAuthentication();
+			return;
 		}
   		bool espShouldReboot = !Update.hasError();
   		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", espShouldReboot ? "<h1><strong>Update DONE</strong></h1><br><a href='/app/'>Return Home</a>" : "<h1><strong>Update FAILED</strong></h1><br><a href='/app/'>Retry?</a>");
@@ -12948,7 +13011,7 @@ void webService()
   		request->send(response); },
 		[](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
 		{
-			if (!request->authenticate(config.http_username, config.http_password))
+			if (!ensureWebAuth(request))
 			{
 				return;
 			}

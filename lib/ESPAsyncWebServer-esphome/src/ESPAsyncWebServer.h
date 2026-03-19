@@ -226,7 +226,7 @@ class AsyncWebServerRequest {
     // user:realm:md5(user:realm:pass) for digest
     bool authenticate(const char * hash);
     bool authenticate(const char * username, const char * password, const char * realm = NULL, bool passwordIsHash = false);
-    void requestAuthentication(const char * realm = NULL, bool isDigest = true);
+    void requestAuthentication(const char * realm = NULL, bool isDigest = false);
 
     void setHandler(AsyncWebHandler *handler){ _handler = handler; }
     void addInterestingHeader(const String& name);

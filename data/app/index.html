@@ -11,7 +11,15 @@
 <body>
   <div class="app-shell">
     <header class="topbar">
-      <div>
+      <div class="top-priority">
+        <label for="topAprsFreq">APRS Frequency (MHz)</label>
+        <div class="row">
+          <input id="topAprsFreq" type="number" step="0.0001" value="144.3900">
+          <button id="topAprsApply" type="button">Set APRS</button>
+        </div>
+        <small id="topAprsHint" class="muted">Sets RX/TX and APRS auto-return frequency.</small>
+      </div>
+      <div class="top-title">
         <h1>ESP32 APRS Audio</h1>
         <p id="statusLine">Connecting...</p>
       </div>
@@ -121,6 +129,21 @@
 
       <section id="tab-settings" class="tab-pane">
         <div class="card-grid">
+          <article class="card">
+            <h3>WiFi AP + STA</h3>
+            <label><input id="wifiApEnable" type="checkbox"> Enable Access Point (AP)</label>
+            <label>AP SSID<input id="wifiApSsid" type="text" maxlength="31" placeholder="Device AP name"></label>
+            <label>AP Password<input id="wifiApPass" type="password" maxlength="63" placeholder="AP password"></label>
+            <label><input id="wifiStaEnable" type="checkbox"> Enable Station Client (STA)</label>
+            <label>STA SSID<input id="wifiStaSsid" type="text" maxlength="31" placeholder="Router SSID"></label>
+            <label>STA Password<input id="wifiStaPass" type="password" maxlength="63" placeholder="Router password"></label>
+            <label>WiFi TX Power<input id="wifiPower" type="number" min="-4" max="84" step="1"></label>
+            <div class="row">
+              <button id="saveWifi" type="button">Apply WiFi</button>
+            </div>
+            <p id="wifiCfgState" class="muted">Configure AP and optional STA uplink.</p>
+          </article>
+
           <article class="card">
             <h3>Incoming Message Webhook</h3>
             <label><input id="hookEnable" type="checkbox"> Enable webhook forwarding</label>

@@ -81,8 +81,17 @@
       const st = await api("/api/status");
       const sta = st.sta_connected ? `STA ${st.sta_ip}` : "STA disconnected";
       const ap = `AP ${st.ap_ip}`;
+      const aprs = Number(st.audio_aprs_freq);
+      const rxNow = Number(st.audio_rx_freq);
       const commit = state.buildCommit ? ` | ${state.buildCommit}` : "";
-      setStatus(`${sta} | ${ap} | ${st.ap_ssid}${commit}`);
+      setStatus(`${sta} | ${ap} | ${st.ap_ssid} | APRS ${Number.isFinite(aprs) ? aprs.toFixed(4) : "-" } MHz${commit}`);
+      if (Number.isFinite(aprs) && document.activeElement !== $("topAprsFreq")) {
+        $("topAprsFreq").value = aprs.toFixed(4);
+      }
+      if (Number.isFinite(aprs) && document.activeElement !== $("tuneFreq")) {
+        $("tuneFreq").value = aprs.toFixed(4);
+      }
+      $("topAprsHint").textContent = `APRS lock ${Number.isFinite(aprs) ? aprs.toFixed(4) : "-"} MHz | RX now ${Number.isFinite(rxNow) ? rxNow.toFixed(4) : "-"} MHz`;
     } catch (err) {
       setStatus(`Status error: ${err.message}`);
     }
@@ -350,6 +359,31 @@
     }
   }
 
+  async function setAprsFrequency() {
+    const freq = Number($("topAprsFreq").value);
+    if (!Number.isFinite(freq)) {
+      return;
+    }
+    try {
+      await api("/api/radio/set", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: formBody({
+          freq_rx: freq.toFixed(4),
+          freq_tx: freq.toFixed(4),
+          save: "1"
+        })
+      });
+      await tune("reset");
+      $("tuneFreq").value = freq.toFixed(4);
+      await refreshStatus();
+      await refreshRadioStatus();
+      await updateTuneStatus();
+    } catch (err) {
+      alert(`APRS frequency update failed: ${err.message}`);
+    }
+  }
+
   async function setPtt(on) {
     await api("/api/radio/ptt", {
       method: "POST",
@@ -397,6 +431,16 @@
       $("hookEnable").checked = !!c.msg_webhook_enable;
       $("hookUrl").value = c.msg_webhook_url || "";
       $("hookTimeout").value = c.msg_webhook_timeout_ms || 1500;
+      $("wifiApEnable").checked = !!c.wifi_ap_enable;
+      $("wifiStaEnable").checked = !!c.wifi_sta_enable;
+      $("wifiApSsid").value = c.wifi_ap_ssid || "";
+      $("wifiApPass").value = c.wifi_ap_pass || "";
+      $("wifiStaSsid").value = c.wifi_sta_ssid || "";
+      $("wifiStaPass").value = c.wifi_sta_pass || "";
+      $("wifiPower").value = Number.isFinite(Number(c.wifi_power)) ? String(c.wifi_power) : "44";
+      const sta = c.wifi_sta_connected ? `STA ${c.wifi_sta_ip}` : "STA disconnected";
+      const ap = c.wifi_ap_ip ? `AP ${c.wifi_ap_ip}` : "AP not running";
+      $("wifiCfgState").textContent = `${sta} | ${ap}`;
     } catch (err) {
       console.error(err);
     }
@@ -417,6 +461,29 @@
       alert("Webhook settings saved.");
     } catch (err) {
       alert(`Save failed: ${err.message}`);
+    }
+  }
+
+  async function saveWifiCfg() {
+    try {
+      await api("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: formBody({
+          wifi_ap_enable: $("wifiApEnable").checked ? "1" : "0",
+          wifi_sta_enable: $("wifiStaEnable").checked ? "1" : "0",
+          wifi_ap_ssid: $("wifiApSsid").value.trim(),
+          wifi_ap_pass: $("wifiApPass").value,
+          wifi_sta_ssid: $("wifiStaSsid").value.trim(),
+          wifi_sta_pass: $("wifiStaPass").value,
+          wifi_power: $("wifiPower").value
+        })
+      });
+      await loadWebhookCfg();
+      await refreshStatus();
+      alert("WiFi settings saved and reconfiguration requested.");
+    } catch (err) {
+      alert(`WiFi save failed: ${err.message}`);
     }
   }
 
@@ -503,6 +570,7 @@
     });
 
     $("openLegacy").onclick = () => { location.href = "/legacy/"; };
+    $("topAprsApply").onclick = setAprsFrequency;
     $("refreshContacts").onclick = refreshContacts;
     $("sendForm").addEventListener("submit", sendMessage);
 
@@ -553,6 +621,7 @@
     $("micEnable").onclick = enableMic;
     $("refreshDiag").onclick = refreshDiag;
     $("runSelftest").onclick = runSelftest;
+    $("saveWifi").onclick = saveWifiCfg;
     $("saveWebhook").onclick = saveWebhookCfg;
     $("backupCfg").onclick = () => { window.open("/api/config/backup", "_blank"); };
     $("restoreCfg").onclick = restoreConfig;
