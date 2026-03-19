@@ -4,3 +4,11 @@
 .vscode/launch.json
 .vscode/ipch
 .DS_Store
+.DS_store
+
+# OS-generated files
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
