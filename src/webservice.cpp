@@ -17,6 +17,7 @@
 #include <ESPCPUTemp.h>
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include <memory>
 
 extern SemaphoreHandle_t psramMutex;
 extern bool psramLock(TickType_t timeout = portMAX_DELAY);
@@ -90,6 +91,38 @@ char *StringToCharPtr(const String &str)
 	return charPtr;
 }
 
+// Build a streamed response from an owned heap buffer to avoid duplicating
+// large HTML pages into AsyncBasicResponse::String on low-memory targets.
+AsyncWebServerResponse *beginOwnedHtmlResponse(AsyncWebServerRequest *request, char *html)
+{
+	if (html == nullptr)
+	{
+		return nullptr;
+	}
+
+	const size_t htmlLen = strlen(html);
+	auto htmlHolder = std::shared_ptr<char>(html, [](char *ptr)
+											 { free(ptr); });
+
+	return request->beginResponse(
+		"text/html",
+		htmlLen,
+		[htmlHolder, htmlLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+		{
+			if (index >= htmlLen)
+			{
+				return 0;
+			}
+			size_t chunkLen = htmlLen - index;
+			if (chunkLen > maxLen)
+			{
+				chunkLen = maxLen;
+			}
+			memcpy(buffer, htmlHolder.get() + index, chunkLen);
+			return chunkLen;
+		});
+}
+
 #ifdef PPPOS
 #include <PPP.h>
 #endif
@@ -106,6 +139,7 @@ AsyncWebServer async_server(80);
 AsyncWebServer async_websocket(81);
 AsyncWebSocket ws("/ws");
 AsyncWebSocket ws_gnss("/ws_gnss");
+AsyncWebSocket ws_audio("/ws_audio");
 
 #ifdef MQTT
 #include <PubSubClient.h>
@@ -121,6 +155,49 @@ AsyncEventSource lastheard_events("/eventHeard");
 AsyncEventSource message_events("/eventMsg");
 
 char *webString;
+
+static constexpr uint16_t AUDIO_MONITOR_RATE = 8000;
+static constexpr size_t AUDIO_MONITOR_CHUNK = 320; // 40ms at 8kHz
+static uint8_t audioMonitorBuffer[AUDIO_MONITOR_CHUNK];
+static size_t audioMonitorBufferLen = 0;
+static uint32_t audioMonitorAccumulator = 0;
+
+static inline int16_t clampToInt16(int32_t value)
+{
+	if (value > 32767)
+	{
+		return 32767;
+	}
+	if (value < -32768)
+	{
+		return -32768;
+	}
+	return (int16_t)value;
+}
+
+static uint8_t linearToMuLaw(int16_t pcm)
+{
+	static constexpr int16_t MULAW_BIAS = 0x84;
+	static constexpr int16_t MULAW_CLIP = 32635;
+	uint8_t sign = (pcm < 0) ? 0x80 : 0x00;
+	if (pcm < 0)
+	{
+		pcm = -pcm;
+	}
+	if (pcm > MULAW_CLIP)
+	{
+		pcm = MULAW_CLIP;
+	}
+	pcm += MULAW_BIAS;
+
+	uint8_t exponent = 7;
+	for (uint16_t expMask = 0x4000; (pcm & expMask) == 0 && exponent > 0; expMask >>= 1)
+	{
+		exponent--;
+	}
+	const uint8_t mantissa = (pcm >> (exponent + 3)) & 0x0F;
+	return (uint8_t)(~(sign | (exponent << 4) | mantissa));
+}
 
 extern unsigned long waitISRetry;
 extern volatile int8_t adcEn;
@@ -243,6 +320,8 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "$(\"#contentmain\").load(\"/tlm\");\n");
 	strcat(webString, "} else if (tabName == 'SENSOR') {\n");
 	strcat(webString, "$(\"#contentmain\").load(\"/sensor\");\n");
+	strcat(webString, "} else if (tabName == 'Audio') {\n");
+	strcat(webString, "$(\"#contentmain\").load(\"/audio\");\n");
 	strcat(webString, "} else if (tabName == 'VPN') {\n");
 	strcat(webString, "$(\"#contentmain\").load(\"/vpn\");\n");
 #ifdef MQTT
@@ -394,6 +473,7 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WX')\">WX</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TLM')\">TLM</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'SENSOR')\">SENSOR</button>\n");
+	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Audio')\">Audio</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'VPN')\">VPN</button>\n");
 #ifdef MQTT
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
@@ -435,11 +515,10 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "</html>");
 
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("Sensor", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 	lastHeardTimeout = 0;
 	lastHeard_Flag = true;
 }
@@ -763,11 +842,10 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	strcat(webString, "</table>\n");
 	strcat(webString, "</div>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("dashboard", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 	lastHeardTimeout = millis() + 500;
 	lastHeard_Flag = true;
 }
@@ -941,11 +1019,10 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	strcat(html, "$(window).trigger('resize');\n");
 	strcat(html, "</script>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("Sidebar", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
 }
 
 void handle_symbol(AsyncWebServerRequest *request)
@@ -1085,11 +1162,10 @@ void handle_sysinfo(AsyncWebServerRequest *request)
 	strcat(html, "</table>\n");
 
 	// request->send(200, "text/html", html); // send to someones browser when asked
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("Sysinfo", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
 }
 
 void event_lastHeard(bool gethtml)
@@ -1793,11 +1869,10 @@ void handle_storage(AsyncWebServerRequest *request)
 
 	strcat(webString, "</body>\n</html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("Sensor", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString); // Free the allocated memory
 	adcEn = 1;
 	dacEn = 0;
 }
@@ -2531,11 +2606,10 @@ void handle_radio(AsyncWebServerRequest *request)
 		// request->send(200, "text/html", html); // send to someones browser when asked
 		//request->send_P(200, "text/html", html);
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Sysinfo", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -2812,11 +2886,10 @@ void handle_vpn(AsyncWebServerRequest *request)
 		strcat(html, "</form>");
 
 		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("VPN", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -3164,11 +3237,10 @@ void handle_mqtt(AsyncWebServerRequest *request)
 		strcat(html, "</form>\n");
 
 		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("MQTT", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 #endif
@@ -3495,11 +3567,10 @@ void handle_msg(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table>");
 
 		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("MSG", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -5579,12 +5650,10 @@ void handle_mod(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table>\n");
 #endif
 
-		const char* dataType = "text/html";
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("MOD", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory	
 	}
 }
 
@@ -6782,11 +6851,10 @@ void handle_system(AsyncWebServerRequest *request)
 		strcat(html, "</form><br />");
 #endif
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("System", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html);
 	}
 }
 
@@ -7764,11 +7832,10 @@ void handle_igate(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("IGATE", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -8541,11 +8608,10 @@ void handle_digi(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("digi", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -8987,11 +9053,10 @@ void handle_wx(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Weather", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -9506,11 +9571,10 @@ void handle_tlm(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Telemetry", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -10034,11 +10098,10 @@ void handle_sensor(AsyncWebServerRequest *request)
 
 		strcat(html, "</script>\n");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Sensor", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -10813,11 +10876,10 @@ void handle_tracker(AsyncWebServerRequest *request)
 	strcat(html, "</td></tr></table><br />\n");
 	strcat(html, "</form><br />");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("Tracker", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory	
 }
 
 void handle_wireless(AsyncWebServerRequest *request)
@@ -11223,11 +11285,10 @@ void handle_wireless(AsyncWebServerRequest *request)
 		strcat(html, "</form>");
 #endif
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("wifi", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
 
 	}
 }
@@ -11322,6 +11383,49 @@ void handle_ws(char *Raw, size_t len, uint16_t mVrms)
 				sprintf(jsonMsg, "{\"Active\":\"0\",\"mVrms\":\"0\",\"RAW\":\"\",\"timeStamp\":\"%li\"}", timeStamp);
 			ws.textAll(jsonMsg);
 			free(jsonMsg);
+		}
+	}
+}
+
+void handle_ws_audio_samples(const float *samples, size_t len, uint16_t sampleRate)
+{
+	if (samples == nullptr || len == 0 || sampleRate == 0)
+	{
+		return;
+	}
+
+	if (ws_audio.count() < 1)
+	{
+		audioMonitorBufferLen = 0;
+		audioMonitorAccumulator = 0;
+		return;
+	}
+
+	for (size_t i = 0; i < len; i++)
+	{
+		audioMonitorAccumulator += AUDIO_MONITOR_RATE;
+		if (audioMonitorAccumulator < sampleRate)
+		{
+			continue;
+		}
+		audioMonitorAccumulator -= sampleRate;
+
+		float s = samples[i];
+		if (s > 1.0f)
+		{
+			s = 1.0f;
+		}
+		else if (s < -1.0f)
+		{
+			s = -1.0f;
+		}
+
+		const int16_t pcm = clampToInt16((int32_t)(s * 32767.0f));
+		audioMonitorBuffer[audioMonitorBufferLen++] = linearToMuLaw(pcm);
+		if (audioMonitorBufferLen >= AUDIO_MONITOR_CHUNK)
+		{
+			ws_audio.binaryAll(audioMonitorBuffer, audioMonitorBufferLen);
+			audioMonitorBufferLen = 0;
 		}
 	}
 }
@@ -11450,11 +11554,264 @@ void handle_test(AsyncWebServerRequest *request)
 
 	strcat(webString, "</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("Test", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString); // Free the allocated memory
+}
+
+void handle_audio(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	const char *audioPage = R"HTML(
+<div style="max-width:860px;margin:auto;">
+<table>
+<th colspan="2"><span><b>Browser Audio Monitor</b></span></th>
+<tr><td align="right"><b>Status:</b></td><td align="left"><span id="audioStatus" style="color:#c0392b;font-weight:600;">Stopped</span></td></tr>
+<tr><td align="right"><b>Listen:</b></td><td align="left">
+<button class="button" id="audioToggleBtn" type="button">Start Listening</button>
+<button class="button" id="audioMuteBtn" type="button">Mute</button>
+</td></tr>
+<tr><td align="right"><b>Volume:</b></td><td align="left"><input id="audioVolume" type="range" min="0" max="100" value="70" style="width:260px;"> <span id="audioVolumeValue">70%</span></td></tr>
+<tr><td align="right"><b>Buffer:</b></td><td align="left"><span id="audioQueue">0 ms</span></td></tr>
+<tr><td align="right"><b>Level:</b></td><td align="left">
+<div style="width:300px;height:12px;border:1px solid #888;border-radius:10px;overflow:hidden;background:#f1f1f1;">
+<div id="audioLevelBar" style="height:100%;width:0%;background:linear-gradient(90deg,#2ecc71,#f1c40f,#e74c3c);transition:width .08s linear;"></div>
+</div>
+</td></tr>
+<tr><td align="right"><b>Format:</b></td><td align="left"><span id="audioCodec">8kHz mu-law mono</span></td></tr>
+</table>
+<div style="font-size:9pt;color:#555;margin-top:8px;">
+Open this tab and click <b>Start Listening</b> to monitor RX audio in your browser.
+</div>
+</div>
+<script type="text/javascript">
+(function(){
+  if (window.__audioMonitor && typeof window.__audioMonitor.stop === "function") {
+    window.__audioMonitor.stop();
+  }
+
+  const monitor = {
+    running: false,
+    muted: false,
+    ws: null,
+    audioCtx: null,
+    gainNode: null,
+    procNode: null,
+    queue: [],
+    queueOffset: 0,
+    queuedSamples: 0,
+    sampleRate: 8000,
+    currentSample: 0,
+    resampleAcc: 0,
+    level: 0
+  };
+
+  const elStatus = document.getElementById("audioStatus");
+  const elToggle = document.getElementById("audioToggleBtn");
+  const elMute = document.getElementById("audioMuteBtn");
+  const elVol = document.getElementById("audioVolume");
+  const elVolVal = document.getElementById("audioVolumeValue");
+  const elQueue = document.getElementById("audioQueue");
+  const elLevel = document.getElementById("audioLevelBar");
+  const elCodec = document.getElementById("audioCodec");
+
+  function setStatus(txt, color) {
+    elStatus.textContent = txt;
+    elStatus.style.color = color || "#2c3e50";
+  }
+
+  function mulawToLinear(uVal) {
+    uVal = (~uVal) & 0xFF;
+    const sign = uVal & 0x80;
+    const exponent = (uVal >> 4) & 0x07;
+    const mantissa = uVal & 0x0F;
+    let sample = ((mantissa << 3) + 0x84) << exponent;
+    sample -= 0x84;
+    return sign ? -sample : sample;
+  }
+
+  function setVolume(vol) {
+    const gain = Math.max(0, Math.min(1, vol));
+    if (monitor.gainNode) {
+      monitor.gainNode.gain.value = monitor.muted ? 0 : gain;
+    }
+  }
+
+  function clearQueue() {
+    monitor.queue = [];
+    monitor.queueOffset = 0;
+    monitor.queuedSamples = 0;
+    monitor.currentSample = 0;
+    monitor.resampleAcc = 0;
+  }
+
+  function popQueueSample() {
+    if (monitor.queue.length === 0) {
+      return 0;
+    }
+    const chunk = monitor.queue[0];
+    const sample = chunk[monitor.queueOffset++];
+    monitor.queuedSamples--;
+    if (monitor.queueOffset >= chunk.length) {
+      monitor.queue.shift();
+      monitor.queueOffset = 0;
+    }
+    return sample;
+  }
+
+  function ensureAudioPath() {
+    if (!monitor.audioCtx) {
+      monitor.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      monitor.gainNode = monitor.audioCtx.createGain();
+      monitor.procNode = monitor.audioCtx.createScriptProcessor(1024, 1, 1);
+      monitor.procNode.onaudioprocess = function(e) {
+        const out = e.outputBuffer.getChannelData(0);
+        const outputRate = monitor.audioCtx.sampleRate;
+        for (let i = 0; i < out.length; i++) {
+          monitor.resampleAcc += monitor.sampleRate;
+          while (monitor.resampleAcc >= outputRate) {
+            monitor.currentSample = popQueueSample();
+            monitor.resampleAcc -= outputRate;
+          }
+          out[i] = monitor.currentSample;
+        }
+      };
+      monitor.procNode.connect(monitor.gainNode);
+      monitor.gainNode.connect(monitor.audioCtx.destination);
+    }
+    setVolume(parseInt(elVol.value, 10) / 100.0);
+  }
+
+  function stop() {
+    monitor.running = false;
+    elToggle.textContent = "Start Listening";
+    setStatus("Stopped", "#c0392b");
+    if (monitor.ws) {
+      monitor.ws.onopen = null;
+      monitor.ws.onclose = null;
+      monitor.ws.onmessage = null;
+      monitor.ws.onerror = null;
+      monitor.ws.close();
+      monitor.ws = null;
+    }
+    clearQueue();
+    if (monitor.audioCtx && monitor.audioCtx.state !== "closed") {
+      monitor.audioCtx.suspend();
+    }
+  }
+
+  async function start() {
+    ensureAudioPath();
+    await monitor.audioCtx.resume();
+    clearQueue();
+
+    monitor.ws = new WebSocket("ws://" + location.hostname + ":81/ws_audio");
+    monitor.ws.binaryType = "arraybuffer";
+
+    monitor.ws.onopen = function() {
+      monitor.running = true;
+      elToggle.textContent = "Stop Listening";
+      setStatus("Connected", "#27ae60");
+    };
+
+    monitor.ws.onclose = function() {
+      if (monitor.running) {
+        setStatus("Disconnected", "#e67e22");
+      }
+      stop();
+    };
+
+    monitor.ws.onerror = function() {
+      setStatus("Socket error", "#e74c3c");
+    };
+
+    monitor.ws.onmessage = function(event) {
+      if (typeof event.data === "string") {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "cfg") {
+            monitor.sampleRate = parseInt(msg.rate || 8000, 10);
+            elCodec.textContent = (monitor.sampleRate + "Hz " + (msg.codec || "mu-law") + " mono");
+          }
+        } catch (_) {}
+        return;
+      }
+
+      const ulaw = new Uint8Array(event.data);
+      const pcm = new Float32Array(ulaw.length);
+      let peak = 0;
+      for (let i = 0; i < ulaw.length; i++) {
+        const s = mulawToLinear(ulaw[i]) / 32768.0;
+        pcm[i] = s;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      monitor.level = peak;
+      monitor.queue.push(pcm);
+      monitor.queuedSamples += pcm.length;
+
+      const maxSamples = monitor.sampleRate * 2; // keep <= 2 seconds queued
+      while (monitor.queuedSamples > maxSamples && monitor.queue.length > 0) {
+        monitor.queuedSamples -= monitor.queue[0].length;
+        monitor.queue.shift();
+        monitor.queueOffset = 0;
+      }
+    };
+  }
+
+  function toggle() {
+    if (monitor.running) {
+      stop();
+    } else {
+      start().catch(function() {
+        setStatus("Audio start failed", "#e74c3c");
+      });
+    }
+  }
+
+  function toggleMute() {
+    monitor.muted = !monitor.muted;
+    elMute.textContent = monitor.muted ? "Unmute" : "Mute";
+    setVolume(parseInt(elVol.value, 10) / 100.0);
+  }
+
+  elToggle.addEventListener("click", toggle);
+  elMute.addEventListener("click", toggleMute);
+  elVol.addEventListener("input", function() {
+    elVolVal.textContent = elVol.value + "%";
+    setVolume(parseInt(elVol.value, 10) / 100.0);
+  });
+
+  setInterval(function() {
+    const qMs = monitor.sampleRate > 0 ? Math.round((monitor.queuedSamples * 1000) / monitor.sampleRate) : 0;
+    elQueue.textContent = qMs + " ms";
+    elLevel.style.width = Math.min(100, Math.round(monitor.level * 100)) + "%";
+    monitor.level *= 0.85;
+  }, 100);
+
+  window.__audioMonitor = { stop: stop };
+})();
+</script>
+)HTML";
+
+	const size_t requiredLen = strlen(audioPage) + 1;
+	char *webString = allocateStringMemory(requiredLen + 64);
+	if (!webString)
+	{
+		request->send(500, "text/html", "Memory allocation failed");
+		return;
+	}
+	strcpy(webString, audioPage);
+
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
+	response->addHeader("Audio", "content");
+	response->addHeader("Cache-Control", "no-cache");
+	request->send(response);
 }
 
 void handle_about(AsyncWebServerRequest *request)
@@ -11753,11 +12110,10 @@ void handle_about(AsyncWebServerRequest *request)
 	#endif
 	strcat(webString, "</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("About", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 }
 
 void handle_gnss(AsyncWebServerRequest *request)
@@ -11901,11 +12257,10 @@ void handle_gnss(AsyncWebServerRequest *request)
 
 	strcat(webString, "</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("GNSS", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 }
 
 void handle_default()
@@ -11942,13 +12297,27 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 
 	if (type == WS_EVT_CONNECT)
 	{
-
 		log_d("Websocket client connection received");
+		if (server == &ws_audio)
+		{
+			client->text("{\"type\":\"cfg\",\"codec\":\"mulaw\",\"rate\":8000}");
+		}
 	}
 	else if (type == WS_EVT_DISCONNECT)
 	{
 
 		log_d("Client disconnected");
+	}
+	else if (type == WS_EVT_DATA && server == &ws_audio)
+	{
+		AwsFrameInfo *info = (AwsFrameInfo *)arg;
+		if (info && info->opcode == WS_TEXT && info->final && info->index == 0)
+		{
+			if (len == 4 && strncmp((const char *)data, "ping", 4) == 0)
+			{
+				client->text("pong");
+			}
+		}
 	}
 }
 
@@ -11989,6 +12358,7 @@ void webService()
 		return;
 	}
 	ws.onEvent(onWsEvent);
+	ws_audio.onEvent(onWsEvent);
 
 	// web client handlers
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -12025,6 +12395,8 @@ void webService()
 					{ handle_tlm(request); });
 	async_server.on("/sensor", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_sensor(request); });
+	async_server.on("/audio", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_audio(request); });
 	async_server.on("/system", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_system(request); });
 	async_server.on("/wireless", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12144,5 +12516,6 @@ void webService()
 	async_server.begin();
 	async_websocket.addHandler(&ws);
 	async_websocket.addHandler(&ws_gnss);
+	async_websocket.addHandler(&ws_audio);
 	async_websocket.begin();
 }

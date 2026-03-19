@@ -1430,6 +1430,7 @@ void IRAM_ATTR sample_dac_isr()
 
 extern int mVrms;
 extern float dBV;
+extern void handle_ws_audio_samples(const float *samples, size_t len, uint16_t sampleRate);
 
 long mVsum = 0;
 int mVsumCount = 0;
@@ -1681,6 +1682,7 @@ void AFSK_Poll(bool SA818, bool RFPower)
         // portEXIT_CRITICAL_ISR(&timerMux);
         //  Update AGC gain
         update_agc(audio_buffer, BLOCK_SIZE);
+        handle_ws_audio_samples(audio_buffer, BLOCK_SIZE, SAMPLERATE);
 #ifdef ADC_SAMPLE
         offset = tp->avg;
 #else
