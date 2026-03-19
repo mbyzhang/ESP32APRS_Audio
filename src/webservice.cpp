@@ -12732,6 +12732,12 @@ void handle_app_index(AsyncWebServerRequest *request);
 
 void handle_app_root(AsyncWebServerRequest *request)
 {
+	const String url = request->url();
+	if (!(url == "/" || url == "/app"))
+	{
+		request->send(404, "text/plain", "Not found");
+		return;
+	}
 	handle_app_index(request);
 }
 
@@ -12753,6 +12759,16 @@ void handle_app_css(AsyncWebServerRequest *request)
 void handle_app_commit(AsyncWebServerRequest *request)
 {
 	serveAppAsset(request, "/app/commit.txt", "text/plain");
+}
+
+void handle_legacy_route(AsyncWebServerRequest *request)
+{
+	if (!ensureWebAuth(request))
+		return;
+	AsyncWebServerResponse *response = request->beginResponse(302);
+	response->addHeader("Location", "/app/");
+	response->addHeader("Cache-Control", "no-store");
+	request->send(response);
 }
 
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -12850,10 +12866,6 @@ void webService()
 	// web client handlers
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_app_root(request); });
-	async_server.on("/app", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_root(request); });
-	async_server.on("/legacy", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ handle_app_root(request); });
 	async_server.on("/app/", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_app_index(request); });
 	async_server.on("/app/index.html", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -12871,6 +12883,12 @@ void webService()
 					{ handle_app_css(request); });
 	async_server.on("/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_app_commit(request); });
+	async_server.on("/app", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_root(request); });
+	async_server.on("/legacy", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_legacy_route(request); });
+	async_server.on("/legacy/", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_legacy_route(request); });
 	async_server.on("/logout", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_logout(request); });
 	async_server.on("/audio_tune", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)

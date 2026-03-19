@@ -502,7 +502,7 @@
       b.onclick = () => switchTab(b.dataset.tab);
     });
 
-    $("openLegacy").onclick = () => { location.href = "/legacy"; };
+    $("openLegacy").onclick = () => { location.href = "/app/"; };
     $("refreshContacts").onclick = refreshContacts;
     $("sendForm").addEventListener("submit", sendMessage);
 
