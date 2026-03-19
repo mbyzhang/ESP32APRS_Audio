@@ -161,6 +161,74 @@ static constexpr size_t AUDIO_MONITOR_CHUNK = 320; // 40ms at 8kHz
 static uint8_t audioMonitorBuffer[AUDIO_MONITOR_CHUNK];
 static size_t audioMonitorBufferLen = 0;
 static uint32_t audioMonitorAccumulator = 0;
+static constexpr uint32_t AUDIO_TUNE_IDLE_TIMEOUT_MS = 120000; // 2 minutes
+static bool audioTuneActive = false;
+static float audioTuneAprsFreqRx = 0.0F;
+static uint32_t audioTuneLastUserMs = 0;
+
+static inline float absFloat(float v)
+{
+	return (v < 0.0F) ? -v : v;
+}
+
+static void getRfRangeForType(uint8_t rfType, float &freqMin, float &freqMax)
+{
+	switch (rfType)
+	{
+	case RF_SA868_VHF:
+		freqMin = 134.0F;
+		freqMax = 174.0F;
+		break;
+	case RF_SR_1WV:
+	case RF_SR_2WVS:
+		freqMin = 136.0F;
+		freqMax = 174.0F;
+		break;
+	case RF_SA868_350:
+		freqMin = 320.0F;
+		freqMax = 400.0F;
+		break;
+	case RF_SR_1W350:
+		freqMin = 350.0F;
+		freqMax = 390.0F;
+		break;
+	case RF_SA868_UHF:
+	case RF_SR_1WU:
+	case RF_SR_2WUS:
+		freqMin = 400.0F;
+		freqMax = 470.0F;
+		break;
+	default:
+		freqMin = 134.0F;
+		freqMax = 500.0F;
+		break;
+	}
+}
+
+static void audioTuneTouch()
+{
+	audioTuneLastUserMs = millis();
+}
+
+static void audioTuneResetToAprs(const char *reason)
+{
+	if (!audioTuneActive)
+	{
+		return;
+	}
+
+	const float targetFreq = audioTuneAprsFreqRx;
+	audioTuneActive = false;
+	audioTuneTouch();
+
+	if (absFloat(config.freq_rx - targetFreq) > 0.00005F)
+	{
+		config.freq_rx = targetFreq;
+		RF_MODULE(false);
+	}
+
+	log_i("Audio tuner returned to APRS RX %.4f (%s)", targetFreq, reason ? reason : "manual");
+}
 
 static inline int16_t clampToInt16(int32_t value)
 {
@@ -462,9 +530,9 @@ void setMainPage(AsyncWebServerRequest *request)
 	{
 		strcat(webString, "<h1>ESP32APRS_Audio</h1>\n");
 	}
-	strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
+	strcat(webString, "<div class=\"top-actions\"><a href=\"/logout\">Log Out</a></div>\n");
 	strcat(webString, "<div class=\"row\">\n");
-	strcat(webString, "<ul class=\"nav nav-tabs\" style=\"margin: 5px;\">\n");
+	strcat(webString, "<ul class=\"nav nav-tabs\">\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DashBoard')\">DashBoard</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Radio')\" id=\"btnRadio\">Radio</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'IGATE')\">IGATE</button>\n");
@@ -489,7 +557,7 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "</div>\n");
 	strcat(webString, "\n");
 
-	strcat(webString, "<div class=\"contentwide\" id=\"contentmain\"  style=\"font-size: 2pt;\">\n");
+	strcat(webString, "<div class=\"contentwide\" id=\"contentmain\">\n");
 	strcat(webString, "\n");
 	strcat(webString, "</div>\n");
 	strcat(webString, "<br />\n");
@@ -529,7 +597,246 @@ void setMainPage(AsyncWebServerRequest *request)
 
 void handle_css(AsyncWebServerRequest *request)
 {
-	const char *css = ".container{width:900px;text-align:left;margin:auto;border-radius:10px 10px 10px 10px;-moz-border-radius:10px 10px 10px 10px;-webkit-border-radius:10px 10px 10px 10px;-khtml-border-radius:10px 10px 10px 10px;-ms-border-radius:10px 10px 10px 10px;box-shadow:3px 3px 3px #707070;background:#fff;border-color: #2194ec;padding: 0px;border-width: 5px;border-style:solid;}body,font{font:12px verdana,arial,sans-serif;color:#fff}.header{background:#2194ec;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;text-align:left;padding:5px 0;border-radius:10px 10px 0 0;-moz-border-radius:10px 10px 0 0;-webkit-border-radius:10px 10px 0 0;-khtml-border-radius:10px 10px 0 0;-ms-border-radius:10px 10px 0 0}.content{margin:0 0 0 166px;padding:1px 5px 5px;color:#000;background:#fff;text-align:center;font-size: 8pt;}.contentwide{padding:50px 5px 5px;color:#000;background:#fff;text-align:center}.contentwide h2{color:#000;font:1em verdana,arial,sans-serif;text-align:center;font-weight:700;padding:0;margin:0;font-size: 12pt;}.footer{background:#2194ec;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;font-size:9px;text-align:center;padding:10px 0;border-radius:0 0 10px 10px;-moz-border-radius:0 0 10px 10px;-webkit-border-radius:0 0 10px 10px;-khtml-border-radius:0 0 10px 10px;-ms-border-radius:0 0 10px 10px;clear:both}#tail{height:450px;width:805px;overflow-y:scroll;overflow-x:scroll;color:#0f0;background:#000}table{vertical-align:middle;text-align:center;empty-cells:show;padding-left:3;padding-right:3;padding-top:3;padding-bottom:3;border-collapse:collapse;border-color:#0f07f2;border-style:solid;border-spacing:0px;border-width:3px;text-decoration:none;color:#fff;background:#000;font-family:verdana,arial,sans-serif;font-size : 12px;width:100%;white-space:nowrap}table th{cursor: pointer;user-select: none;font-size: 10pt;font-family:lucidia console,Monaco,monospace;text-shadow:1px 1px #0e038c;text-decoration:none;background:#0525f7;border:1px solid silver}table tr:nth-child(even){background:#f7f7f7}table tr:nth-child(odd){background:#eeeeee}table td{color:#000;font-family:lucidia console,Monaco,monospace;text-decoration:none;border:1px solid #010369}body{background:#edf0f5;color:#000}a{text-decoration:none}a:link,a:visited{text-decoration:none;color:#0000e0;font-weight:400}th:last-child a.tooltip:hover span{left:auto;right:0}ul{padding:5px;margin:10px 0;list-style:none;float:left}ul li{float:left;display:inline;margin:0 10px}ul li a{text-decoration:none;float:left;color:#999;cursor:pointer;font:900 14px/22px arial,Helvetica,sans-serif}ul li a span{margin:0 10px 0 -10px;padding:1px 8px 5px 18px;position:relative;float:left}h1{text-shadow:2px 2px #303030;text-align:center}.toggle{position:absolute;margin-left:-9999px;visibility:hidden}.toggle+label{display:block;position:relative;cursor:pointer;outline:none}input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#ddd;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;}input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#ddd;border-radius:12px;transition:margin .4s,background .4s}input.toggle-round-flat:checked+label{background-color:#dd4b39}input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#dd4b39}@-moz-document url-prefix(){select,input{margin:0;padding:0;border-width:1px;font:12px verdana,arial,sans-serif}input[type=button],button,input[type=submit]{padding:0 3px;border-radius:3px 3px 3px 3px;-moz-border-radius:3px 3px 3px 3px}}.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}.nice-select.small ul li:nth-of-type(2){clear:both}.nav{margin-bottom:0;padding-left:10;list-style:none}.nav>li{position:relative;display:block}.nav>li>a{position:relative;display:block;padding:5px 10px}.nav>li>a:hover,.nav>li>a:focus{text-decoration:none;background-color:#eee}.nav>li.disabled>a{color:#999}.nav>li.disabled>a:hover,.nav>li.disabled>a:focus{color:#999;text-decoration:none;background-color:initial;cursor:not-allowed}.nav .open>a,.nav .open>a:hover,.nav .open>a:focus{background-color:#eee;border-color:#428bca}.nav .nav-divider{height:1px;margin:9px 0;overflow:hidden;background-color:#e5e5e5}.nav>li>a>img{max-width:none}.nav-tabs{border-bottom:1px solid #ddd}.nav-tabs>li{float:left;margin-bottom:-1px}.nav-tabs>li>a{margin-right:0;line-height:1.42857143;border:1px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>li>a:hover{border-color:#eee #eee #ddd}.nav-tabs>button{margin-right:0;line-height:1.42857143;border:2px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>button:hover{background-color:#25bbfc;border-color:#428bca;color:#eaf2f9;border-bottom-color:transparent;}.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{color:#f7fdfd;background-color:#1aae0d;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs>li.active>a,.nav-tabs>li.active>a:hover,.nav-tabs>li.active>a:focus{color:#428bca;background-color:#e5e5e5;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs.nav-justified{width:100%;border-bottom:0}.nav-tabs.nav-justified>li{float:none}.nav-tabs.nav-justified>li>a{text-align:center;margin-bottom:5px}.nav-tabs.nav-justified>.dropdown .dropdown-menu{top:auto;left:auto}.nav-status{float:left;margin:0;padding:3px;width:160px;font-weight:400;min-height:600}#bar,#prgbar {background-color: #f1f1f1;border-radius: 14px}#bar {background-color: #3498db;width: 0%;height: 14px}.switch{position:relative;display:inline-block;width:34px;height:16px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#f55959;-webkit-transition:.4s;transition:.4s}.slider:before{position:absolute;content:\"\";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;-webkit-transition:.4s;transition:.4s}input:checked+.slider{background-color:#5ca30a}input:focus+.slider{box-shadow:0 0 1px #5ca30a}input:checked+.slider:before{-webkit-transform:translateX(16px);-ms-transform:translateX(16px);transform:translateX(16px)}.slider.round{border-radius:34px}.slider.round:before{border-radius:50%}.button{border:1px solid #06c;background-color:#09c;color:#fff;padding:5px 10px;border-radius: 3px}.button:hover{border:1px solid #09c;background-color:#0ac;color:#fff}.button:disabled,button[disabled]{border:1px solid #999;background-color:#ccc;color:#666}.arrow {margin-left: 5px;font-size: 12px;}\n";
+	static const char css[] PROGMEM = R"CSS(
+:root{
+	--bg:#e8f1f6;
+	--panel:#ffffff;
+	--panel-2:#f7fbfe;
+	--line:#b7d3e2;
+	--ink:#11202b;
+	--ink-soft:#415f72;
+	--primary:#0b7fb3;
+	--primary-2:#0a5f95;
+	--accent:#0da96b;
+	--danger:#c23e3e;
+}
+*{box-sizing:border-box}
+body,font{
+	margin:0;
+	padding:16px 10px 24px;
+	color:var(--ink);
+	font:14px/1.45 "Trebuchet MS","Verdana","Tahoma",sans-serif;
+	background:
+		radial-gradient(circle at 12% 0%,rgba(11,127,179,.20) 0,transparent 42%),
+		radial-gradient(circle at 90% 5%,rgba(13,169,107,.16) 0,transparent 38%),
+		linear-gradient(180deg,#f5fbff 0%,var(--bg) 100%);
+}
+a,a:link,a:visited{text-decoration:none;color:#0f5e86}
+a:hover{text-decoration:underline}
+.container{
+	width:min(1160px,96vw);
+	margin:auto;
+	border:1px solid var(--line);
+	border-radius:14px;
+	overflow:hidden;
+	background:var(--panel);
+	box-shadow:0 22px 36px rgba(15,35,48,.18);
+}
+.header{
+	padding:14px 16px 10px;
+	background:
+		linear-gradient(135deg,var(--primary) 0%,var(--primary-2) 72%),
+		linear-gradient(45deg,rgba(255,255,255,.12) 0%,rgba(255,255,255,0) 60%);
+	color:#ecf8ff;
+}
+h1{
+	margin:4px 0 8px;
+	text-align:center;
+	font-size:1.55rem;
+	letter-spacing:.02em;
+	color:#ecf8ff;
+}
+.top-actions{
+	text-align:right;
+	margin-bottom:8px;
+	font-size:12px;
+}
+.top-actions a{
+	display:inline-block;
+	padding:4px 9px;
+	border-radius:999px;
+	border:1px solid rgba(255,255,255,.45);
+	color:#fff !important;
+	background:rgba(255,255,255,.10);
+}
+.top-actions a:hover{
+	background:rgba(255,255,255,.2);
+	text-decoration:none;
+}
+.row{padding:0}
+.nav{
+	margin:0;
+	padding:0;
+	list-style:none;
+}
+ul.nav.nav-tabs{
+	display:flex;
+	flex-wrap:wrap;
+	gap:6px;
+	padding:0;
+	margin:0;
+}
+.nav-tabs>button{
+	border:1px solid rgba(255,255,255,.45);
+	border-radius:9px;
+	padding:7px 10px;
+	background:rgba(255,255,255,.08);
+	color:#e5f7ff;
+	font-weight:700;
+	letter-spacing:.01em;
+	cursor:pointer;
+	transition:.18s ease;
+}
+.nav-tabs>button:hover{
+	background:rgba(255,255,255,.20);
+	transform:translateY(-1px);
+}
+.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{
+	background:var(--accent);
+	border-color:var(--accent);
+	color:#fff;
+	box-shadow:0 6px 14px rgba(13,169,107,.35);
+}
+.contentwide{
+	padding:14px 12px 10px;
+	background:linear-gradient(180deg,var(--panel) 0%,var(--panel-2) 100%);
+	min-height:420px;
+	font-size:14px !important;
+}
+.contentwide h2{
+	margin:0 0 10px;
+	color:var(--ink);
+	font-size:1.08rem;
+}
+.footer{
+	padding:10px 8px;
+	font-size:12px;
+	text-align:center;
+	color:#d8f0fb;
+	background:linear-gradient(135deg,var(--primary-2) 0%,var(--primary) 100%);
+}
+table{
+	width:100%;
+	border-collapse:separate;
+	border-spacing:0;
+	background:#fff;
+	border:1px solid #9dc3d9;
+	font-size:12px;
+	color:var(--ink);
+}
+table th{
+	position:sticky;
+	top:0;
+	background:linear-gradient(180deg,#0d84bd 0%,#0b6997 100%);
+	color:#f7fdff;
+	border:1px solid #8fc0da;
+	padding:6px 7px;
+	font-family:"Lucida Console","Menlo","Monaco","Courier New",monospace;
+	text-shadow:none;
+}
+table td{
+	border:1px solid #d0e3ef;
+	padding:5px 6px;
+	color:#112735;
+	font-family:"Lucida Console","Menlo","Monaco","Courier New",monospace;
+}
+table tr:nth-child(odd){background:#f8fcff}
+table tr:nth-child(even){background:#eff7fb}
+input,select,textarea,button{
+	font:13px/1.35 "Trebuchet MS","Verdana","Tahoma",sans-serif;
+}
+input[type=text],input[type=password],input[type=number],input[type=search],select,textarea{
+	width:auto;
+	max-width:100%;
+	padding:5px 7px;
+	border:1px solid #9ec3d8;
+	border-radius:7px;
+	background:#fff;
+	color:#12232f;
+}
+input:focus,select:focus,textarea:focus{
+	outline:none;
+	border-color:#3fa4d3;
+	box-shadow:0 0 0 3px rgba(63,164,211,.20);
+}
+button,.button,input[type=button],input[type=submit]{
+	border:1px solid #0f7cb0;
+	border-radius:8px;
+	padding:6px 11px;
+	font-weight:700;
+	color:#fff;
+	background:linear-gradient(180deg,#1692cf 0%,#0d6f9f 100%);
+}
+button:hover,.button:hover,input[type=button]:hover,input[type=submit]:hover{
+	filter:brightness(1.06);
+}
+button:disabled,.button:disabled,button[disabled],input[type=submit]:disabled{
+	border-color:#9aa8b1;
+	color:#d7dce0;
+	background:#b3bcc3;
+}
+fieldset{
+	border:1px solid #b4d0df;
+	border-radius:9px;
+	background:#fafdff;
+	padding:8px 10px;
+}
+legend{
+	color:#1a6f98;
+	font-weight:700;
+	padding:0 6px;
+}
+#tail{
+	height:420px;
+	width:100%;
+	overflow:auto;
+	color:#7cff9b;
+	background:#05131a;
+	border:1px solid #184359;
+	padding:8px;
+	font-family:"Lucida Console","Menlo","Monaco","Courier New",monospace;
+}
+#bar,#prgbar{background:#cfe4f0;border-radius:14px}
+#bar{background:linear-gradient(90deg,#0c7fb4 0%,#0ea878 100%);width:0%;height:14px}
+.nav-status{
+	margin:0;
+	padding:6px;
+	width:180px;
+	font-weight:400;
+	min-height:560px;
+}
+.arrow{margin-left:5px;font-size:12px}
+.switch{position:relative;display:inline-block;width:34px;height:16px}
+.switch input{opacity:0;width:0;height:0}
+.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#dc5a5a;transition:.3s}
+.slider:before{position:absolute;content:"";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;transition:.3s}
+input:checked+.slider{background-color:#31a962}
+input:checked+.slider:before{transform:translateX(16px)}
+.slider.round{border-radius:34px}
+.slider.round:before{border-radius:50%}
+.toggle{position:absolute;margin-left:-9999px;visibility:hidden}
+.toggle+label{display:block;position:relative;cursor:pointer;outline:none}
+input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#d4dde2;border-radius:10px;transition:background .4s}
+input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;content:""}
+input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}
+input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#c7d2da;border-radius:12px;transition:margin .4s,background .4s}
+input.toggle-round-flat:checked+label{background-color:#25a06d}
+input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#25a06d}
+.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}
+.nice-select.small ul li:nth-of-type(2){clear:both}
+@media (max-width:960px){
+	body{padding:8px}
+	.container{width:100%;border-radius:10px}
+	.header{padding:12px 10px 8px}
+	h1{font-size:1.2rem}
+	ul.nav.nav-tabs{gap:5px}
+	.nav-tabs>button{padding:6px 8px;font-size:12px}
+	.contentwide{padding:9px 7px;min-height:340px}
+	.nav-status{width:100%;min-height:0}
+	table{font-size:11px}
+	table th,table td{padding:4px}
+}
+)CSS";
 	request->send_P(200, "text/css", css);
 }
 
@@ -11442,6 +11749,15 @@ void handle_ws_audio_samples(const float *samples, size_t len, uint16_t sampleRa
 		return;
 	}
 
+	if (audioTuneActive)
+	{
+		const uint32_t now = millis();
+		if ((uint32_t)(now - audioTuneLastUserMs) > AUDIO_TUNE_IDLE_TIMEOUT_MS)
+		{
+			audioTuneResetToAprs("idle timeout");
+		}
+	}
+
 	if (ws_audio.count() < 1)
 	{
 		audioMonitorBufferLen = 0;
@@ -11632,9 +11948,20 @@ void handle_audio(AsyncWebServerRequest *request)
 </div>
 </td></tr>
 <tr><td align="right"><b>Format:</b></td><td align="left"><span id="audioCodec">8kHz mu-law mono</span></td></tr>
+<tr><td align="right"><b>Tuner RX:</b></td><td align="left">
+<input id="audioTuneFreq" type="number" step="0.0001" value="144.3900" style="width:150px;"> MHz
+<button class="button" id="audioTuneBtn" type="button">Tune RX</button>
+<button class="button" id="audioAprsBtn" type="button">Back To APRS</button>
+</td></tr>
+<tr><td align="right"><b>Tuner State:</b></td><td align="left">
+<span id="audioTuneState" style="font-weight:600;color:#27ae60;">APRS locked</span>
+<span style="margin-left:8px;">RX: <span id="audioTuneNow">-</span></span>
+<span style="margin-left:8px;">APRS: <span id="audioTuneAprs">-</span></span>
+</td></tr>
+<tr><td align="right"><b>Auto Return:</b></td><td align="left"><span id="audioTuneAuto">Idle return enabled</span></td></tr>
 </table>
 <div style="font-size:9pt;color:#555;margin-top:8px;">
-Open this tab and click <b>Start Listening</b> to monitor RX audio in your browser.
+Tune temporarily for audio monitoring; when this interface is idle it automatically returns RX to APRS.
 </div>
 </div>
 <script type="text/javascript">
@@ -11667,10 +11994,61 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
   const elQueue = document.getElementById("audioQueue");
   const elLevel = document.getElementById("audioLevelBar");
   const elCodec = document.getElementById("audioCodec");
+  const elTuneFreq = document.getElementById("audioTuneFreq");
+  const elTuneBtn = document.getElementById("audioTuneBtn");
+  const elAprsBtn = document.getElementById("audioAprsBtn");
+  const elTuneState = document.getElementById("audioTuneState");
+  const elTuneNow = document.getElementById("audioTuneNow");
+  const elTuneAprs = document.getElementById("audioTuneAprs");
+  const elTuneAuto = document.getElementById("audioTuneAuto");
 
   function setStatus(txt, color) {
     elStatus.textContent = txt;
     elStatus.style.color = color || "#2c3e50";
+  }
+
+  async function tuneApi(action, freqValue) {
+    let url = "/audio_tune?action=" + encodeURIComponent(action);
+    if (typeof freqValue === "number" && Number.isFinite(freqValue)) {
+      url += "&freq=" + encodeURIComponent(freqValue.toFixed(4));
+    }
+    const resp = await fetch(url, { method: "GET", cache: "no-store" });
+    let data = null;
+    try { data = await resp.json(); } catch (_) {}
+    if (!resp.ok || !data || data.ok === false) {
+      const msg = (data && data.message) ? data.message : ("HTTP " + resp.status);
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  function renderTuneStatus(st) {
+    if (!st) return;
+    const rxFreq = Number(st.rx || 0);
+    const aprsFreq = Number(st.aprs || 0);
+    if (Number.isFinite(rxFreq) && rxFreq > 0) {
+      elTuneNow.textContent = rxFreq.toFixed(4) + " MHz";
+    }
+    if (Number.isFinite(aprsFreq) && aprsFreq > 0) {
+      elTuneAprs.textContent = aprsFreq.toFixed(4) + " MHz";
+    }
+    if (st.active) {
+      elTuneState.textContent = "Temporary tuned";
+      elTuneState.style.color = "#d35400";
+    } else {
+      elTuneState.textContent = "APRS locked";
+      elTuneState.style.color = "#27ae60";
+    }
+    if (!(document.activeElement === elTuneFreq) && Number.isFinite(rxFreq) && rxFreq > 0) {
+      elTuneFreq.value = rxFreq.toFixed(4);
+    }
+    const idleSec = Number(st.idleSec || 0);
+    const timeoutSec = Number(st.timeoutSec || 0);
+    const minF = Number(st.min || 0);
+    const maxF = Number(st.max || 0);
+    if (Number.isFinite(timeoutSec) && timeoutSec > 0) {
+      elTuneAuto.textContent = "Return to APRS after " + timeoutSec + "s idle (idle now " + idleSec + "s, range " + minF.toFixed(4) + "-" + maxF.toFixed(4) + " MHz)";
+    }
   }
 
   function mulawToLinear(uVal) {
@@ -11766,6 +12144,7 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
       monitor.running = true;
       elToggle.textContent = "Stop Listening";
       setStatus("Connected", "#27ae60");
+      tuneApi("touch").then(renderTuneStatus).catch(function(){});
     };
 
     monitor.ws.onclose = function() {
@@ -11829,8 +12208,48 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     setVolume(parseInt(elVol.value, 10) / 100.0);
   }
 
+  async function setTune() {
+    const f = parseFloat(elTuneFreq.value);
+    if (!Number.isFinite(f)) {
+      setStatus("Invalid tune frequency", "#e74c3c");
+      return;
+    }
+    try {
+      const st = await tuneApi("set", f);
+      renderTuneStatus(st);
+      setStatus("Tuned RX " + f.toFixed(4) + " MHz", "#27ae60");
+    } catch (err) {
+      setStatus("Tune failed: " + err.message, "#e74c3c");
+    }
+  }
+
+  async function resetTune() {
+    try {
+      const st = await tuneApi("reset");
+      renderTuneStatus(st);
+      setStatus("Returned to APRS", "#2c3e50");
+    } catch (err) {
+      setStatus("Retune failed: " + err.message, "#e74c3c");
+    }
+  }
+
+  async function refreshTuneStatus() {
+    try {
+      const st = await tuneApi("status");
+      renderTuneStatus(st);
+    } catch (_) {}
+  }
+
   elToggle.addEventListener("click", toggle);
   elMute.addEventListener("click", toggleMute);
+  elTuneBtn.addEventListener("click", setTune);
+  elAprsBtn.addEventListener("click", resetTune);
+  elTuneFreq.addEventListener("keydown", function(ev) {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      setTune();
+    }
+  });
   elVol.addEventListener("input", function() {
     elVolVal.textContent = elVol.value + "%";
     setVolume(parseInt(elVol.value, 10) / 100.0);
@@ -11842,6 +12261,15 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
     elLevel.style.width = Math.min(100, Math.round(monitor.level * 100)) + "%";
     monitor.level *= 0.85;
   }, 100);
+
+  setInterval(function() {
+    if (monitor.running && monitor.ws && monitor.ws.readyState === WebSocket.OPEN) {
+      monitor.ws.send("ping");
+    }
+  }, 10000);
+
+  setInterval(refreshTuneStatus, 5000);
+  refreshTuneStatus();
 
   window.__audioMonitor = { stop: stop };
 })();
@@ -11861,6 +12289,99 @@ Open this tab and click <b>Start Listening</b> to monitor RX audio in your brows
 	response->addHeader("Audio", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
+}
+
+void handle_audio_tune(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	float freqMin = 0.0F;
+	float freqMax = 0.0F;
+	getRfRangeForType(config.rf_type, freqMin, freqMax);
+
+	auto sendStatus = [&](int statusCode, bool ok, const char *message)
+	{
+		char json[320];
+		const uint32_t timeoutSec = AUDIO_TUNE_IDLE_TIMEOUT_MS / 1000UL;
+		const uint32_t idleSec = (audioTuneLastUserMs == 0) ? timeoutSec : ((uint32_t)(millis() - audioTuneLastUserMs) / 1000UL);
+		const float aprsFreq = audioTuneActive ? audioTuneAprsFreqRx : config.freq_rx;
+		snprintf(json, sizeof(json),
+				 "{\"ok\":%s,\"active\":%s,\"rx\":%.4f,\"aprs\":%.4f,\"min\":%.4f,\"max\":%.4f,\"idleSec\":%lu,\"timeoutSec\":%lu,\"message\":\"%s\"}",
+				 ok ? "true" : "false",
+				 audioTuneActive ? "true" : "false",
+				 config.freq_rx,
+				 aprsFreq,
+				 freqMin,
+				 freqMax,
+				 (unsigned long)idleSec,
+				 (unsigned long)timeoutSec,
+				 message ? message : "");
+		request->send(statusCode, "application/json", json);
+	};
+
+	String action = request->arg("action");
+	action.toLowerCase();
+
+	if (action.length() == 0 || action == "status")
+	{
+		sendStatus(200, true, "status");
+		return;
+	}
+
+	if (action == "touch")
+	{
+		audioTuneTouch();
+		sendStatus(200, true, "touch");
+		return;
+	}
+
+	if (action == "reset")
+	{
+		audioTuneResetToAprs("manual reset");
+		sendStatus(200, true, "reset");
+		return;
+	}
+
+	if (action == "set")
+	{
+		if (!request->hasArg("freq"))
+		{
+			sendStatus(400, false, "missing freq");
+			return;
+		}
+		if (!config.rf_en)
+		{
+			sendStatus(409, false, "radio disabled");
+			return;
+		}
+
+		const float newFreq = request->arg("freq").toFloat();
+		if (newFreq < freqMin || newFreq > freqMax)
+		{
+			sendStatus(422, false, "freq out of range");
+			return;
+		}
+
+		if (!audioTuneActive)
+		{
+			audioTuneAprsFreqRx = config.freq_rx;
+		}
+		audioTuneActive = true;
+		audioTuneTouch();
+
+		if (absFloat(config.freq_rx - newFreq) > 0.00005F)
+		{
+			config.freq_rx = newFreq;
+			RF_MODULE(false);
+		}
+		sendStatus(200, true, "tuned");
+		return;
+	}
+
+	sendStatus(400, false, "invalid action");
 }
 
 void handle_about(AsyncWebServerRequest *request)
@@ -12349,6 +12870,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 		log_d("Websocket client connection received");
 		if (server == &ws_audio)
 		{
+			audioTuneTouch();
 			client->text("{\"type\":\"cfg\",\"codec\":\"mulaw\",\"rate\":8000}");
 		}
 	}
@@ -12364,6 +12886,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 		{
 			if (len == 4 && strncmp((const char *)data, "ping", 4) == 0)
 			{
+				audioTuneTouch();
 				client->text("pong");
 			}
 		}
@@ -12446,6 +12969,8 @@ void webService()
 					{ handle_sensor(request); });
 	async_server.on("/audio", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_audio(request); });
+	async_server.on("/audio_tune", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_audio_tune(request); });
 	async_server.on("/system", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_system(request); });
 	async_server.on("/wireless", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
