@@ -1204,17 +1204,24 @@ void adc_continue_init(void)
  */
 static void sigmadelta_init(void)
 {
+  gpio_num_t sigmadelta_gpio = GPIO_NUM_26;
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+  sigmadelta_gpio = GPIO_NUM_1; // GPIO1 is used for ESP32C3
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+  sigmadelta_gpio = GPIO_NUM_2; // GPIO2 is used for ESP32S3
+#else
+  // For ESP32 targets, use configured DAC pin when valid.
+  if (_dac_pin >= 0 && _dac_pin <= 33)
+  {
+    sigmadelta_gpio = (gpio_num_t)_dac_pin;
+  }
+#endif
+
   sigmadelta_config_t sigmadelta_cfg = {
       .channel = SIGMADELTA_CHANNEL_0,
       .sigmadelta_duty = 127,
       .sigmadelta_prescale = 96,
-#ifdef CONFIG_IDF_TARGET_ESP32C3
-      .sigmadelta_gpio = GPIO_NUM_1, // GPIO1 is used for ESP32C3
-#elif defined(CONFIG_IDF_TARGET_ESP32S3)
-      .sigmadelta_gpio = GPIO_NUM_2, // GPIO2 is used for ESP32S3
-#else
-      .sigmadelta_gpio = GPIO_NUM_26,
-#endif
+      .sigmadelta_gpio = sigmadelta_gpio,
   };
   sigmadelta_config(&sigmadelta_cfg);
 }

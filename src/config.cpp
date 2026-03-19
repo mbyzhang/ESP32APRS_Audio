@@ -382,6 +382,8 @@ bool saveConfiguration(const char *filename, const Configuration &config)
     doc["rfPDAct"] = config.rf_pd_active;
     doc["rfPWRAct"] = config.rf_pwr_active;
     doc["rfPTTAct"] = config.rf_ptt_active;
+    doc["adcGPIO"] = config.adc_gpio;
+    doc["dacGPIO"] = config.dac_gpio;
     doc["adcAtten"] = config.adc_atten;
     doc["adcOffset"] = config.adc_dc_offset;
     doc["rfBaudrate"] = config.rf_baudrate;
@@ -874,19 +876,21 @@ bool loadConfiguration(const char *filename, Configuration &config)
         strlcpy(config.gnss_at_command, doc["gnssAT"] | "", sizeof(config.gnss_at_command));
 
         // MOD RF group
-        config.rf_tx_gpio = doc["rfTx"];
-        config.rf_rx_gpio = doc["rfRx"];
-        config.rf_sql_gpio = doc["rfSQL"];
-        config.rf_pd_gpio = doc["rfPD"];
-        config.rf_pwr_gpio = doc["rfPWR"];
-        config.rf_ptt_gpio = doc["rfPTT"];
-        config.rf_sql_active = doc["rfSQLAct"];
-        config.rf_pd_active = doc["rfPDAct"];
-        config.rf_pwr_active = doc["rfPWRAct"];
-        config.rf_ptt_active = doc["rfPTTAct"];
-        config.rf_baudrate = doc["rfBaudrate"];
-        config.adc_atten = doc["adcAtten"];
-        config.adc_dc_offset = doc["adcOffset"];          
+        config.rf_tx_gpio = doc["rfTx"] | config.rf_tx_gpio;
+        config.rf_rx_gpio = doc["rfRx"] | config.rf_rx_gpio;
+        config.rf_sql_gpio = doc["rfSQL"] | config.rf_sql_gpio;
+        config.rf_pd_gpio = doc["rfPD"] | config.rf_pd_gpio;
+        config.rf_pwr_gpio = doc["rfPWR"] | config.rf_pwr_gpio;
+        config.rf_ptt_gpio = doc["rfPTT"] | config.rf_ptt_gpio;
+        config.rf_sql_active = doc["rfSQLAct"] | config.rf_sql_active;
+        config.rf_pd_active = doc["rfPDAct"] | config.rf_pd_active;
+        config.rf_pwr_active = doc["rfPWRAct"] | config.rf_pwr_active;
+        config.rf_ptt_active = doc["rfPTTAct"] | config.rf_ptt_active;
+        config.adc_gpio = doc["adcGPIO"] | config.adc_gpio;
+        config.dac_gpio = doc["dacGPIO"] | config.dac_gpio;
+        config.rf_baudrate = doc["rfBaudrate"] | config.rf_baudrate;
+        config.adc_atten = doc["adcAtten"] | config.adc_atten;
+        config.adc_dc_offset = doc["adcOffset"] | config.adc_dc_offset;
 
         // config.rf_reset_gpio = doc["rfRST"];
         // config.rf_dio0_gpio = doc["rfDIO0"];

@@ -1471,7 +1471,11 @@ void defaultConfig()
     config.rf_pwr_active = 1;
     config.rf_ptt_active = 1;
 #endif
+#if defined(KV4P_HT)
+    config.adc_atten = 4;
+#else
     config.adc_atten = 0;
+#endif
     config.adc_dc_offset = 600;
     config.rf_baudrate = 9600;
 
@@ -3271,16 +3275,22 @@ void setup()
 
     LED_Status(255, 255, 255);
 
+    // Start from board-specific defaults so missing keys in /default.cfg cannot
+    // leave critical GPIO values (PTT/PD/ADC/DAC) at generic struct defaults.
+    defaultConfig();
+
     if (!LITTLEFS.exists("/default.cfg"))
     {
         log_d("Factory Default");
-        defaultConfig();
         saveConfiguration("/default.cfg", config);
     }
     else
     {
         if (!loadConfiguration("/default.cfg", config))
+        {
             defaultConfig();
+            saveConfiguration("/default.cfg", config);
+        }
     }
 
     //setCpuFrequencyMhz(config.cpuFreq);
@@ -3290,6 +3300,27 @@ void setup()
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     if ((config.rf_ptt_gpio > 25) && (config.rf_ptt_gpio < 38))
         config.rf_ptt_gpio = 5; // GPIO25-37 are flash only on ESP32S3
+#endif
+
+#if defined(KV4P_HT)
+    // KV4P HT 2.0D fixed wiring (per KV4P firmware docs/source).
+    bool kv4pPinFixApplied = false;
+    if (config.rf_tx_gpio != 17) { config.rf_tx_gpio = 17; kv4pPinFixApplied = true; }
+    if (config.rf_rx_gpio != 16) { config.rf_rx_gpio = 16; kv4pPinFixApplied = true; }
+    if (config.rf_sql_gpio != 4) { config.rf_sql_gpio = 4; kv4pPinFixApplied = true; }
+    if (config.rf_pd_gpio != 19) { config.rf_pd_gpio = 19; kv4pPinFixApplied = true; }
+    if (config.rf_ptt_gpio != 18) { config.rf_ptt_gpio = 18; kv4pPinFixApplied = true; }
+    if (config.adc_gpio != 34) { config.adc_gpio = 34; kv4pPinFixApplied = true; }
+    if (config.dac_gpio != 25) { config.dac_gpio = 25; kv4pPinFixApplied = true; }
+    if (config.rf_sql_active != 0) { config.rf_sql_active = 0; kv4pPinFixApplied = true; }
+    if (config.rf_pd_active != 1) { config.rf_pd_active = 1; kv4pPinFixApplied = true; }
+    if (config.rf_ptt_active != 0) { config.rf_ptt_active = 0; kv4pPinFixApplied = true; }
+    if (config.adc_atten != 4) { config.adc_atten = 4; kv4pPinFixApplied = true; }
+    if (kv4pPinFixApplied)
+    {
+        log_w("Applied KV4P HT 2.0D GPIO defaults and saved /default.cfg");
+        saveConfiguration("/default.cfg", config);
+    }
 #endif
 
     if (config.i2c1_enable)
