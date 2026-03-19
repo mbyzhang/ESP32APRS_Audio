@@ -333,7 +333,13 @@ typedef struct Config_Struct
 	bool rf_pd_active = 1;
 	bool rf_pwr_active = 0;
 	bool rf_ptt_active = 0;
+#ifdef CONFIG_IDF_TARGET_ESP32
+	int8_t adc_gpio = 36;
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
 	int8_t adc_gpio = 1;
+#else
+	int8_t adc_gpio = 0;
+#endif
 	int8_t dac_gpio = 18;
 	int8_t adc_sel_gpio = -1;
 	int8_t dac_sel_gpio = 17;
