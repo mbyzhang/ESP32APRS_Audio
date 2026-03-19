@@ -12728,11 +12728,11 @@ static void serveAppAsset(AsyncWebServerRequest *request, const char *path, cons
 	request->send(response);
 }
 
+void handle_app_index(AsyncWebServerRequest *request);
+
 void handle_app_root(AsyncWebServerRequest *request)
 {
-	if (!ensureWebAuth(request))
-		return;
-	request->redirect("/app/");
+	handle_app_index(request);
 }
 
 void handle_app_index(AsyncWebServerRequest *request)
@@ -12748,6 +12748,11 @@ void handle_app_js(AsyncWebServerRequest *request)
 void handle_app_css(AsyncWebServerRequest *request)
 {
 	serveAppAsset(request, "/app/app.css", "text/css");
+}
+
+void handle_app_commit(AsyncWebServerRequest *request)
+{
+	serveAppAsset(request, "/app/commit.txt", "text/plain");
 }
 
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -12840,7 +12845,6 @@ void webService()
 	{
 		return;
 	}
-	ws.onEvent(onWsEvent);
 	ws_audio.onEvent(onWsEvent);
 
 	// web client handlers
@@ -12858,6 +12862,15 @@ void webService()
 					{ handle_app_js(request); });
 	async_server.on("/app/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_app_css(request); });
+	async_server.on("/app/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_commit(request); });
+	// Compatibility routes for stale cached HTML that references root-level assets.
+	async_server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_js(request); });
+	async_server.on("/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_css(request); });
+	async_server.on("/commit.txt", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_app_commit(request); });
 	async_server.on("/logout", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_logout(request); });
 	async_server.on("/audio_tune", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12976,8 +12989,5 @@ void webService()
 
 	async_server.onNotFound(notFound);
 	async_server.begin();
-	async_websocket.addHandler(&ws);
-	async_websocket.addHandler(&ws_gnss);
 	async_server.addHandler(&ws_audio);
-	async_websocket.begin();
 }

@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>ESP32 APRS Audio</title>
+  <link rel="stylesheet" href="/app/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>ESP32 APRS Audio</h1>
+        <p id="statusLine">Connecting...</p>
+      </div>
+      <button id="openLegacy" class="ghost-btn" type="button">Legacy UI</button>
+    </header>
+
+    <main class="main-tabs">
+      <section id="tab-home" class="tab-pane active">
+        <div class="chat-layout">
+          <aside class="contacts">
+            <div class="contacts-head">
+              <h2>Stations</h2>
+              <button id="refreshContacts" class="ghost-btn" type="button">Refresh</button>
+            </div>
+            <div id="contactsList" class="contacts-list"></div>
+          </aside>
+
+          <section class="chat-panel">
+            <div class="chat-head">
+              <h2 id="chatTitle">Select a station</h2>
+              <small id="chatSub">Recent RF heard + APRS messages</small>
+            </div>
+            <div id="messagesList" class="messages-list"></div>
+            <form id="sendForm" class="send-form">
+              <input id="sendTo" type="text" placeholder="CALL-SSID" maxlength="10" required>
+              <input id="sendText" type="text" placeholder="Type APRS message" maxlength="240" required>
+              <button type="submit">Send</button>
+            </form>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-audio" class="tab-pane">
+        <div class="card-grid">
+          <article class="card">
+            <h3>RX Audio</h3>
+            <div class="row">
+              <button id="audioToggle" type="button">Start Listening</button>
+              <button id="audioMute" type="button">Mute</button>
+            </div>
+            <label>Volume <input id="audioVolume" type="range" min="0" max="100" value="70"></label>
+            <div class="meter"><span id="audioLevel"></span></div>
+            <p class="muted" id="audioState">Stopped</p>
+          </article>
+
+          <article class="card">
+            <h3>Tuner</h3>
+            <label>RX Frequency (MHz)</label>
+            <div class="row">
+              <input id="tuneFreq" type="number" step="0.0001" value="144.3900">
+              <button id="tuneSet" type="button">Tune</button>
+              <button id="tuneReset" type="button">APRS</button>
+            </div>
+            <p class="muted" id="tuneStatus">APRS locked</p>
+          </article>
+
+          <article class="card">
+            <h3>Radio Controls</h3>
+            <div class="grid2">
+              <label>RX MHz<input id="radioRx" type="number" step="0.0001"></label>
+              <label>TX MHz<input id="radioTx" type="number" step="0.0001"></label>
+              <label>CTCSS RX<select id="toneRx"></select></label>
+              <label>CTCSS TX<select id="toneTx"></select></label>
+              <label>SQL<input id="sqlLevel" type="range" min="0" max="8" value="1"></label>
+              <label>Volume<input id="rfVolume" type="range" min="1" max="8" value="6"></label>
+              <label>DCS RX
+                <input type="text" value="Not yet" disabled>
+              </label>
+              <label>DCS TX
+                <input type="text" value="Not yet" disabled>
+              </label>
+            </div>
+            <div class="row">
+              <button id="saveRadio" type="button">Apply + Save</button>
+              <button id="pttBtn" type="button" class="warn">Hold PTT</button>
+            </div>
+            <p class="muted" id="pttState">PTT: idle</p>
+          </article>
+
+          <article class="card">
+            <h3>Web Mic TX</h3>
+            <div class="row">
+              <button id="micEnable" type="button">Enable Mic</button>
+            </div>
+            <div class="meter"><span id="micLevel"></span></div>
+            <p class="muted">Hold PTT to key TX. Mic meter verifies browser input.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="tab-diag" class="tab-pane">
+        <div class="card-grid">
+          <article class="card">
+            <h3>RF Diagnostics</h3>
+            <dl id="diagList" class="diag-list"></dl>
+            <button id="refreshDiag" type="button">Refresh</button>
+          </article>
+
+          <article class="card">
+            <h3>KV4P HT 2.0D Self-Test</h3>
+            <div id="selftestSummary" class="muted">Not run</div>
+            <div id="selftestList" class="selftest-list"></div>
+            <button id="runSelftest" type="button">Run Self-Test</button>
+          </article>
+        </div>
+      </section>
+
+      <section id="tab-settings" class="tab-pane">
+        <div class="card-grid">
+          <article class="card">
+            <h3>Incoming Message Webhook</h3>
+            <label><input id="hookEnable" type="checkbox"> Enable webhook forwarding</label>
+            <label>Webhook URL<input id="hookUrl" type="url" placeholder="https://example/webhook"></label>
+            <label>Timeout (ms)<input id="hookTimeout" type="number" min="200" max="10000" step="100"></label>
+            <button id="saveWebhook" type="button">Save Webhook Settings</button>
+          </article>
+
+          <article class="card">
+            <h3>Config Backup / Restore</h3>
+            <div class="row">
+              <button id="backupCfg" type="button">Download default.cfg</button>
+            </div>
+            <div class="row">
+              <input id="restoreCfgFile" type="file" accept=".cfg,application/json,text/plain">
+              <button id="restoreCfg" type="button">Restore Config</button>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3>OTA Firmware</h3>
+            <div class="row">
+              <input id="otaFile" type="file" accept=".bin,application/octet-stream">
+              <button id="otaUpload" type="button">Upload OTA</button>
+            </div>
+            <p class="muted">Device reboots automatically after successful update.</p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <nav class="tabbar">
+      <button data-tab="home" class="active">Home</button>
+      <button data-tab="audio">Audio</button>
+      <button data-tab="diag">Diagnostics</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+  </div>
+
+  <script src="/app/app.js"></script>
+</body>
+</html>
