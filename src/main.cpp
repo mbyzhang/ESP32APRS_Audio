@@ -238,6 +238,7 @@ extern volatile int8_t dacEn;
 extern volatile bool pttOff;
 extern volatile uint32_t adcIsrCount;
 extern volatile int fifoSampleCount;
+volatile int8_t webAudioPttRequest = 0; // -1: force off, +1: force on
 // extern volatile uint32_t frameDecodeCount;
 
 long timeNetwork, timeAprs, timeGui;
@@ -1366,6 +1367,19 @@ void logWeather(double lat, double lon, double speed, double course)
     }
 }
 
+#ifndef DEFAULT_WIFI_STA_SSID
+#define DEFAULT_WIFI_STA_SSID "APRSTH"
+#endif
+#ifndef DEFAULT_WIFI_STA_PASS
+#define DEFAULT_WIFI_STA_PASS "aprsthnetwork"
+#endif
+#ifndef DEFAULT_WIFI_AP_SSID
+#define DEFAULT_WIFI_AP_SSID "ESP32APRS_Audio"
+#endif
+#ifndef DEFAULT_WIFI_AP_PASS
+#define DEFAULT_WIFI_AP_PASS "aprsthnetwork"
+#endif
+
 void defaultConfig()
 {
     log_d("Default configure mode!");
@@ -1382,16 +1396,20 @@ void defaultConfig()
     config.wifi_power = 44; // WIFI_POWER_11dBm
     config.wifi_ap_ch = 6;
     config.wifi_sta[0].enable = true;
-    sprintf(config.wifi_sta[0].wifi_ssid, "APRSTH");
-    sprintf(config.wifi_sta[0].wifi_pass, "aprsthnetwork");
+    strlcpy(config.wifi_sta[0].wifi_ssid, DEFAULT_WIFI_STA_SSID, sizeof(config.wifi_sta[0].wifi_ssid));
+    strlcpy(config.wifi_sta[0].wifi_pass, DEFAULT_WIFI_STA_PASS, sizeof(config.wifi_sta[0].wifi_pass));
     for (int i = 1; i < 5; i++)
     {
         config.wifi_sta[i].enable = false;
         config.wifi_sta[i].wifi_ssid[0] = 0;
         config.wifi_sta[i].wifi_pass[0] = 0;
     }
-    sprintf(config.wifi_ap_ssid, "ESP32APRS_Audio");
-    sprintf(config.wifi_ap_pass, "aprsthnetwork");
+    {
+        const uint64_t chipid = ESP.getEfuseMac();
+        const uint32_t macSuffix = (uint32_t)(chipid & 0xFFFFFF);
+        snprintf(config.wifi_ap_ssid, sizeof(config.wifi_ap_ssid), "%s_%06X", DEFAULT_WIFI_AP_SSID, macSuffix);
+    }
+    strlcpy(config.wifi_ap_pass, DEFAULT_WIFI_AP_PASS, sizeof(config.wifi_ap_pass));
 
     // Blutooth
     config.bt_slave = false;
@@ -3587,7 +3605,7 @@ void setup()
     xTaskCreatePinnedToCore(
         taskAPRSPoll,        /* Function to implement the task */
         "taskAPRSPoll",      /* Name of the task */
-        2048,                /* Stack size in words */
+        4096,                /* Stack size in words */
         NULL,                /* Task input parameter */
         0,                   /* Priority of the task */
         &taskAPRSPollHandle, /* Task handle. */
@@ -3624,7 +3642,7 @@ void setup()
     xTaskCreatePinnedToCore(
         taskAPRSPoll,        /* Function to implement the task */
         "taskAPRSPoll",      /* Name of the task */
-        2048,                /* Stack size in words */
+        4096,                /* Stack size in words */
         NULL,                /* Task input parameter */
         0,                   /* Priority of the task */
         &taskAPRSPollHandle, /* Task handle. */
@@ -6223,6 +6241,12 @@ void taskAPRS(void *pvParameters)
             setPtt(false);
             pttOff = false;
             log_i("[TX-END] PTT released, fifo=%d", fifoSampleCount);
+        }
+        if (webAudioPttRequest != 0)
+        {
+            const int8_t req = webAudioPttRequest;
+            webAudioPttRequest = 0;
+            setPtt(req > 0);
         }
         long now = millis();
         // wdtSensorTimer = now;

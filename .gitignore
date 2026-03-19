@@ -5,6 +5,7 @@
 .vscode/ipch
 .DS_Store
 .DS_store
+.env
 
 # OS-generated files
 ._*

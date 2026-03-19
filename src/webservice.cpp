@@ -236,12 +236,14 @@ void taskAudioTx(void *pvParameters)
 	dac_output_voltage(DAC_CHAN_1, 128);
 #endif
 	int64_t nextUs = esp_timer_get_time();
+	uint16_t yieldCounter = 0;
 	for (;;)
 	{
 		if (!audioTxPttActive)
 		{
 			vTaskDelay(pdMS_TO_TICKS(5));
 			nextUs = esp_timer_get_time();
+			yieldCounter = 0;
 			continue;
 		}
 
@@ -264,6 +266,11 @@ void taskAudioTx(void *pvParameters)
 		else
 		{
 			nextUs = nowUs;
+		}
+		if (++yieldCounter >= 64)
+		{
+			yieldCounter = 0;
+			taskYIELD();
 		}
 	}
 }
@@ -308,6 +315,7 @@ static uint8_t linearToMuLaw(int16_t pcm)
 extern unsigned long waitISRetry;
 extern volatile int8_t adcEn;
 extern volatile int8_t dacEn;
+extern volatile int8_t webAudioPttRequest;
 extern unsigned long upTimeStamp;
 extern double VBat;
 extern bool VBat_Flag;
@@ -12611,7 +12619,7 @@ static void stopAudioTxSession()
 	{
 		audioTxPttActive = false;
 		audioTxClearBuffer();
-		setPtt(false);
+		webAudioPttRequest = -1;
 	}
 	audioTxOwnerId = 0;
 }
@@ -12670,7 +12678,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
 					audioTxOwnerId = client->id();
 					audioTxClearBuffer();
 					audioTxPttActive = true;
-					setPtt(true);
+					webAudioPttRequest = 1;
 					client->text("{\"type\":\"tx\",\"ok\":1,\"state\":\"on\"}");
 				}
 			}
@@ -12752,7 +12760,7 @@ void webService()
 	ws_audio.onEvent(onWsEvent);
 	if (taskAudioTxHandle == nullptr)
 	{
-		xTaskCreate(taskAudioTx, "AudioTx", 4096, nullptr, 1, &taskAudioTxHandle);
+		xTaskCreatePinnedToCore(taskAudioTx, "AudioTx", 4096, nullptr, 1, &taskAudioTxHandle, 0);
 	}
 
 	// web client handlers
