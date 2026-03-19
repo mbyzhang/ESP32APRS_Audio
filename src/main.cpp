@@ -7647,8 +7647,8 @@ void taskAPRSPoll(void *pvParameters)
     // afskSetDCOffset(config.adc_dc_offset);
     afskSetADCAtten(config.adc_atten);
 #ifdef KV4P_HT
-    dac_output_enable(DAC_CHANNEL_2);  // GPIO26 (DAC1)
-    dac_output_voltage(DAC_CHANNEL_2, (255.0 / 3.3) * 1.75);
+    dac_output_enable(DAC_CHAN_1);  // GPIO26 (DAC1)
+    dac_output_voltage(DAC_CHAN_1, (255.0 / 3.3) * 1.75);
 #endif
 
 #ifdef STRIP_PIN

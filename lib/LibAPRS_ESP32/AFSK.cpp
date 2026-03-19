@@ -462,7 +462,7 @@ void afskSetADCAtten(uint8_t val)
     cfg_adc_atten = ADC_ATTENDB_MAX;
     Vref = 3300;
   }
-  analogSetPinAttenuation(adc_pins[0], cfg_adc_atten);
+  analogSetPinAttenuation(_adc_pin, cfg_adc_atten);
 }
 #else
 adc_atten_t cfg_adc_atten = ADC_ATTEN_DB_0;
@@ -637,7 +637,12 @@ void I2S_Init(i2s_mode_t MODE, i2s_bits_per_sample_t BPS)
   }
   // GPIO36, VP
   // init ADC pad
+#ifdef KV4P_HT
+  i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_6);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_12);
+#else
   i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_0);
+#endif
   // i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, BPS, I2S_CHANNEL_MONO);
   i2s_adc_enable(I2S_NUM_0);
   delay(500); // required for stability of ADC
@@ -699,7 +704,7 @@ void IRAM_ATTR sample_adc_isr()
     fifo.lock = true;
     // digitalWrite(15,HIGH);
     portENTER_CRITICAL_ISR(&timerMux); // ISR start
-    int16_t adc = analogReadMilliVolts(adc_pins[0]);
+    int16_t adc = analogReadMilliVolts(_adc_pin);
 
     // RingBuffer_Push(&fifo, adc);
     // if(fifo.head >= BUFFER_SIZE || fifo.head < 0) fifo.head = 0; // Check if head exceeds buffer size
@@ -1041,10 +1046,10 @@ void adc_continue_init(void)
 {
   adc_channel_t channel;
   adc_unit_t adc_unit = ADC_UNIT_1;
-  esp_err_t Err = adc_continuous_io_to_channel(adc_pins[0], &adc_unit, &channel);
+  esp_err_t Err = adc_continuous_io_to_channel(_adc_pin, &adc_unit, &channel);
   if (Err != ESP_OK)
   {
-    log_e("Pin %u is not ADC pin!", adc_pins[0]);
+    log_e("Pin %u is not ADC pin!", _adc_pin);
   }
   if (adc_unit != 0)
   {
@@ -1260,7 +1265,7 @@ void AFSK_hw_init(void)
 #ifdef ADC_SAMPLE
   pinMode(15, OUTPUT);
   analogReadResolution(12);
-  analogSetPinAttenuation(adc_pins[0], cfg_adc_atten);
+  analogSetPinAttenuation(_adc_pin, cfg_adc_atten);
   timer_adc = timerBegin(20000000);
   // Attach onTimer function to our timer.
   timerAttachInterrupt(timer_adc, &sample_adc_isr); // Attaches the handler function to the timer
