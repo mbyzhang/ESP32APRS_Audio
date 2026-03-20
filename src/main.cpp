@@ -1380,6 +1380,56 @@ void logWeather(double lat, double lon, double speed, double course)
 #define DEFAULT_WIFI_AP_PASS "aprsthnetwork"
 #endif
 
+static bool isHexChar(char c)
+{
+    return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+}
+
+static bool isDefaultApSsidFormat(const char *ssid)
+{
+    if (ssid == nullptr)
+    {
+        return false;
+    }
+
+    const size_t baseLen = strlen(DEFAULT_WIFI_AP_SSID);
+    if (strcmp(ssid, DEFAULT_WIFI_AP_SSID) == 0)
+    {
+        return true;
+    }
+    if (strncmp(ssid, DEFAULT_WIFI_AP_SSID, baseLen) != 0)
+    {
+        return false;
+    }
+    if (ssid[baseLen] != '_')
+    {
+        return false;
+    }
+    if (strlen(ssid) != (baseLen + 7))
+    {
+        return false;
+    }
+    for (size_t i = baseLen + 1; i < baseLen + 7; ++i)
+    {
+        if (!isHexChar(ssid[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void setDefaultApSsidForThisDevice(char *ssid, size_t ssidLen)
+{
+    if (ssid == nullptr || ssidLen == 0)
+    {
+        return;
+    }
+    const uint64_t chipid = ESP.getEfuseMac();
+    const uint32_t macSuffix = (uint32_t)(chipid & 0xFFFFFF);
+    snprintf(ssid, ssidLen, "%s_%06X", DEFAULT_WIFI_AP_SSID, macSuffix);
+}
+
 void defaultConfig()
 {
     log_d("Default configure mode!");
@@ -1404,11 +1454,7 @@ void defaultConfig()
         config.wifi_sta[i].wifi_ssid[0] = 0;
         config.wifi_sta[i].wifi_pass[0] = 0;
     }
-    {
-        const uint64_t chipid = ESP.getEfuseMac();
-        const uint32_t macSuffix = (uint32_t)(chipid & 0xFFFFFF);
-        snprintf(config.wifi_ap_ssid, sizeof(config.wifi_ap_ssid), "%s_%06X", DEFAULT_WIFI_AP_SSID, macSuffix);
-    }
+    setDefaultApSsidForThisDevice(config.wifi_ap_ssid, sizeof(config.wifi_ap_ssid));
     strlcpy(config.wifi_ap_pass, DEFAULT_WIFI_AP_PASS, sizeof(config.wifi_ap_pass));
 
     // Blutooth
@@ -3324,6 +3370,17 @@ void setup()
         if (!loadConfiguration("/default.cfg", config))
         {
             defaultConfig();
+            saveConfiguration("/default.cfg", config);
+        }
+    }
+
+    if (isDefaultApSsidFormat(config.wifi_ap_ssid))
+    {
+        char prevApSsid[sizeof(config.wifi_ap_ssid)];
+        strlcpy(prevApSsid, config.wifi_ap_ssid, sizeof(prevApSsid));
+        setDefaultApSsidForThisDevice(config.wifi_ap_ssid, sizeof(config.wifi_ap_ssid));
+        if (strcmp(prevApSsid, config.wifi_ap_ssid) != 0)
+        {
             saveConfiguration("/default.cfg", config);
         }
     }
