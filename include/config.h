@@ -496,6 +496,23 @@ typedef struct Config_Struct
 	uint8_t msg_retry;
 	uint16_t msg_interval;
 
+	// Outbound webhooks for forwarding RX packets (Telegram, Discord, etc.)
+	// Up to 4 destinations.  See src/webhook.cpp for the templating syntax.
+	#define WEBHOOK_SLOTS 4
+	#define WEBHOOK_EVT_ANY      0x01
+	#define WEBHOOK_EVT_MSG_TO_ME 0x02
+	#define WEBHOOK_EVT_POSITION 0x04
+	#define WEBHOOK_EVT_STATUS   0x08
+	struct WebhookEntry {
+		bool enabled;
+		uint8_t event_mask;     // bitwise OR of WEBHOOK_EVT_*
+		char name[24];
+		char url[192];          // GET-style URL for simple webhooks (template-substituted)
+		char body_template[256];// JSON body template; empty -> default JSON
+		char filter_callsign[10];// substring filter on src callsign; empty = all
+	};
+	WebhookEntry webhooks[WEBHOOK_SLOTS];
+
 } Configuration;
 
 bool saveConfiguration(const char *filename, const Configuration &config);

@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>APRS Chat</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="topbar">
+  <button id="stationBtn" class="who" title="Edit callsign / frequency">
+    <span id="meCall">…</span>
+    <span id="meFreq" class="dim"></span>
+  </button>
+  <div class="actions">
+    <button id="mapBtn" class="ghost" title="Map of stations">🗺</button>
+    <button id="gpsBtn" class="ghost" title="Toggle GPS beacon">📍</button>
+    <button id="hookBtn" class="ghost" title="Webhooks">🔔</button>
+    <a id="settingsLink" class="ghost" href="/settings" title="Settings">⚙️</a>
+  </div>
+</header>
+
+<div id="stationOverlay" hidden>
+  <div class="sheet">
+    <header>
+      <h2>Station</h2>
+      <button id="stationClose" class="ghost" type="button">✕</button>
+    </header>
+
+    <div class="grp">
+      <h3>Identity</h3>
+      <div class="row">
+        <label class="grow">callsign<input id="stCall" type="text" autocomplete="off" spellcheck="false" placeholder="M0XYZ"></label>
+        <label style="flex:0 0 80px">SSID<input id="stSsid" type="number" min="0" max="15" step="1"></label>
+      </div>
+      <div class="row">
+        <button type="button" id="stSaveId">Save callsign</button>
+        <span class="res" id="stIdRes"></span>
+      </div>
+      <p class="dim">Applied to APRS / messages / tracker / digi at once.</p>
+    </div>
+
+    <div class="grp">
+      <h3>Frequency</h3>
+      <div class="row">
+        <button type="button" data-freq="144.8000" class="preset">EU 144.8000</button>
+        <button type="button" data-freq="144.3900" class="preset">US 144.39</button>
+        <button type="button" data-freq="144.6400" class="preset">JP 144.64</button>
+        <button type="button" data-freq="439.1000" class="preset">UHF 439.1</button>
+      </div>
+      <div class="row">
+        <label class="grow">freq (MHz, simplex)<input id="stFreq" type="number" step="0.0001" min="100" max="530"></label>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto;flex-direction:row;align-items:center;gap:6px">
+          <input id="stRfEn" type="checkbox"> RF module enabled (RX/TX)
+        </label>
+      </div>
+      <details>
+        <summary class="dim">advanced (split / squelch / power)</summary>
+        <div class="row">
+          <label class="grow">RX freq<input id="stFreqRx" type="number" step="0.0001"></label>
+          <label class="grow">TX freq<input id="stFreqTx" type="number" step="0.0001"></label>
+        </div>
+        <div class="row">
+          <label style="flex:0 0 100px">squelch (0-9)<input id="stSql" type="number" min="0" max="9"></label>
+          <label style="flex:0 0 100px">TX power<select id="stPwr"><option value="0">low</option><option value="1">high</option></select></label>
+          <label class="grow">CTCSS RX (Hz×10)<input id="stToneRx" type="number" min="0"></label>
+          <label class="grow">CTCSS TX (Hz×10)<input id="stToneTx" type="number" min="0"></label>
+        </div>
+      </details>
+      <div class="row">
+        <button type="button" id="stSaveRadio">Apply frequency</button>
+        <span class="res" id="stRadioRes"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="hookOverlay" hidden>
+  <div class="sheet">
+    <header>
+      <h2>Webhooks</h2>
+      <button id="hookClose" class="ghost" type="button">✕</button>
+    </header>
+    <p class="dim">
+      Forward received APRS packets to any HTTP endpoint. Variables:
+      <code>{src}</code> <code>{addressee}</code> <code>{message}</code>
+      <code>{raw}</code> <code>{ts}</code> <code>{channel}</code>.
+      Telegram preset: URL
+      <code>https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage</code>,
+      body <code>{"chat_id":"&lt;ID&gt;","text":"{src}: {message}"}</code>.
+    </p>
+    <div id="hookSlots"></div>
+  </div>
+</div>
+
+<div id="mapOverlay" hidden>
+  <button id="mapClose" class="ghost" type="button">✕</button>
+  <div id="map"></div>
+  <div id="mapStatus" class="dim">loading map…</div>
+</div>
+
+<main id="feed" aria-live="polite"></main>
+
+<footer id="composer">
+  <input id="toCall" type="text" placeholder="To (callsign or *)" autocomplete="off" spellcheck="false">
+  <input id="msgInput" type="text" placeholder="Type a message…" autocomplete="off">
+  <button id="sendBtn" type="button">Send</button>
+</footer>
+
+<div id="status" class="dim"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

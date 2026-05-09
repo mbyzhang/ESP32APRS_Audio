@@ -111,6 +111,9 @@ extern uint16_t TLM_SEQ;
 extern uint16_t IGATE_TLM_SEQ;
 extern uint16_t DIGI_TLM_SEQ;
 extern unsigned long StandByTick;
+// Set true to ask main loop() to safely re-initialise the RF module after a
+// frequency / squelch / power change.  Defined in main.cpp.
+extern volatile bool rfModuleReinitPending;
 
 #ifdef __cplusplus
 extern "C"
@@ -140,5 +143,28 @@ void handle_ws_gnss(char *nmea);
 void handle_ws_gnss(char *nmea, size_t size);
 void event_lastHeard(bool gethtml=false);
 String event_chatMessage(bool gethtml=false);
+
+// New mobile chat UI hooks
+//
+// Phase 5 (future) FM voice contract for /ws_audio on port 81:
+//   - text commands from browser:  "ping", "tx_start", "tx_stop"
+//   - binary frames inbound:       8 kHz mono i16 LE PCM (browser → DAC)
+//   - binary frames outbound:      8 kHz mono i16 LE PCM (ADC → browser)
+// The browser is responsible for sample-rate conversion, AGC, VAD, level
+// metering and optional Opus encoding so the ESP32 only does I/O.
+// `tx=true` marks a packet that originated from *this* station (self-TX),
+// so the chat UI can render it on the right with sent/pending styling.
+void publishRawPacket(const char *raw, int channel, int audioLvl, bool tx = false);
+void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime);
+void api_me(AsyncWebServerRequest *request);
+void api_packets_recent(AsyncWebServerRequest *request);
+void api_tx_message(AsyncWebServerRequest *request);
+void api_tx_position(AsyncWebServerRequest *request);
+void api_webhooks_list(AsyncWebServerRequest *request);
+void api_webhooks_save(AsyncWebServerRequest *request);
+void api_webhooks_test(AsyncWebServerRequest *request);
+void api_identity_set(AsyncWebServerRequest *request);
+void api_radio_get(AsyncWebServerRequest *request);
+void api_radio_set(AsyncWebServerRequest *request);
 
 #endif

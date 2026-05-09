@@ -155,9 +155,18 @@ extern PubSubClient clientMQTT;
 extern pppType pppStatus;
 #endif
 
+#include "webhook.h"
+
 // Create an Event Source on /events
 AsyncEventSource lastheard_events("/eventHeard");
 AsyncEventSource message_events("/eventMsg");
+
+// Per-packet RX stream consumed by the new chat-style mobile UI.
+// Each event carries one APRS packet as JSON: {ts, ch, audio, raw}.
+// The browser is responsible for parsing TNC2 -> structured data.
+AsyncEventSource raw_packet_events("/api/packets/stream");
+volatile uint32_t g_rxPacketCount = 0;
+volatile uint32_t g_txPacketCount = 0;
 
 char *webString;
 
@@ -370,17 +379,34 @@ void handle_logout(AsyncWebServerRequest *request)
 
 void setMainPage(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
 
-	// Using dynamic memory allocation instead of String
-	char *webString = allocateStringMemory(12000); // Initial buffer size, adjust as needed
-	if (!webString)
+	// Stream the response so we never need a single ~12 KB contiguous buffer.
+	// On non-PSRAM builds the heap is heavily fragmented once WiFi/TLS/etc.
+	// are running and large calloc()s frequently fail, which previously made
+	// this handler return nothing ("Main page allocation failed"). The chunked
+	// stream uses small internal buffers managed by ESPAsyncWebServer.
+	AsyncResponseStream *stream = request->beginResponseStream("text/html");
+	if (!stream)
 	{
-		return; // Memory allocation failed
+		request->send(500, "text/plain", "Main page stream allocation failed");
+		return;
 	}
+	stream->addHeader("Sensor", "content");
+	stream->addHeader("Cache-Control", "no-cache");
+
+	// Local helpers to keep the existing strcat-style call sites working with
+	// minimal churn: webString_print(s) appends a literal/string, and
+	// webString_printf(...) handles the snprintf-into-temp-buffer pattern.
+	auto webString_print = [&](const char *s) { stream->print(s); };
+
+#define strcpy(dst, src) webString_print(src)
+#define strcat(dst, src) webString_print(src)
+
+	char *webString = nullptr; // legacy variable, unused with streaming
 
 	strcpy(webString, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
 	strcat(webString, "<meta name=\"robots\" content=\"index\" />\n");
@@ -629,11 +655,10 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "</body>\n");
 	strcat(webString, "</html>");
 
+#undef strcpy
+#undef strcat
 
-	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
-	response->addHeader("Sensor", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
+	request->send(stream);
 	lastHeardTimeout = 0;
 	lastHeard_Flag = true;
 }
@@ -653,6 +678,531 @@ void handle_css(AsyncWebServerRequest *request)
 	AsyncWebServerResponse *response = request->beginResponse(LITTLEFS, "/style.css", "text/css", false);
 	response->addHeader("Cache-Control", "public, max-age=3600");
 	request->send(response);
+}
+
+// Serve a static asset for the new chat-style mobile UI from LittleFS.
+// Transparently prefers a "<path>.gz" sibling and sets Content-Encoding: gzip
+// so we can ship pre-compressed JS/CSS without spending RAM on runtime gzip.
+void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime)
+{
+	String gz = String(path) + ".gz";
+	if (LITTLEFS.exists(gz))
+	{
+		AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, gz, mime, false);
+		r->addHeader("Content-Encoding", "gzip");
+		r->addHeader("Cache-Control", "public, max-age=600");
+		request->send(r);
+		return;
+	}
+	if (!LITTLEFS.exists(path))
+	{
+		request->send(404, "text/plain", path);
+		return;
+	}
+	AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, path, mime, false);
+	r->addHeader("Cache-Control", "public, max-age=600");
+	request->send(r);
+}
+
+// Append a JSON-escaped copy of `src` into `dst` (bounded by `cap`, leaving room
+// for a NUL). Skips control characters and CR; encodes \n as "\\n".
+static size_t json_escape_into(char *dst, size_t cap, const char *src)
+{
+	size_t j = 0;
+	for (size_t i = 0; src && src[i] && j + 2 < cap; i++)
+	{
+		unsigned char c = (unsigned char)src[i];
+		if (c == '\\' || c == '"')
+		{
+			dst[j++] = '\\';
+			dst[j++] = (char)c;
+		}
+		else if (c == '\n')
+		{
+			dst[j++] = '\\';
+			dst[j++] = 'n';
+		}
+		else if (c < 0x20)
+		{
+			// drop other control chars (CR, NUL slip-through, etc.)
+		}
+		else
+		{
+			dst[j++] = (char)c;
+		}
+	}
+	dst[j] = 0;
+	return j;
+}
+
+// Called from main.cpp:pkgListUpdate() once per received packet (RF or INET).
+// Increments the RX counter and, when at least one EventSource client is
+// listening, pushes a compact JSON event so the chat UI can show it instantly.
+void publishRawPacket(const char *raw, int channel, int audioLvl, bool tx)
+{
+	if (!tx) g_rxPacketCount++;
+	if (raw == nullptr || raw[0] == 0)
+		return;
+	// Fan out to outbound webhooks regardless of whether a browser is watching
+	// the SSE — webhook_enqueue() is cheap when no slot is enabled.  We don't
+	// fan out our own self-TX (you don't want a Telegram bot echoing your own
+	// posts back at you), only RX traffic.
+	if (!tx)
+		webhook_enqueue(raw, channel, audioLvl);
+	if (raw_packet_events.count() == 0)
+		return; // nobody listening; cheap path
+
+	// Bound the raw line length so a runaway packet can't blow our stack buffer.
+	char esc[360];
+	json_escape_into(esc, sizeof(esc), raw);
+
+	char buf[440];
+	snprintf(buf, sizeof(buf),
+			 "{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"dir\":\"%s\",\"raw\":\"%s\"}",
+			 (long long)time(NULL), channel, audioLvl,
+			 tx ? "tx" : "rx", esc);
+	raw_packet_events.send(buf, "packet", millis() / 1000, 1000);
+}
+
+// Tiny key=value parser for application/x-www-form-urlencoded request bodies.
+// Returns true if `key` was found; copies the URL-decoded value into `out` (cap-bounded).
+static bool form_field(AsyncWebServerRequest *request, const char *key, char *out, size_t cap)
+{
+	if (!request->hasParam(key, true))
+		return false;
+	String v = request->getParam(key, true)->value();
+	strlcpy(out, v.c_str(), cap);
+	return true;
+}
+
+// POST /api/tx/message — body: form fields {to, text}.  Calls sendAPRSMessage().
+void api_tx_message(AsyncWebServerRequest *request)
+{
+	char to[16] = {0};
+	char text[200] = {0};
+	if (!form_field(request, "to", to, sizeof(to)) || to[0] == 0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing to\"}");
+		return;
+	}
+	if (!form_field(request, "text", text, sizeof(text)) || text[0] == 0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing text\"}");
+		return;
+	}
+	// Pad addressee to 9 chars (APRS message format wants exactly 9 in <toCall  >).
+	String dest = String(to);
+	dest.toUpperCase();
+	sendAPRSMessage(dest, String(text), config.msg_encrypt);
+	g_txPacketCount++;
+
+	// Echo our own TX into the chat feed so the user sees what they sent.
+	// Build a representative TNC2 line — we don't try to mirror the exact
+	// path / msgid that sendAPRSMessage queues internally; the browser only
+	// needs src + addressee + text to render this in the timeline.
+	{
+		char src[16];
+		if (config.aprs_ssid > 0)
+			snprintf(src, sizeof(src), "%s-%u", config.aprs_mycall, (unsigned)config.aprs_ssid);
+		else
+			strlcpy(src, config.aprs_mycall, sizeof(src));
+		char tnc2[260];
+		snprintf(tnc2, sizeof(tnc2), "%s>APE32L::%-9s:%s",
+				 src, dest.c_str(), text);
+		publishRawPacket(tnc2, 0, 0, /*tx=*/true);
+	}
+
+	request->send(200, "application/json", "{\"ok\":true}");
+}
+
+// Build an APRS uncompressed lat/lon string: ddmm.hhN/dddmm.hhW
+static void format_aprs_latlon(double lat, double lon, char *out, size_t cap, char symbol_table, char symbol_code)
+{
+	char ns = (lat >= 0) ? 'N' : 'S';
+	char ew = (lon >= 0) ? 'E' : 'W';
+	double alat = lat < 0 ? -lat : lat;
+	double alon = lon < 0 ? -lon : lon;
+	int latDeg = (int)alat;
+	double latMin = (alat - latDeg) * 60.0;
+	int lonDeg = (int)alon;
+	double lonMin = (alon - lonDeg) * 60.0;
+	snprintf(out, cap, "%02d%05.2f%c%c%03d%05.2f%c%c",
+			 latDeg, latMin, ns, symbol_table,
+			 lonDeg, lonMin, ew, symbol_code);
+}
+
+// POST /api/tx/position — body: {lat, lon, comment?, symbol_table?, symbol_code?, dest?}
+void api_tx_position(AsyncWebServerRequest *request)
+{
+	char latS[24] = {0};
+	char lonS[24] = {0};
+	char comment[64] = {0};
+	char symT[2] = "/";
+	char symC[2] = ">";
+	char destSel[8] = {0};
+	if (!form_field(request, "lat", latS, sizeof(latS)) ||
+		!form_field(request, "lon", lonS, sizeof(lonS)))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing lat/lon\"}");
+		return;
+	}
+	form_field(request, "comment", comment, sizeof(comment));
+	form_field(request, "symbol_table", symT, sizeof(symT));
+	form_field(request, "symbol_code", symC, sizeof(symC));
+	form_field(request, "dest", destSel, sizeof(destSel)); // "rf" | "inet" | "" (both)
+	double lat = atof(latS);
+	double lon = atof(lonS);
+	if (lat == 0.0 && lon == 0.0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"bad lat/lon\"}");
+		return;
+	}
+	char pos[32];
+	format_aprs_latlon(lat, lon, pos, sizeof(pos), symT[0], symC[0]);
+
+	// Source callsign: prefer aprs_mycall (with optional SSID).
+	char src[16];
+	if (config.aprs_ssid > 0)
+		snprintf(src, sizeof(src), "%s-%u", config.aprs_mycall, (unsigned)config.aprs_ssid);
+	else
+		snprintf(src, sizeof(src), "%s", config.aprs_mycall);
+
+	// Build TNC2: SRC>APE32L,WIDE1-1:!POS<comment>
+	char tnc2[200];
+	snprintf(tnc2, sizeof(tnc2), "%s>APE32L,WIDE1-1:!%s%s", src, pos, comment);
+
+	uint8_t channel = RF_CHANNEL;
+	if (strcasecmp(destSel, "inet") == 0)
+		channel = INET_CHANNEL;
+	else if (destSel[0] == 0)
+	{
+		channel = 0;
+		if (config.trk_loc2rf) channel |= RF_CHANNEL;
+		if (config.trk_loc2inet) channel |= INET_CHANNEL;
+		if (channel == 0) channel = RF_CHANNEL;
+	}
+
+	bool ok = pkgTxPush(tnc2, strlen(tnc2), 0, channel);
+	if (ok) {
+		g_txPacketCount++;
+		// Mirror our position into the SSE so the chat UI plots us on the map
+		// and shows the beacon in the timeline.
+		publishRawPacket(tnc2, 0, 0, /*tx=*/true);
+	}
+	char resp[96];
+	snprintf(resp, sizeof(resp), "{\"ok\":%s,\"raw\":\"%s\"}", ok ? "true" : "false", "(see /api/packets/stream)");
+	request->send(ok ? 200 : 503, "application/json", resp);
+}
+
+// GET /api/webhooks — list current webhook slots as JSON.
+void api_webhooks_list(AsyncWebServerRequest *request)
+{
+	AsyncResponseStream *s = request->beginResponseStream("application/json");
+	if (!s) { request->send(500, "text/plain", "alloc failed"); return; }
+	s->addHeader("Cache-Control", "no-cache");
+	s->print('[');
+	char esc[260];
+	for (int i = 0; i < WEBHOOK_SLOTS; i++)
+	{
+		const auto &w = config.webhooks[i];
+		if (i) s->print(',');
+		s->print('{');
+		s->printf("\"slot\":%d,\"enabled\":%s,\"event_mask\":%u,",
+				  i, w.enabled ? "true" : "false", (unsigned)w.event_mask);
+		json_escape_into(esc, sizeof(esc), w.name);          s->printf("\"name\":\"%s\",", esc);
+		json_escape_into(esc, sizeof(esc), w.url);           s->printf("\"url\":\"%s\",", esc);
+		json_escape_into(esc, sizeof(esc), w.body_template); s->printf("\"body_template\":\"%s\",", esc);
+		json_escape_into(esc, sizeof(esc), w.filter_callsign); s->printf("\"filter_callsign\":\"%s\"", esc);
+		s->print('}');
+	}
+	s->print(']');
+	request->send(s);
+}
+
+// POST /api/webhooks — body fields: slot, enabled, event_mask, name, url, body_template, filter_callsign.
+// Saves to /default.cfg so config persists across reboot.
+void api_webhooks_save(AsyncWebServerRequest *request)
+{
+	char slotS[8] = {0};
+	if (!form_field(request, "slot", slotS, sizeof(slotS)))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing slot\"}");
+		return;
+	}
+	int slot = atoi(slotS);
+	if (slot < 0 || slot >= WEBHOOK_SLOTS)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"bad slot\"}");
+		return;
+	}
+	auto &w = config.webhooks[slot];
+	char tmp[8] = {0};
+	if (form_field(request, "enabled", tmp, sizeof(tmp)))
+		w.enabled = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y');
+	if (form_field(request, "event_mask", tmp, sizeof(tmp)))
+		w.event_mask = (uint8_t)atoi(tmp);
+	form_field(request, "name", w.name, sizeof(w.name));
+	form_field(request, "url", w.url, sizeof(w.url));
+	form_field(request, "body_template", w.body_template, sizeof(w.body_template));
+	form_field(request, "filter_callsign", w.filter_callsign, sizeof(w.filter_callsign));
+	bool saved = saveConfiguration("/default.cfg", config);
+	char resp[64];
+	snprintf(resp, sizeof(resp), "{\"ok\":%s}", saved ? "true" : "false");
+	request->send(saved ? 200 : 500, "application/json", resp);
+}
+
+// POST /api/webhooks/test — body: slot. Synchronously fires a test event.
+void api_webhooks_test(AsyncWebServerRequest *request)
+{
+	char slotS[8] = {0};
+	if (!form_field(request, "slot", slotS, sizeof(slotS)))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing slot\"}");
+		return;
+	}
+	int slot = atoi(slotS);
+	char err[32] = {0};
+	int rc = webhook_test(slot, err, sizeof(err));
+	char resp[96];
+	// rc == 0 means "queued"; the actual HTTP fire happens on the worker task.
+	// Anything else is a synchronous error (bad slot, slot empty, queue full).
+	snprintf(resp, sizeof(resp),
+			 "{\"ok\":%s,\"queued\":%s,\"err\":\"%s\"}",
+			 rc == 0 ? "true" : "false",
+			 rc == 0 ? "true" : "false",
+			 err);
+	request->send(rc == 0 ? 202 : 400, "application/json", resp);
+}
+
+// POST /api/identity — set callsign + SSID across all roles in one go.
+// Fields: callsign (uppercase, max 9 chars), ssid (0-15).  We mirror the
+// value into aprs_mycall / msg_mycall / trk_mycall / digi_mycall so a single
+// edit from the chat UI changes everything the user expects.
+void api_identity_set(AsyncWebServerRequest *request)
+{
+	char call[12] = {0};
+	char ssidS[8] = {0};
+	bool gotCall = form_field(request, "callsign", call, sizeof(call));
+	bool gotSsid = form_field(request, "ssid", ssidS, sizeof(ssidS));
+	if (!gotCall && !gotSsid)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"no fields\"}");
+		return;
+	}
+
+	if (gotCall)
+	{
+		// Uppercase + strip whitespace; reject empty.
+		char clean[12] = {0};
+		size_t j = 0;
+		for (size_t i = 0; call[i] && j < sizeof(clean) - 1; i++)
+		{
+			char c = call[i];
+			if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+			if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') clean[j++] = c;
+		}
+		clean[j] = 0;
+		if (j == 0)
+		{
+			request->send(400, "application/json", "{\"ok\":false,\"err\":\"empty callsign\"}");
+			return;
+		}
+		strlcpy(config.aprs_mycall, clean, sizeof(config.aprs_mycall));
+		strlcpy(config.msg_mycall,  clean, sizeof(config.msg_mycall));
+		strlcpy(config.trk_mycall,  clean, sizeof(config.trk_mycall));
+		strlcpy(config.digi_mycall, clean, sizeof(config.digi_mycall));
+	}
+	if (gotSsid)
+	{
+		int s = atoi(ssidS);
+		if (s < 0) s = 0;
+		if (s > 15) s = 15;
+		config.aprs_ssid = (uint8_t)s;
+		config.trk_ssid  = (uint8_t)s;
+		config.digi_ssid = (uint8_t)s;
+	}
+
+	bool saved = saveConfiguration("/default.cfg", config);
+	char resp[160];
+	snprintf(resp, sizeof(resp),
+			 "{\"ok\":%s,\"callsign\":\"%s\",\"ssid\":%u}",
+			 saved ? "true" : "false",
+			 config.aprs_mycall, (unsigned)config.aprs_ssid);
+	request->send(saved ? 200 : 500, "application/json", resp);
+}
+
+// GET /api/radio — current radio settings (freq in MHz, CTCSS in 0.1 Hz units
+// per SR110 convention, sql_level 0-9, rf_power 0=low/1=high).  Also returns
+// rf_type and AFSK modem state so the chat UI can diagnose "why no RX".
+void api_radio_get(AsyncWebServerRequest *request)
+{
+	extern volatile int8_t adcEn; // from main.cpp; 1 = ADC sampling, -1 = halted
+	extern int mVrms;             // from main.cpp; running RMS of incoming audio (mV)
+	int sqlPin = -1;
+	if (config.rf_sql_gpio >= 0)
+		sqlPin = digitalRead(config.rf_sql_gpio);
+	char buf[440];
+	snprintf(buf, sizeof(buf),
+			 "{\"freq_rx\":%.4f,\"freq_tx\":%.4f,"
+			 "\"tone_rx\":%d,\"tone_tx\":%d,"
+			 "\"sql_level\":%u,\"rf_power\":%s,"
+			 "\"band\":%u,\"rf_en\":%s,\"volume\":%u,"
+			 "\"rf_type\":%u,\"modem\":%u,\"adc_en\":%d,"
+			 "\"sql_active\":%u,\"mvrms\":%d,\"sql_pin\":%d}",
+			 (double)config.freq_rx, (double)config.freq_tx,
+			 config.tone_rx, config.tone_tx,
+			 (unsigned)config.sql_level, config.rf_power ? "true" : "false",
+			 (unsigned)config.band, config.rf_en ? "true" : "false",
+			 (unsigned)config.volume,
+			 (unsigned)config.rf_type, (unsigned)config.modem_type,
+			 (int)adcEn, (unsigned)config.rf_sql_active,
+			 mVrms, sqlPin);
+	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
+	r->addHeader("Cache-Control", "no-cache");
+	request->send(r);
+}
+
+// POST /api/radio — change one or more radio settings.  Any field absent
+// from the form body is left at its current value.  Supports a `freq` alias
+// that sets both RX and TX (the common case for simplex APRS).  Triggers a
+// safe RF re-init via the main loop.
+void api_radio_set(AsyncWebServerRequest *request)
+{
+	bool changed = false;
+	char tmp[24];
+
+	if (form_field(request, "freq", tmp, sizeof(tmp)) && tmp[0])
+	{
+		float f = atof(tmp);
+		if (f >= 100.0f && f <= 530.0f) {
+			config.freq_rx = f;
+			config.freq_tx = f;
+			changed = true;
+		}
+	}
+	if (form_field(request, "freq_rx", tmp, sizeof(tmp)) && tmp[0])
+	{
+		float f = atof(tmp);
+		if (f >= 100.0f && f <= 530.0f) { config.freq_rx = f; changed = true; }
+	}
+	if (form_field(request, "freq_tx", tmp, sizeof(tmp)) && tmp[0])
+	{
+		float f = atof(tmp);
+		if (f >= 100.0f && f <= 530.0f) { config.freq_tx = f; changed = true; }
+	}
+	if (form_field(request, "tone_rx", tmp, sizeof(tmp)))   { config.tone_rx   = atoi(tmp); changed = true; }
+	if (form_field(request, "tone_tx", tmp, sizeof(tmp)))   { config.tone_tx   = atoi(tmp); changed = true; }
+	if (form_field(request, "sql_level", tmp, sizeof(tmp))) { config.sql_level = (uint8_t)atoi(tmp); changed = true; }
+	if (form_field(request, "volume", tmp, sizeof(tmp)))    { config.volume    = (uint8_t)atoi(tmp); changed = true; }
+	if (form_field(request, "rf_power", tmp, sizeof(tmp)))
+	{
+		config.rf_power = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y' || tmp[0] == 'h');
+		changed = true;
+	}
+	if (form_field(request, "rf_en", tmp, sizeof(tmp)))
+	{
+		config.rf_en = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y');
+		changed = true;
+	}
+
+	if (!changed)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"no fields\"}");
+		return;
+	}
+
+	bool saved = saveConfiguration("/default.cfg", config);
+	// Defer the actual radio re-init to loop() — the radio init does
+	// blocking serial I/O that we don't want on the AsyncWebServer task.
+	rfModuleReinitPending = true;
+
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+			 "{\"ok\":%s,\"freq_rx\":%.4f,\"freq_tx\":%.4f,"
+			 "\"tone_rx\":%d,\"tone_tx\":%d,\"sql_level\":%u,\"rf_power\":%s}",
+			 saved ? "true" : "false",
+			 (double)config.freq_rx, (double)config.freq_tx,
+			 config.tone_rx, config.tone_tx,
+			 (unsigned)config.sql_level, config.rf_power ? "true" : "false");
+	request->send(saved ? 200 : 500, "application/json", buf);
+}
+
+// GET /api/me — small JSON status doc consumed by the mobile UI on load.
+void api_me(AsyncWebServerRequest *request)
+{
+	char buf[384];
+	IPAddress ip = WiFi.localIP();
+	snprintf(buf, sizeof(buf),
+			 "{\"callsign\":\"%s\",\"ssid\":%u,\"version\":\"%s\","
+			 "\"ip\":\"%u.%u.%u.%u\",\"free_heap\":%u,\"uptime\":%lu,"
+			 "\"rx_count\":%lu,\"tx_count\":%lu}",
+			 config.aprs_mycall, (unsigned)config.aprs_ssid, VERSION,
+			 ip[0], ip[1], ip[2], ip[3],
+			 (unsigned)ESP.getFreeHeap(), (unsigned long)(millis() / 1000),
+			 (unsigned long)g_rxPacketCount, (unsigned long)g_txPacketCount);
+	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
+	r->addHeader("Cache-Control", "no-cache");
+	request->send(r);
+}
+
+// GET /api/packets/recent — last N stored packets (most recent first), used
+// to hydrate the chat list when the page loads / reconnects.
+void api_packets_recent(AsyncWebServerRequest *request)
+{
+	AsyncResponseStream *s = request->beginResponseStream("application/json");
+	if (!s)
+	{
+		request->send(500, "text/plain", "stream alloc failed");
+		return;
+	}
+	s->addHeader("Cache-Control", "no-cache");
+
+	// Collect non-empty entries with their times so we can sort newest-first
+	// without copying the raw payloads (just indices).
+	struct IdxTime { int idx; time_t t; };
+	IdxTime entries[PKGLISTSIZE];
+	int n = 0;
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		pkgListType pkg = getPkgList(i);
+		if (pkg.time > 0 && pkg.raw && pkg.raw[0])
+		{
+			entries[n].idx = i;
+			entries[n].t = pkg.time;
+			n++;
+		}
+	}
+	// Simple insertion sort — PKGLISTSIZE is small (20-30).
+	for (int i = 1; i < n; i++)
+	{
+		IdxTime k = entries[i];
+		int j = i - 1;
+		while (j >= 0 && entries[j].t < k.t)
+		{
+			entries[j + 1] = entries[j];
+			j--;
+		}
+		entries[j + 1] = k;
+	}
+
+	s->print('[');
+	bool first = true;
+	char esc[360];
+	for (int i = 0; i < n; i++)
+	{
+		pkgListType pkg = getPkgList(entries[i].idx);
+		if (pkg.raw == nullptr || pkg.raw[0] == 0)
+			continue;
+		if (!first)
+			s->print(',');
+		first = false;
+		json_escape_into(esc, sizeof(esc), pkg.raw);
+		s->printf("{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"raw\":\"%s\"}",
+				  (long long)pkg.time, (int)pkg.channel,
+				  (int)pkg.audio_level, esc);
+	}
+	s->print(']');
+	request->send(s);
 }
 
 void handle_jquery(AsyncWebServerRequest *request)
@@ -992,7 +1542,7 @@ void handle_dashboard(AsyncWebServerRequest *request)
 
 void handle_sidebar(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -1747,7 +2297,7 @@ String event_chatMessage(bool gethtml)
 
 void handle_storage(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2049,7 +2599,7 @@ void handle_storage(AsyncWebServerRequest *request)
 
 void handle_download(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2137,7 +2687,7 @@ void handle_download(AsyncWebServerRequest *request)
 
 void handle_delete(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2177,7 +2727,7 @@ void handle_delete(AsyncWebServerRequest *request)
 
 void handle_format(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2203,7 +2753,7 @@ void handle_format(AsyncWebServerRequest *request)
 
 void handle_radio(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2784,7 +3334,7 @@ void handle_radio(AsyncWebServerRequest *request)
 
 void handle_vpn(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -3065,7 +3615,7 @@ void handle_vpn(AsyncWebServerRequest *request)
 #ifdef MQTT
 void handle_mqtt(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -3416,7 +3966,7 @@ void handle_mqtt(AsyncWebServerRequest *request)
 
 void handle_msg(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -3745,7 +4295,7 @@ void handle_msg(AsyncWebServerRequest *request)
 
 void handle_mod(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -5828,7 +6378,7 @@ void handle_mod(AsyncWebServerRequest *request)
 
 void handle_system(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -7029,7 +7579,7 @@ void handle_system(AsyncWebServerRequest *request)
 
 void handle_igate(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -8010,7 +8560,7 @@ void handle_igate(AsyncWebServerRequest *request)
 
 void handle_digi(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -8786,7 +9336,7 @@ void handle_digi(AsyncWebServerRequest *request)
 
 void handle_wx(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -9231,7 +9781,7 @@ void handle_wx(AsyncWebServerRequest *request)
 
 void handle_tlm(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -9751,7 +10301,7 @@ extern TaskHandle_t taskSensorHandle;
 
 void handle_sensor(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -10276,7 +10826,7 @@ void handle_sensor(AsyncWebServerRequest *request)
 
 void handle_tracker(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -11053,7 +11603,7 @@ void handle_tracker(AsyncWebServerRequest *request)
 
 void handle_wireless(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -11731,7 +12281,7 @@ void handle_test(AsyncWebServerRequest *request)
 
 void handle_audio(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -12137,7 +12687,7 @@ void handle_audio(AsyncWebServerRequest *request)
 
 void handle_about(AsyncWebServerRequest *request)
 {
-	if (false && !request->authenticate(config.http_username, config.http_password))
+	if (!request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -12764,8 +13314,44 @@ void webService()
 	}
 
 	// web client handlers
+	// New chat-style mobile UI lives at "/" as static files in LittleFS (data/index.html etc.).
+	// The legacy multi-tab configuration UI is now reachable at "/settings".
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/index.html", "text/html"); });
+	async_server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/app.js", "application/javascript"); });
+	async_server.on("/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/app.css", "text/css"); });
+	async_server.on("/manifest.webmanifest", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/manifest.webmanifest", "application/manifest+json"); });
+	async_server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ setMainPage(request); });
+
+	// JSON API for the new mobile UI
+	async_server.on("/api/me", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_me(request); });
+	async_server.on("/api/packets/recent", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_packets_recent(request); });
+	async_server.on("/api/tx/message", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_tx_message(request); });
+	async_server.on("/api/tx/position", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_tx_position(request); });
+	async_server.on("/api/identity", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_identity_set(request); });
+	async_server.on("/api/radio", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_radio_get(request); });
+	async_server.on("/api/radio", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_radio_set(request); });
+	// Register the more-specific /api/webhooks/test route BEFORE /api/webhooks
+	// because AsyncWebServer matches by prefix (url.startsWith(uri + "/"))
+	// and the first matching handler wins.
+	async_server.on("/api/webhooks/test", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_webhooks_test(request); });
+	async_server.on("/api/webhooks", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_webhooks_list(request); });
+	async_server.on("/api/webhooks", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_webhooks_save(request); });
+	async_server.addHandler(&raw_packet_events); // SSE on /api/packets/stream
 	async_server.on("/symbol", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_symbol(request); });
 	// async_server.on("/symbol2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)

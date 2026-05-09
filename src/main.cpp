@@ -15,6 +15,7 @@
 #include <limits.h>
 #include <KISS.h>
 #include "webservice.h"
+#include "webhook.h"
 #include <WiFiUdp.h>
 #include "ESP32Ping.h"
 #include <WiFi.h>
@@ -1513,6 +1514,11 @@ void defaultConfig()
     config.adc_gpio = 34;
     config.dac_gpio = 25;
     config.adc_atten = 4;
+    // The whole point of the KV4P-HT board is the radio — enable it by
+    // default so a fresh device receives traffic immediately on boot.
+    config.rf_en = true;
+    config.freq_rx = 144.8000f;
+    config.freq_tx = 144.8000f;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
     config.rf_tx_gpio = 17;
     config.rf_rx_gpio = 18;
@@ -2416,6 +2422,10 @@ int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t a
         return -1;
     if (*raw == 0)
         return -1;
+
+    // Push every received packet to the new mobile chat UI (SSE on /api/packets/stream).
+    // Cheap when no clients are connected (early return inside).
+    publishRawPacket(raw, (int)channel, (int)audioLvl);
 
     // int start_info = strchr(':',0);
 
@@ -3645,6 +3655,11 @@ void setup()
         }
     }
     psramMutex = xSemaphoreCreateMutex();
+
+    // Start the outbound webhook worker (queue + low-priority HTTP task).
+    // Safe to call once WiFi config is loaded; the worker checks WL_CONNECTED
+    // before each POST and silently drops events while offline.
+    webhook_init();
 
     log_d("Start Task");
 #ifdef __XTENSA__
@@ -4909,7 +4924,12 @@ void loop()
     if (rfModuleReinitPending)
     {
         rfModuleReinitPending = false;
-        RF_MODULE(false);
+        // Always pass boot=true so RF_MODULE re-opens SerialRF.  When the radio
+        // boots with rf_en=false, the very first init call is skipped and
+        // SerialRF.begin() never runs.  If the user later enables RF via the
+        // chat UI we'd otherwise try to send AT commands over a closed UART
+        // and the SA868/SR110 would stay silent (= no RX).
+        RF_MODULE(true);
     }
 
     if (millis() > timeTask)
