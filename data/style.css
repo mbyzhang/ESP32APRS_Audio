@@ -145,6 +145,28 @@ body {
   font-weight: 700;
 }
 
+.traffic-tools select,
+.traffic-tools .filter-text {
+  min-height: 36px;
+  border: 1px solid #c9d3c5;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #1d261f;
+  font: inherit;
+  font-weight: 700;
+}
+
+.traffic-tools select {
+  width: 112px;
+  padding: 6px 8px;
+}
+
+.traffic-tools .filter-text {
+  width: 124px;
+  padding: 6px 9px;
+  text-transform: uppercase;
+}
+
 .message-list {
   flex: 1;
   min-height: 360px;
@@ -604,10 +626,20 @@ input:checked + .slider:before {
   }
 
   .traffic-tools button,
-  .traffic-tools label {
+  .traffic-tools label,
+  .traffic-tools select,
+  .traffic-tools .filter-text {
     min-height: 32px;
     padding: 5px 7px;
     font-size: 12px;
+  }
+
+  .traffic-tools select {
+    width: 102px;
+  }
+
+  .traffic-tools .filter-text {
+    width: 104px;
   }
 
   .track-pane {

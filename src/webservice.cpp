@@ -869,7 +869,7 @@ void setMainPage(AsyncWebServerRequest *request)
 		return request->requestAuthentication();
 	}
 
-	static constexpr size_t MAIN_PAGE_HTML_CAPACITY = 52000;
+	static constexpr size_t MAIN_PAGE_HTML_CAPACITY = 18000;
 	char *webString = allocateStringMemory(MAIN_PAGE_HTML_CAPACITY);
 	if (!webString)
 	{
@@ -912,11 +912,26 @@ let autoWatchId=null;
 let lastAutoFix=null;
 const recentKeys={};
 const trackCache={};
+const packetCache=[];
+)APRSJS");
+	const char *uiMyCall = nullptr;
+	if (strlen(config.msg_mycall) > 0 && strcmp(config.msg_mycall, "NOCALL") != 0)
+		uiMyCall = config.msg_mycall;
+	else if (strlen(config.aprs_mycall) > 0 && strcmp(config.aprs_mycall, "NOCALL") != 0)
+		uiMyCall = config.aprs_mycall;
+	else if (strlen(config.trk_mycall) > 0 && strcmp(config.trk_mycall, "NOCALL") != 0)
+		uiMyCall = config.trk_mycall;
+	else
+		uiMyCall = "";
+	snprintf(temp_buffer, sizeof(temp_buffer), "const deviceMyCall='%s';\n", uiMyCall);
+	strcat(webString, temp_buffer);
+	strcat(webString, R"APRSJS(
 
 function el(id){return document.getElementById(id);}
 function setStatus(text){const node=el('linkState'); if(node) node.textContent=text;}
 function fmtTime(ts){const d=ts?new Date(ts*1000):new Date(); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});}
 function escapeHtml(v){return String(v||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function normCall(v){return String(v||'').trim().toUpperCase();}
 function packetKey(pkt){return (pkt.source||'')+'|'+(pkt.raw||'');}
 function isDuplicate(pkt){const key=packetKey(pkt); const now=Date.now(); if(recentKeys[key] && now-recentKeys[key]<5000) return true; recentKeys[key]=now; return false;}
 
@@ -986,8 +1001,8 @@ function loadRecentPackets(){
   const req=tx.objectStore('packets').getAll();
   req.onsuccess=()=>{
     const rows=(req.result||[]).slice(-60);
-    rows.forEach(pkt=>renderPacket(pkt,true));
-    scrollMessages();
+    rows.forEach(pkt=>cachePacket(pkt));
+    renderPackets(true);
   };
 }
 
@@ -1011,6 +1026,10 @@ function renderTracks(){
   list.innerHTML=rows.map(t=>`<div class="track-row"><b>${escapeHtml(t.call)}</b><span>${Number(t.lat).toFixed(5)}, ${Number(t.lon).toFixed(5)}</span><small>${escapeHtml(t.source)} ${fmtTime(t.ts)}</small></div>`).join('');
 }
 
+function cachePacket(pkt){packetCache.push(pkt);while(packetCache.length>240)packetCache.shift();}
+function packetAny(pkt,needle,starts){const n=normCall(needle);if(!n)return true;return [pkt.from,pkt.to,pkt.target,pkt.body,pkt.raw,pkt.path,pkt.source,pkt.type].some(v=>{const s=normCall(v);return starts?s.startsWith(n):s.indexOf(n)>=0;});}
+function packetVisible(pkt){const m=el('trafficFilter')?el('trafficFilter').value:'all',q=el('filterText')?el('filterText').value:'';if(m==='messages')return pkt.type==='message';if(m==='mycall')return packetAny(pkt,q||deviceMyCall,true);if(m==='custom')return packetAny(pkt,q,false);return true;}
+
 function renderPacket(pkt, historical){
   const list=el('messageList');
   if(!list) return;
@@ -1022,14 +1041,18 @@ function renderPacket(pkt, historical){
   const meta=[pkt.source||'', pkt.type||'packet', pkt.path||''].filter(Boolean).join(' | ');
   item.innerHTML=`<div class="msg-meta"><b>${escapeHtml(pkt.from||'APRS')}</b><span>${escapeHtml(target)}</span><time>${fmtTime(pkt.ts)}</time></div><div class="msg-body">${escapeHtml(text)}</div><div class="msg-raw">${escapeHtml(meta)}</div>`;
   list.appendChild(item);
-  while(list.children.length>120) list.removeChild(list.firstElementChild);
   if(!historical) scrollMessages();
 }
+
+function renderPackets(historical){const list=el('messageList');if(!list)return;list.innerHTML='';packetCache.filter(packetVisible).slice(-120).forEach(pkt=>renderPacket(pkt,true));scrollMessages();}
+function applyTrafficFilter(){localStorage.setItem('trafficFilter',el('trafficFilter').value);localStorage.setItem('trafficFilterText',el('filterText').value);renderPackets(true);}
+function restoreTrafficFilter(){const f=el('trafficFilter'),t=el('filterText');if(!f||!t)return;f.value=localStorage.getItem('trafficFilter')||'all';t.value=localStorage.getItem('trafficFilterText')||deviceMyCall||'';f.addEventListener('change',applyTrafficFilter);t.addEventListener('input',applyTrafficFilter);}
 
 function handlePacket(pkt, historical){
   if(!pkt || !pkt.raw) return;
   if(isDuplicate(pkt)) return;
-  renderPacket(pkt, historical);
+  cachePacket(pkt);
+  if(packetVisible(pkt)) renderPacket(pkt, historical);
   savePacket(pkt);
   saveTrack(pkt);
 }
@@ -1058,6 +1081,7 @@ function scrollMessages(){
 
 function clearScreen(){
   const list=el('messageList');
+  packetCache.length=0;
   if(list) list.innerHTML='';
 }
 
@@ -1139,6 +1163,7 @@ function toggleAutoGps(){
 
 async function appInit(){
   db=await openDb();
+  restoreTrafficFilter();
   loadRecentPackets();
   loadTrackCache();
   connectTraffic();
@@ -1173,7 +1198,7 @@ async function appInit(){
 	strcat(webString, "</nav>\n");
 	strcat(webString, "<main id=\"channelView\" class=\"channel-view\">\n");
 	strcat(webString, "<section class=\"traffic-pane\">\n");
-	strcat(webString, "<div class=\"traffic-tools\"><button type=\"button\" onclick=\"clearScreen()\">CLEAR</button><button id=\"gpsOnce\" type=\"button\" onclick=\"requestGps()\">GPS</button><button id=\"autoGps\" type=\"button\" onclick=\"toggleAutoGps()\">AUTO</button><label><input id=\"gpsRf\" type=\"checkbox\" checked>RF</label><label><input id=\"gpsInet\" type=\"checkbox\" checked>INET</label></div>\n");
+	strcat(webString, "<div class=\"traffic-tools\"><button type=\"button\" onclick=\"clearScreen()\">CLEAR</button><select id=\"trafficFilter\" aria-label=\"Traffic filter\"><option value=\"all\">ALL</option><option value=\"messages\">MESSAGES</option><option value=\"mycall\">MY CALL</option><option value=\"custom\">TEXT</option></select><input id=\"filterText\" class=\"filter-text\" type=\"text\" maxlength=\"16\" placeholder=\"CALL/TEXT\" /><button id=\"gpsOnce\" type=\"button\" onclick=\"requestGps()\">GPS</button><button id=\"autoGps\" type=\"button\" onclick=\"toggleAutoGps()\">AUTO</button><label><input id=\"gpsRf\" type=\"checkbox\" checked>RF</label><label><input id=\"gpsInet\" type=\"checkbox\" checked>INET</label></div>\n");
 	strcat(webString, "<div id=\"messageList\" class=\"message-list\"></div>\n");
 	strcat(webString, "<form id=\"composeForm\" class=\"compose-bar\" autocomplete=\"off\">\n");
 	strcat(webString, "<input id=\"toCall\" name=\"toCall\" type=\"text\" maxlength=\"9\" placeholder=\"CALL\" />\n");
