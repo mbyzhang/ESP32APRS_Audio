@@ -462,7 +462,7 @@ void afskSetADCAtten(uint8_t val)
     cfg_adc_atten = ADC_ATTENDB_MAX;
     Vref = 3300;
   }
-  analogSetPinAttenuation(adc_pins[0], cfg_adc_atten);
+  analogSetPinAttenuation(_adc_pin, cfg_adc_atten);
 }
 #else
 adc_atten_t cfg_adc_atten = ADC_ATTEN_DB_0;
@@ -637,7 +637,12 @@ void I2S_Init(i2s_mode_t MODE, i2s_bits_per_sample_t BPS)
   }
   // GPIO36, VP
   // init ADC pad
+#ifdef KV4P_HT
+  i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_6);
+  adc1_config_channel_atten(ADC1_CHANNEL_6, ADC_ATTEN_DB_12);
+#else
   i2s_set_adc_mode(ADC_UNIT_1, ADC1_CHANNEL_0);
+#endif
   // i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, BPS, I2S_CHANNEL_MONO);
   i2s_adc_enable(I2S_NUM_0);
   delay(500); // required for stability of ADC
@@ -651,7 +656,11 @@ void I2S_Init(i2s_mode_t MODE, i2s_bits_per_sample_t BPS)
   adc_set_i2s_data_len(ADC_UNIT_1, 1);
 
   i2s_set_pin(I2S_NUM_0, NULL);
+#ifdef KV4P_HT
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN); // IO25
+#else
   i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN); // IO26
+#endif
   i2s_zero_dma_buffer(I2S_NUM_0);
   // i2s_start(I2S_NUM_0);
   //  dac_output_enable(DAC_CHANNEL_1);
@@ -695,7 +704,7 @@ void IRAM_ATTR sample_adc_isr()
     fifo.lock = true;
     // digitalWrite(15,HIGH);
     portENTER_CRITICAL_ISR(&timerMux); // ISR start
-    int16_t adc = analogReadMilliVolts(adc_pins[0]);
+    int16_t adc = analogReadMilliVolts(_adc_pin);
 
     // RingBuffer_Push(&fifo, adc);
     // if(fifo.head >= BUFFER_SIZE || fifo.head < 0) fifo.head = 0; // Check if head exceeds buffer size
@@ -1037,10 +1046,10 @@ void adc_continue_init(void)
 {
   adc_channel_t channel;
   adc_unit_t adc_unit = ADC_UNIT_1;
-  esp_err_t Err = adc_continuous_io_to_channel(adc_pins[0], &adc_unit, &channel);
+  esp_err_t Err = adc_continuous_io_to_channel(_adc_pin, &adc_unit, &channel);
   if (Err != ESP_OK)
   {
-    log_e("Pin %u is not ADC pin!", adc_pins[0]);
+    log_e("Pin %u is not ADC pin!", _adc_pin);
   }
   if (adc_unit != 0)
   {
@@ -1200,17 +1209,24 @@ void adc_continue_init(void)
  */
 static void sigmadelta_init(void)
 {
+  gpio_num_t sigmadelta_gpio = GPIO_NUM_26;
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+  sigmadelta_gpio = GPIO_NUM_1; // GPIO1 is used for ESP32C3
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+  sigmadelta_gpio = GPIO_NUM_2; // GPIO2 is used for ESP32S3
+#else
+  // For ESP32 targets, use configured DAC pin when valid.
+  if (_dac_pin >= 0 && _dac_pin <= 33)
+  {
+    sigmadelta_gpio = (gpio_num_t)_dac_pin;
+  }
+#endif
+
   sigmadelta_config_t sigmadelta_cfg = {
       .channel = SIGMADELTA_CHANNEL_0,
       .sigmadelta_duty = 127,
       .sigmadelta_prescale = 96,
-#ifdef CONFIG_IDF_TARGET_ESP32C3
-      .sigmadelta_gpio = GPIO_NUM_1, // GPIO1 is used for ESP32C3
-#elif defined(CONFIG_IDF_TARGET_ESP32S3)
-      .sigmadelta_gpio = GPIO_NUM_2, // GPIO2 is used for ESP32S3
-#else
-      .sigmadelta_gpio = GPIO_NUM_26,
-#endif
+      .sigmadelta_gpio = sigmadelta_gpio,
   };
   sigmadelta_config(&sigmadelta_cfg);
 }
@@ -1249,7 +1265,7 @@ void AFSK_hw_init(void)
 #ifdef ADC_SAMPLE
   pinMode(15, OUTPUT);
   analogReadResolution(12);
-  analogSetPinAttenuation(adc_pins[0], cfg_adc_atten);
+  analogSetPinAttenuation(_adc_pin, cfg_adc_atten);
   timer_adc = timerBegin(20000000);
   // Attach onTimer function to our timer.
   timerAttachInterrupt(timer_adc, &sample_adc_isr); // Attaches the handler function to the timer
@@ -1426,6 +1442,7 @@ void IRAM_ATTR sample_dac_isr()
 
 extern int mVrms;
 extern float dBV;
+extern void handle_ws_audio_samples(const float *samples, size_t len, uint16_t sampleRate);
 
 long mVsum = 0;
 int mVsumCount = 0;
@@ -1677,6 +1694,7 @@ void AFSK_Poll(bool SA818, bool RFPower)
         // portEXIT_CRITICAL_ISR(&timerMux);
         //  Update AGC gain
         update_agc(audio_buffer, BLOCK_SIZE);
+        handle_ws_audio_samples(audio_buffer, BLOCK_SIZE, SAMPLERATE);
 #ifdef ADC_SAMPLE
         offset = tp->avg;
 #else

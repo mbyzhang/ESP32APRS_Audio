@@ -8,12 +8,14 @@
 */
 
 #include <Arduino.h>
+#include <driver/dac.h>
 #include <esp_task_wdt.h>
 #include "main.h"
 #include <LibAPRSesp.h>
 #include <limits.h>
 #include <KISS.h>
 #include "webservice.h"
+#include "webhook.h"
 #include <WiFiUdp.h>
 #include "ESP32Ping.h"
 #include <WiFi.h>
@@ -237,7 +239,8 @@ extern volatile int8_t dacEn;
 extern volatile bool pttOff;
 extern volatile uint32_t adcIsrCount;
 extern volatile int fifoSampleCount;
-extern volatile uint32_t frameDecodeCount;
+volatile int8_t webAudioPttRequest = 0; // -1: force off, +1: force on
+// extern volatile uint32_t frameDecodeCount;
 
 long timeNetwork, timeAprs, timeGui;
 long autoResetTimeout = 0;
@@ -306,6 +309,7 @@ EspSoftwareSerial::UART SerialRF;
 
 bool firstGpsTime = true;
 time_t startTime = 0;
+volatile bool rfModuleReinitPending = false;
 
 #ifdef BLUETOOTH
 #if !defined(CONFIG_IDF_TARGET_ESP32)
@@ -1364,6 +1368,69 @@ void logWeather(double lat, double lon, double speed, double course)
     }
 }
 
+#ifndef DEFAULT_WIFI_STA_SSID
+#define DEFAULT_WIFI_STA_SSID "APRSTH"
+#endif
+#ifndef DEFAULT_WIFI_STA_PASS
+#define DEFAULT_WIFI_STA_PASS "aprsthnetwork"
+#endif
+#ifndef DEFAULT_WIFI_AP_SSID
+#define DEFAULT_WIFI_AP_SSID "ESP32APRS_Audio"
+#endif
+#ifndef DEFAULT_WIFI_AP_PASS
+#define DEFAULT_WIFI_AP_PASS "aprsthnetwork"
+#endif
+
+static bool isHexChar(char c)
+{
+    return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+}
+
+static bool isDefaultApSsidFormat(const char *ssid)
+{
+    if (ssid == nullptr)
+    {
+        return false;
+    }
+
+    const size_t baseLen = strlen(DEFAULT_WIFI_AP_SSID);
+    if (strcmp(ssid, DEFAULT_WIFI_AP_SSID) == 0)
+    {
+        return true;
+    }
+    if (strncmp(ssid, DEFAULT_WIFI_AP_SSID, baseLen) != 0)
+    {
+        return false;
+    }
+    if (ssid[baseLen] != '_')
+    {
+        return false;
+    }
+    if (strlen(ssid) != (baseLen + 7))
+    {
+        return false;
+    }
+    for (size_t i = baseLen + 1; i < baseLen + 7; ++i)
+    {
+        if (!isHexChar(ssid[i]))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void setDefaultApSsidForThisDevice(char *ssid, size_t ssidLen)
+{
+    if (ssid == nullptr || ssidLen == 0)
+    {
+        return;
+    }
+    const uint64_t chipid = ESP.getEfuseMac();
+    const uint32_t macSuffix = (uint32_t)(chipid & 0xFFFFFF);
+    snprintf(ssid, ssidLen, "%s_%06X", DEFAULT_WIFI_AP_SSID, macSuffix);
+}
+
 void defaultConfig()
 {
     log_d("Default configure mode!");
@@ -1380,16 +1447,16 @@ void defaultConfig()
     config.wifi_power = 44; // WIFI_POWER_11dBm
     config.wifi_ap_ch = 6;
     config.wifi_sta[0].enable = true;
-    sprintf(config.wifi_sta[0].wifi_ssid, "APRSTH");
-    sprintf(config.wifi_sta[0].wifi_pass, "aprsthnetwork");
+    strlcpy(config.wifi_sta[0].wifi_ssid, DEFAULT_WIFI_STA_SSID, sizeof(config.wifi_sta[0].wifi_ssid));
+    strlcpy(config.wifi_sta[0].wifi_pass, DEFAULT_WIFI_STA_PASS, sizeof(config.wifi_sta[0].wifi_pass));
     for (int i = 1; i < 5; i++)
     {
         config.wifi_sta[i].enable = false;
         config.wifi_sta[i].wifi_ssid[0] = 0;
         config.wifi_sta[i].wifi_pass[0] = 0;
     }
-    sprintf(config.wifi_ap_ssid, "ESP32APRS_Audio");
-    sprintf(config.wifi_ap_pass, "aprsthnetwork");
+    setDefaultApSsidForThisDevice(config.wifi_ap_ssid, sizeof(config.wifi_ap_ssid));
+    strlcpy(config.wifi_ap_pass, DEFAULT_WIFI_AP_PASS, sizeof(config.wifi_ap_pass));
 
     // Blutooth
     config.bt_slave = false;
@@ -1421,7 +1488,7 @@ void defaultConfig()
     config.mic = 8;
     config.modem_type = 1;
 
-#ifdef ESP32C3_MINI
+#if defined(ESP32C3_MINI)
     // config.wifi_power = 74;
     config.rf_tx_gpio = -1;
     config.rf_rx_gpio = -1;
@@ -1433,6 +1500,25 @@ void defaultConfig()
     config.rf_pd_active = 1;
     config.rf_pwr_active = 1;
     config.rf_ptt_active = 0;
+#elif defined(KV4P_HT)
+    config.rf_tx_gpio = 17;
+    config.rf_rx_gpio = 16;
+    config.rf_sql_gpio = 4;
+    config.rf_pd_gpio = 19;
+    config.rf_pwr_gpio = -1;
+    config.rf_ptt_gpio = 18;
+    config.rf_sql_active = 0;
+    config.rf_pd_active = 1;
+    config.rf_pwr_active = 1;
+    config.rf_ptt_active = 0;
+    config.adc_gpio = 34;
+    config.dac_gpio = 25;
+    config.adc_atten = 4;
+    // The whole point of the KV4P-HT board is the radio — enable it by
+    // default so a fresh device receives traffic immediately on boot.
+    config.rf_en = true;
+    config.freq_rx = 144.8000f;
+    config.freq_tx = 144.8000f;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
     config.rf_tx_gpio = 17;
     config.rf_rx_gpio = 18;
@@ -1456,7 +1542,11 @@ void defaultConfig()
     config.rf_pwr_active = 1;
     config.rf_ptt_active = 1;
 #endif
+#if defined(KV4P_HT)
+    config.adc_atten = 4;
+#else
     config.adc_atten = 0;
+#endif
     config.adc_dc_offset = 600;
     config.rf_baudrate = 9600;
 
@@ -2333,6 +2423,10 @@ int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t a
     if (*raw == 0)
         return -1;
 
+    // Push every received packet to the new mobile chat UI (SSE on /api/packets/stream).
+    // Cheap when no clients are connected (early return inside).
+    publishRawPacket(raw, (int)channel, (int)audioLvl);
+
     // int start_info = strchr(':',0);
 
     char callsign[11];
@@ -2659,15 +2753,19 @@ bool pkgTxSend()
                     {
                         if ((config.rf_type == RF_SR_1WV) || (config.rf_type == RF_SR_1WU) || (config.rf_type == RF_SR_1W350))
                         {
-                            digitalWrite(config.rf_pwr_gpio, LOW);
-                            if (config.rf_power ^ !config.rf_pwr_active)
-                                pinMode(config.rf_pwr_gpio, OPEN_DRAIN);
-                            else
-                                pinMode(config.rf_pwr_gpio, OUTPUT);
+                            if (config.rf_pwr_gpio >= 0)
+                            {
+                                digitalWrite(config.rf_pwr_gpio, LOW);
+                                if (config.rf_power ^ !config.rf_pwr_active)
+                                    pinMode(config.rf_pwr_gpio, OPEN_DRAIN);
+                                else
+                                    pinMode(config.rf_pwr_gpio, OUTPUT);
+                            }
                         }
                         else
                         {
-                            digitalWrite(config.rf_pwr_gpio, config.rf_power ^ !config.rf_pwr_active); // ON RF Power H/L
+                            if (config.rf_pwr_gpio >= 0)
+                                digitalWrite(config.rf_pwr_gpio, config.rf_power ^ !config.rf_pwr_active); // ON RF Power H/L
                         }
                     }
                     status.txCount++;
@@ -2867,10 +2965,17 @@ String FRS_getVERSION()
 
 unsigned long SA818_Timeout = 0;
 
+void requestRFModuleReinit()
+{
+    rfModuleReinitPending = true;
+}
+
 void RF_MODULE_SLEEP()
 {
-    digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
-    digitalWrite(config.rf_pd_gpio, LOW);
+    if (config.rf_pwr_gpio >= 0)
+        digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
+    if (config.rf_pd_gpio >= 0)
+        digitalWrite(config.rf_pd_gpio, LOW);
     // PMU.disableDC3();
 }
 
@@ -2933,8 +3038,11 @@ void RF_MODULE(bool boot)
     //! DC3 Radio & Pixels VDD , Don't change
     // PMU.setDC3Voltage(3400);
     // PMU.disableDC3();
-    pinMode(config.rf_pwr_gpio, OUTPUT);
-    digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active); // RF POWER LOW
+    if (config.rf_pwr_gpio >= 0)
+    {
+        pinMode(config.rf_pwr_gpio, OUTPUT);
+        digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active); // RF POWER LOW
+    }
 
     // pinMode(config.rf_ptt_gpio, OUTPUT);
     // digitalWrite(config.rf_ptt_gpio, !config.rf_ptt_active); // PTT HIGH
@@ -3095,8 +3203,10 @@ void RF_MODULE_CHECK()
     else
     {
         log_d("RF Module %s sleep", RF_TYPE[config.rf_type]);
-        digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
-        digitalWrite(config.rf_pd_gpio, LOW);
+        if (config.rf_pwr_gpio >= 0)
+            digitalWrite(config.rf_pwr_gpio, !config.rf_pwr_active);
+        if (config.rf_pd_gpio >= 0)
+            digitalWrite(config.rf_pd_gpio, LOW);
         delay(500);
         RF_MODULE(true);
     }
@@ -3213,11 +3323,11 @@ void setup()
     pinMode(LED_TX, OUTPUT);
 
     // Set up serial port
-#ifdef CORE_DEBUG_LEVEL
+// #ifdef CORE_DEBUG_LEVEL
     Serial.begin(115200); // debug
-#else
-    Serial.begin(9600); // monitor
-#endif
+// #else
+//     Serial.begin(9600); // monitor
+// #endif
 
     if (!LITTLEFS.begin(FORMAT_LITTLEFS_IF_FAILED))
     {
@@ -3256,16 +3366,33 @@ void setup()
 
     LED_Status(255, 255, 255);
 
+    // Start from board-specific defaults so missing keys in /default.cfg cannot
+    // leave critical GPIO values (PTT/PD/ADC/DAC) at generic struct defaults.
+    defaultConfig();
+
     if (!LITTLEFS.exists("/default.cfg"))
     {
         log_d("Factory Default");
-        defaultConfig();
         saveConfiguration("/default.cfg", config);
     }
     else
     {
         if (!loadConfiguration("/default.cfg", config))
+        {
             defaultConfig();
+            saveConfiguration("/default.cfg", config);
+        }
+    }
+
+    if (isDefaultApSsidFormat(config.wifi_ap_ssid))
+    {
+        char prevApSsid[sizeof(config.wifi_ap_ssid)];
+        strlcpy(prevApSsid, config.wifi_ap_ssid, sizeof(prevApSsid));
+        setDefaultApSsidForThisDevice(config.wifi_ap_ssid, sizeof(config.wifi_ap_ssid));
+        if (strcmp(prevApSsid, config.wifi_ap_ssid) != 0)
+        {
+            saveConfiguration("/default.cfg", config);
+        }
     }
 
     //setCpuFrequencyMhz(config.cpuFreq);
@@ -3275,6 +3402,27 @@ void setup()
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
     if ((config.rf_ptt_gpio > 25) && (config.rf_ptt_gpio < 38))
         config.rf_ptt_gpio = 5; // GPIO25-37 are flash only on ESP32S3
+#endif
+
+#if defined(KV4P_HT)
+    // KV4P HT 2.0D fixed wiring (per KV4P firmware docs/source).
+    bool kv4pPinFixApplied = false;
+    if (config.rf_tx_gpio != 17) { config.rf_tx_gpio = 17; kv4pPinFixApplied = true; }
+    if (config.rf_rx_gpio != 16) { config.rf_rx_gpio = 16; kv4pPinFixApplied = true; }
+    if (config.rf_sql_gpio != 4) { config.rf_sql_gpio = 4; kv4pPinFixApplied = true; }
+    if (config.rf_pd_gpio != 19) { config.rf_pd_gpio = 19; kv4pPinFixApplied = true; }
+    if (config.rf_ptt_gpio != 18) { config.rf_ptt_gpio = 18; kv4pPinFixApplied = true; }
+    if (config.adc_gpio != 34) { config.adc_gpio = 34; kv4pPinFixApplied = true; }
+    if (config.dac_gpio != 25) { config.dac_gpio = 25; kv4pPinFixApplied = true; }
+    if (config.rf_sql_active != 0) { config.rf_sql_active = 0; kv4pPinFixApplied = true; }
+    if (config.rf_pd_active != 1) { config.rf_pd_active = 1; kv4pPinFixApplied = true; }
+    if (config.rf_ptt_active != 0) { config.rf_ptt_active = 0; kv4pPinFixApplied = true; }
+    if (config.adc_atten != 4) { config.adc_atten = 4; kv4pPinFixApplied = true; }
+    if (kv4pPinFixApplied)
+    {
+        log_w("Applied KV4P HT 2.0D GPIO defaults and saved /default.cfg");
+        saveConfiguration("/default.cfg", config);
+    }
 #endif
 
     if (config.i2c1_enable)
@@ -3508,6 +3656,11 @@ void setup()
     }
     psramMutex = xSemaphoreCreateMutex();
 
+    // Start the outbound webhook worker (queue + low-priority HTTP task).
+    // Safe to call once WiFi config is loaded; the worker checks WL_CONNECTED
+    // before each POST and silently drops events while offline.
+    webhook_init();
+
     log_d("Start Task");
 #ifdef __XTENSA__
     // if (config.wifi_mode != 0)
@@ -3524,7 +3677,7 @@ void setup()
     xTaskCreatePinnedToCore(
         taskAPRSPoll,        /* Function to implement the task */
         "taskAPRSPoll",      /* Name of the task */
-        2048,                /* Stack size in words */
+        4096,                /* Stack size in words */
         NULL,                /* Task input parameter */
         0,                   /* Priority of the task */
         &taskAPRSPollHandle, /* Task handle. */
@@ -3561,7 +3714,7 @@ void setup()
     xTaskCreatePinnedToCore(
         taskAPRSPoll,        /* Function to implement the task */
         "taskAPRSPoll",      /* Name of the task */
-        2048,                /* Stack size in words */
+        4096,                /* Stack size in words */
         NULL,                /* Task input parameter */
         0,                   /* Priority of the task */
         &taskAPRSPollHandle, /* Task handle. */
@@ -4768,6 +4921,17 @@ void msgBox(String msg)
 
 void loop()
 {
+    if (rfModuleReinitPending)
+    {
+        rfModuleReinitPending = false;
+        // Always pass boot=true so RF_MODULE re-opens SerialRF.  When the radio
+        // boots with rf_en=false, the very first init call is skipped and
+        // SerialRF.begin() never runs.  If the user later enables RF via the
+        // chat UI we'd otherwise try to send AT commands over a closed UART
+        // and the SA868/SR110 would stay silent (= no RX).
+        RF_MODULE(true);
+    }
+
     if (millis() > timeTask)
     {
         timeTask = millis() + 10000;
@@ -6153,7 +6317,13 @@ void taskAPRS(void *pvParameters)
         {
             setPtt(false);
             pttOff = false;
-            log_i("[TX-END] PTT released, fifo=%d frames=%u", fifoSampleCount, frameDecodeCount);
+            log_i("[TX-END] PTT released, fifo=%d", fifoSampleCount);
+        }
+        if (webAudioPttRequest != 0)
+        {
+            const int8_t req = webAudioPttRequest;
+            webAudioPttRequest = 0;
+            setPtt(req > 0);
         }
         long now = millis();
         // wdtSensorTimer = now;
@@ -7521,6 +7691,10 @@ void taskAPRSPoll(void *pvParameters)
 
     // afskSetDCOffset(config.adc_dc_offset);
     afskSetADCAtten(config.adc_atten);
+#ifdef KV4P_HT
+    dac_output_enable(DAC_CHAN_1);  // GPIO26 (DAC1)
+    dac_output_voltage(DAC_CHAN_1, (255.0 / 3.3) * 1.75);
+#endif
 
 #ifdef STRIP_PIN
     AFSK_init(config.adc_gpio, config.dac_gpio, config.rf_ptt_gpio, config.rf_sql_gpio, config.rf_pwr_gpio, -1, -1, STRIP_PIN, config.rf_ptt_active, config.rf_sql_active, config.rf_pwr_active);

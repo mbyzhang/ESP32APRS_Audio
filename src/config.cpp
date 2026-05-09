@@ -382,6 +382,8 @@ bool saveConfiguration(const char *filename, const Configuration &config)
     doc["rfPDAct"] = config.rf_pd_active;
     doc["rfPWRAct"] = config.rf_pwr_active;
     doc["rfPTTAct"] = config.rf_ptt_active;
+    doc["adcGPIO"] = config.adc_gpio;
+    doc["dacGPIO"] = config.dac_gpio;
     doc["adcAtten"] = config.adc_atten;
     doc["adcOffset"] = config.adc_dc_offset;
     doc["rfBaudrate"] = config.rf_baudrate;
@@ -528,6 +530,19 @@ bool saveConfiguration(const char *filename, const Configuration &config)
     doc["msgAESKey"] = config.msg_key;
     doc["msgRetry"] = config.msg_retry;
     doc["msgInterval"] = config.msg_interval;
+
+    // Outbound webhooks (4 slots).  Stored as a JSON array under "webhooks".
+    JsonArray whArr = doc["webhooks"].to<JsonArray>();
+    for (int i = 0; i < WEBHOOK_SLOTS; i++)
+    {
+        JsonObject o = whArr.add<JsonObject>();
+        o["en"] = config.webhooks[i].enabled;
+        o["em"] = config.webhooks[i].event_mask;
+        o["name"] = config.webhooks[i].name;
+        o["url"] = config.webhooks[i].url;
+        o["body"] = config.webhooks[i].body_template;
+        o["filter"] = config.webhooks[i].filter_callsign;
+    }
 
     // Serialize JSON to file
     File file = LITTLEFS.open(filename, FILE_WRITE);
@@ -874,19 +889,21 @@ bool loadConfiguration(const char *filename, Configuration &config)
         strlcpy(config.gnss_at_command, doc["gnssAT"] | "", sizeof(config.gnss_at_command));
 
         // MOD RF group
-        config.rf_tx_gpio = doc["rfTx"];
-        config.rf_rx_gpio = doc["rfRx"];
-        config.rf_sql_gpio = doc["rfSQL"];
-        config.rf_pd_gpio = doc["rfPD"];
-        config.rf_pwr_gpio = doc["rfPWR"];
-        config.rf_ptt_gpio = doc["rfPTT"];
-        config.rf_sql_active = doc["rfSQLAct"];
-        config.rf_pd_active = doc["rfPDAct"];
-        config.rf_pwr_active = doc["rfPWRAct"];
-        config.rf_ptt_active = doc["rfPTTAct"];
-        config.rf_baudrate = doc["rfBaudrate"];
-        config.adc_atten = doc["adcAtten"];
-        config.adc_dc_offset = doc["adcOffset"];          
+        config.rf_tx_gpio = doc["rfTx"] | config.rf_tx_gpio;
+        config.rf_rx_gpio = doc["rfRx"] | config.rf_rx_gpio;
+        config.rf_sql_gpio = doc["rfSQL"] | config.rf_sql_gpio;
+        config.rf_pd_gpio = doc["rfPD"] | config.rf_pd_gpio;
+        config.rf_pwr_gpio = doc["rfPWR"] | config.rf_pwr_gpio;
+        config.rf_ptt_gpio = doc["rfPTT"] | config.rf_ptt_gpio;
+        config.rf_sql_active = doc["rfSQLAct"] | config.rf_sql_active;
+        config.rf_pd_active = doc["rfPDAct"] | config.rf_pd_active;
+        config.rf_pwr_active = doc["rfPWRAct"] | config.rf_pwr_active;
+        config.rf_ptt_active = doc["rfPTTAct"] | config.rf_ptt_active;
+        config.adc_gpio = doc["adcGPIO"] | config.adc_gpio;
+        config.dac_gpio = doc["dacGPIO"] | config.dac_gpio;
+        config.rf_baudrate = doc["rfBaudrate"] | config.rf_baudrate;
+        config.adc_atten = doc["adcAtten"] | config.adc_atten;
+        config.adc_dc_offset = doc["adcOffset"] | config.adc_dc_offset;
 
         // config.rf_reset_gpio = doc["rfRST"];
         // config.rf_dio0_gpio = doc["rfDIO0"];
@@ -1038,6 +1055,26 @@ bool loadConfiguration(const char *filename, Configuration &config)
             config.msg_interval = doc["msgInterval"];
             strlcpy(config.msg_key, doc["msgAESKey"] | "", sizeof(config.msg_key));
             strlcpy(config.msg_mycall, doc["msgMycall"] | "", sizeof(config.msg_mycall));
+        }
+
+        // Webhooks.  All slots zeroed if the key isn't in the file (older config).
+        for (int i = 0; i < WEBHOOK_SLOTS; i++)
+            memset(&config.webhooks[i], 0, sizeof(config.webhooks[i]));
+        JsonArray whArr = doc["webhooks"].as<JsonArray>();
+        if (!whArr.isNull())
+        {
+            int i = 0;
+            for (JsonObject o : whArr)
+            {
+                if (i >= WEBHOOK_SLOTS) break;
+                config.webhooks[i].enabled    = o["en"] | false;
+                config.webhooks[i].event_mask = o["em"] | (uint8_t)WEBHOOK_EVT_ANY;
+                strlcpy(config.webhooks[i].name,             o["name"]   | "", sizeof(config.webhooks[i].name));
+                strlcpy(config.webhooks[i].url,              o["url"]    | "", sizeof(config.webhooks[i].url));
+                strlcpy(config.webhooks[i].body_template,    o["body"]   | "", sizeof(config.webhooks[i].body_template));
+                strlcpy(config.webhooks[i].filter_callsign,  o["filter"] | "", sizeof(config.webhooks[i].filter_callsign));
+                i++;
+            }
         }
 
         // Close the file (Curiously, File's destructor doesn't close the file)

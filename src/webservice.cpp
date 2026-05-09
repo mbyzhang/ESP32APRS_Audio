@@ -13,10 +13,16 @@
 #include "wireguard_vpn.h"
 #include <LibAPRSesp.h>
 #include <parse_aprs.h>
+#include "AFSK.h"
 #include "jquery_min_js.h"
 #include <ESPCPUTemp.h>
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include <memory>
+#if defined(CONFIG_IDF_TARGET_ESP32)
+#include <driver/dac.h>
+#endif
 
 extern SemaphoreHandle_t psramMutex;
 extern bool psramLock(TickType_t timeout = portMAX_DELAY);
@@ -90,6 +96,38 @@ char *StringToCharPtr(const String &str)
 	return charPtr;
 }
 
+// Build a streamed response from an owned heap buffer to avoid duplicating
+// large HTML pages into AsyncBasicResponse::String on low-memory targets.
+AsyncWebServerResponse *beginOwnedHtmlResponse(AsyncWebServerRequest *request, char *html)
+{
+	if (html == nullptr)
+	{
+		return nullptr;
+	}
+
+	const size_t htmlLen = strlen(html);
+	auto htmlHolder = std::shared_ptr<char>(html, [](char *ptr)
+											 { free(ptr); });
+
+	return request->beginResponse(
+		"text/html",
+		htmlLen,
+		[htmlHolder, htmlLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+		{
+			if (index >= htmlLen)
+			{
+				return 0;
+			}
+			size_t chunkLen = htmlLen - index;
+			if (chunkLen > maxLen)
+			{
+				chunkLen = maxLen;
+			}
+			memcpy(buffer, htmlHolder.get() + index, chunkLen);
+			return chunkLen;
+		});
+}
+
 #ifdef PPPOS
 #include <PPP.h>
 #endif
@@ -106,6 +144,7 @@ AsyncWebServer async_server(80);
 AsyncWebServer async_websocket(81);
 AsyncWebSocket ws("/ws");
 AsyncWebSocket ws_gnss("/ws_gnss");
+AsyncWebSocket ws_audio("/ws_audio");
 
 #ifdef MQTT
 #include <PubSubClient.h>
@@ -116,15 +155,176 @@ extern PubSubClient clientMQTT;
 extern pppType pppStatus;
 #endif
 
+#include "webhook.h"
+
 // Create an Event Source on /events
 AsyncEventSource lastheard_events("/eventHeard");
 AsyncEventSource message_events("/eventMsg");
 
+// Per-packet RX stream consumed by the new chat-style mobile UI.
+// Each event carries one APRS packet as JSON: {ts, ch, audio, raw}.
+// The browser is responsible for parsing TNC2 -> structured data.
+AsyncEventSource raw_packet_events("/api/packets/stream");
+volatile uint32_t g_rxPacketCount = 0;
+volatile uint32_t g_txPacketCount = 0;
+
 char *webString;
+
+static constexpr uint16_t AUDIO_MONITOR_RATE = 8000;
+static constexpr size_t AUDIO_MONITOR_CHUNK = 320; // 40ms at 8kHz
+static uint8_t audioMonitorBuffer[AUDIO_MONITOR_CHUNK];
+static size_t audioMonitorBufferLen = 0;
+static uint32_t audioMonitorAccumulator = 0;
+
+static constexpr uint16_t AUDIO_TX_RATE = 8000;
+static constexpr size_t AUDIO_TX_BUFFER_SIZE = 16384;
+static uint8_t audioTxBuffer[AUDIO_TX_BUFFER_SIZE];
+static volatile size_t audioTxHead = 0;
+static volatile size_t audioTxTail = 0;
+static portMUX_TYPE audioTxMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool audioTxPttActive = false;
+static volatile uint32_t audioTxOwnerId = 0;
+static TaskHandle_t taskAudioTxHandle = nullptr;
+
+static inline int16_t muLawToLinear(uint8_t uVal)
+{
+	uVal = static_cast<uint8_t>(~uVal);
+	const uint8_t sign = uVal & 0x80;
+	const uint8_t exponent = (uVal >> 4) & 0x07;
+	const uint8_t mantissa = uVal & 0x0F;
+	int16_t sample = static_cast<int16_t>(((mantissa << 3) + 0x84) << exponent);
+	sample = static_cast<int16_t>(sample - 0x84);
+	return sign ? -sample : sample;
+}
+
+static inline void audioTxClearBuffer()
+{
+	portENTER_CRITICAL(&audioTxMux);
+	audioTxHead = 0;
+	audioTxTail = 0;
+	portEXIT_CRITICAL(&audioTxMux);
+}
+
+static inline bool audioTxPopSample(uint8_t &sample)
+{
+	bool ok = false;
+	portENTER_CRITICAL(&audioTxMux);
+	if (audioTxTail != audioTxHead)
+	{
+		sample = audioTxBuffer[audioTxTail];
+		audioTxTail = (audioTxTail + 1) % AUDIO_TX_BUFFER_SIZE;
+		ok = true;
+	}
+	portEXIT_CRITICAL(&audioTxMux);
+	return ok;
+}
+
+static inline void audioTxPushSamples(const uint8_t *data, size_t len)
+{
+	if (data == nullptr || len == 0)
+		return;
+
+	portENTER_CRITICAL(&audioTxMux);
+	for (size_t i = 0; i < len; ++i)
+	{
+		const size_t nextHead = (audioTxHead + 1) % AUDIO_TX_BUFFER_SIZE;
+		if (nextHead == audioTxTail)
+		{
+			audioTxTail = (audioTxTail + 1) % AUDIO_TX_BUFFER_SIZE; // drop oldest
+		}
+		audioTxBuffer[audioTxHead] = data[i];
+		audioTxHead = nextHead;
+	}
+	portEXIT_CRITICAL(&audioTxMux);
+}
+
+void taskAudioTx(void *pvParameters)
+{
+#if defined(CONFIG_IDF_TARGET_ESP32)
+	dac_output_enable(DAC_CHAN_1);
+	dac_output_voltage(DAC_CHAN_1, 128);
+#endif
+	int64_t nextUs = esp_timer_get_time();
+	uint16_t yieldCounter = 0;
+	for (;;)
+	{
+		if (!audioTxPttActive)
+		{
+			vTaskDelay(pdMS_TO_TICKS(5));
+			nextUs = esp_timer_get_time();
+			yieldCounter = 0;
+			continue;
+		}
+
+		uint8_t ulaw = 0xFF; // silence
+		(void)audioTxPopSample(ulaw);
+		const int16_t pcm = muLawToLinear(ulaw);
+		const uint8_t dacSample = static_cast<uint8_t>((static_cast<int32_t>(pcm) + 32768) >> 8);
+#if defined(CONFIG_IDF_TARGET_ESP32)
+		dac_output_voltage(DAC_CHAN_1, dacSample);
+#else
+		(void)dacSample;
+#endif
+
+		nextUs += (1000000 / AUDIO_TX_RATE);
+		const int64_t nowUs = esp_timer_get_time();
+		if (nextUs > nowUs)
+		{
+			delayMicroseconds(static_cast<uint32_t>(nextUs - nowUs));
+		}
+		else
+		{
+			nextUs = nowUs;
+		}
+		if (++yieldCounter >= 64)
+		{
+			yieldCounter = 0;
+			taskYIELD();
+		}
+	}
+}
+
+static inline int16_t clampToInt16(int32_t value)
+{
+	if (value > 32767)
+	{
+		return 32767;
+	}
+	if (value < -32768)
+	{
+		return -32768;
+	}
+	return (int16_t)value;
+}
+
+static uint8_t linearToMuLaw(int16_t pcm)
+{
+	static constexpr int16_t MULAW_BIAS = 0x84;
+	static constexpr int16_t MULAW_CLIP = 32635;
+	uint8_t sign = (pcm < 0) ? 0x80 : 0x00;
+	if (pcm < 0)
+	{
+		pcm = -pcm;
+	}
+	if (pcm > MULAW_CLIP)
+	{
+		pcm = MULAW_CLIP;
+	}
+	pcm += MULAW_BIAS;
+
+	uint8_t exponent = 7;
+	for (uint16_t expMask = 0x4000; (pcm & expMask) == 0 && exponent > 0; expMask >>= 1)
+	{
+		exponent--;
+	}
+	const uint8_t mantissa = (pcm >> (exponent + 3)) & 0x0F;
+	return (uint8_t)(~(sign | (exponent << 4) | mantissa));
+}
 
 extern unsigned long waitISRetry;
 extern volatile int8_t adcEn;
 extern volatile int8_t dacEn;
+extern volatile int8_t webAudioPttRequest;
 extern unsigned long upTimeStamp;
 extern double VBat;
 extern bool VBat_Flag;
@@ -184,18 +384,36 @@ void setMainPage(AsyncWebServerRequest *request)
 		return request->requestAuthentication();
 	}
 
-	// Using dynamic memory allocation instead of String
-	char *webString = allocateStringMemory(12000); // Initial buffer size, adjust as needed
-	if (!webString)
+	// Stream the response so we never need a single ~12 KB contiguous buffer.
+	// On non-PSRAM builds the heap is heavily fragmented once WiFi/TLS/etc.
+	// are running and large calloc()s frequently fail, which previously made
+	// this handler return nothing ("Main page allocation failed"). The chunked
+	// stream uses small internal buffers managed by ESPAsyncWebServer.
+	AsyncResponseStream *stream = request->beginResponseStream("text/html");
+	if (!stream)
 	{
-		return; // Memory allocation failed
+		request->send(500, "text/plain", "Main page stream allocation failed");
+		return;
 	}
+	stream->addHeader("Sensor", "content");
+	stream->addHeader("Cache-Control", "no-cache");
+
+	// Local helpers to keep the existing strcat-style call sites working with
+	// minimal churn: webString_print(s) appends a literal/string, and
+	// webString_printf(...) handles the snprintf-into-temp-buffer pattern.
+	auto webString_print = [&](const char *s) { stream->print(s); };
+
+#define strcpy(dst, src) webString_print(src)
+#define strcat(dst, src) webString_print(src)
+
+	char *webString = nullptr; // legacy variable, unused with streaming
 
 	strcpy(webString, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
 	strcat(webString, "<meta name=\"robots\" content=\"index\" />\n");
 	strcat(webString, "<meta name=\"robots\" content=\"follow\" />\n");
 	strcat(webString, "<meta name=\"language\" content=\"English\" />\n");
 	strcat(webString, "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />\n");
+	strcat(webString, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n");
 	strcat(webString, "<meta name=\"GENERATOR\" content=\"configure 20230924\" />\n");
 	strcat(webString, "<meta name=\"Author\" content=\"Mr.Somkiat Nakhonthai (HS5TQA)\" />\n");
 	strcat(webString, "<meta name=\"Description\" content=\"Web Embedded Configuration\" />\n");
@@ -216,7 +434,7 @@ void setMainPage(AsyncWebServerRequest *request)
 		strcat(webString, "<title>ESP32APRS_Audio</title>\n");
 	}
 
-	strcat(webString, "<link rel=\"stylesheet\" type=\"text/css\" href=\"style.css\" />\n");
+	strcat(webString, "<link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" />\n");
 	strcat(webString, "<script src=\"/jquery-3.7.1.js\"></script>\n");
 	strcat(webString, "<script type=\"text/javascript\">\n");
 	strcat(webString, "function selectTab(evt, tabName) {\n");
@@ -243,6 +461,8 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "$(\"#contentmain\").load(\"/tlm\");\n");
 	strcat(webString, "} else if (tabName == 'SENSOR') {\n");
 	strcat(webString, "$(\"#contentmain\").load(\"/sensor\");\n");
+	strcat(webString, "} else if (tabName == 'Audio') {\n");
+	strcat(webString, "$(\"#contentmain\").load(\"/audio\");\n");
 	strcat(webString, "} else if (tabName == 'VPN') {\n");
 	strcat(webString, "$(\"#contentmain\").load(\"/vpn\");\n");
 #ifdef MQTT
@@ -394,6 +614,7 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WX')\">WX</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TLM')\">TLM</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'SENSOR')\">SENSOR</button>\n");
+	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Audio')\">Audio</button>\n");
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'VPN')\">VPN</button>\n");
 #ifdef MQTT
 	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
@@ -409,7 +630,7 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "</div>\n");
 	strcat(webString, "\n");
 
-	strcat(webString, "<div class=\"contentwide\" id=\"contentmain\"  style=\"font-size: 2pt;\">\n");
+	strcat(webString, "<div class=\"contentwide\" id=\"contentmain\">\n");
 	strcat(webString, "\n");
 	strcat(webString, "</div>\n");
 	strcat(webString, "<br />\n");
@@ -434,12 +655,10 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "</body>\n");
 	strcat(webString, "</html>");
 
+#undef strcpy
+#undef strcat
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
-	response->addHeader("Sensor", "content");
-	response->addHeader("Cache-Control", "no-cache");
-	request->send(response);
-	free(webString);
+	request->send(stream);
 	lastHeardTimeout = 0;
 	lastHeard_Flag = true;
 }
@@ -450,8 +669,540 @@ void setMainPage(AsyncWebServerRequest *request)
 
 void handle_css(AsyncWebServerRequest *request)
 {
-	const char *css = ".container{width:900px;text-align:left;margin:auto;border-radius:10px 10px 10px 10px;-moz-border-radius:10px 10px 10px 10px;-webkit-border-radius:10px 10px 10px 10px;-khtml-border-radius:10px 10px 10px 10px;-ms-border-radius:10px 10px 10px 10px;box-shadow:3px 3px 3px #707070;background:#fff;border-color: #2194ec;padding: 0px;border-width: 5px;border-style:solid;}body,font{font:12px verdana,arial,sans-serif;color:#fff}.header{background:#2194ec;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;text-align:left;padding:5px 0;border-radius:10px 10px 0 0;-moz-border-radius:10px 10px 0 0;-webkit-border-radius:10px 10px 0 0;-khtml-border-radius:10px 10px 0 0;-ms-border-radius:10px 10px 0 0}.content{margin:0 0 0 166px;padding:1px 5px 5px;color:#000;background:#fff;text-align:center;font-size: 8pt;}.contentwide{padding:50px 5px 5px;color:#000;background:#fff;text-align:center}.contentwide h2{color:#000;font:1em verdana,arial,sans-serif;text-align:center;font-weight:700;padding:0;margin:0;font-size: 12pt;}.footer{background:#2194ec;text-decoration:none;color:#fff;font-family:verdana,arial,sans-serif;font-size:9px;text-align:center;padding:10px 0;border-radius:0 0 10px 10px;-moz-border-radius:0 0 10px 10px;-webkit-border-radius:0 0 10px 10px;-khtml-border-radius:0 0 10px 10px;-ms-border-radius:0 0 10px 10px;clear:both}#tail{height:450px;width:805px;overflow-y:scroll;overflow-x:scroll;color:#0f0;background:#000}table{vertical-align:middle;text-align:center;empty-cells:show;padding-left:3;padding-right:3;padding-top:3;padding-bottom:3;border-collapse:collapse;border-color:#0f07f2;border-style:solid;border-spacing:0px;border-width:3px;text-decoration:none;color:#fff;background:#000;font-family:verdana,arial,sans-serif;font-size : 12px;width:100%;white-space:nowrap}table th{cursor: pointer;user-select: none;font-size: 10pt;font-family:lucidia console,Monaco,monospace;text-shadow:1px 1px #0e038c;text-decoration:none;background:#0525f7;border:1px solid silver}table tr:nth-child(even){background:#f7f7f7}table tr:nth-child(odd){background:#eeeeee}table td{color:#000;font-family:lucidia console,Monaco,monospace;text-decoration:none;border:1px solid #010369}body{background:#edf0f5;color:#000}a{text-decoration:none}a:link,a:visited{text-decoration:none;color:#0000e0;font-weight:400}th:last-child a.tooltip:hover span{left:auto;right:0}ul{padding:5px;margin:10px 0;list-style:none;float:left}ul li{float:left;display:inline;margin:0 10px}ul li a{text-decoration:none;float:left;color:#999;cursor:pointer;font:900 14px/22px arial,Helvetica,sans-serif}ul li a span{margin:0 10px 0 -10px;padding:1px 8px 5px 18px;position:relative;float:left}h1{text-shadow:2px 2px #303030;text-align:center}.toggle{position:absolute;margin-left:-9999px;visibility:hidden}.toggle+label{display:block;position:relative;cursor:pointer;outline:none}input.toggle-round-flat+label{padding:1px;width:33px;height:18px;background-color:#ddd;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:before,input.toggle-round-flat+label:after{display:block;position:absolute;}input.toggle-round-flat+label:before{top:1px;left:1px;bottom:1px;right:1px;background-color:#fff;border-radius:10px;transition:background .4s}input.toggle-round-flat+label:after{top:2px;left:2px;bottom:2px;width:16px;background-color:#ddd;border-radius:12px;transition:margin .4s,background .4s}input.toggle-round-flat:checked+label{background-color:#dd4b39}input.toggle-round-flat:checked+label:after{margin-left:14px;background-color:#dd4b39}@-moz-document url-prefix(){select,input{margin:0;padding:0;border-width:1px;font:12px verdana,arial,sans-serif}input[type=button],button,input[type=submit]{padding:0 3px;border-radius:3px 3px 3px 3px;-moz-border-radius:3px 3px 3px 3px}}.nice-select.small,.nice-select-dropdown li.option{height:24px!important;min-height:24px!important;line-height:24px!important}.nice-select.small ul li:nth-of-type(2){clear:both}.nav{margin-bottom:0;padding-left:10;list-style:none}.nav>li{position:relative;display:block}.nav>li>a{position:relative;display:block;padding:5px 10px}.nav>li>a:hover,.nav>li>a:focus{text-decoration:none;background-color:#eee}.nav>li.disabled>a{color:#999}.nav>li.disabled>a:hover,.nav>li.disabled>a:focus{color:#999;text-decoration:none;background-color:initial;cursor:not-allowed}.nav .open>a,.nav .open>a:hover,.nav .open>a:focus{background-color:#eee;border-color:#428bca}.nav .nav-divider{height:1px;margin:9px 0;overflow:hidden;background-color:#e5e5e5}.nav>li>a>img{max-width:none}.nav-tabs{border-bottom:1px solid #ddd}.nav-tabs>li{float:left;margin-bottom:-1px}.nav-tabs>li>a{margin-right:0;line-height:1.42857143;border:1px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>li>a:hover{border-color:#eee #eee #ddd}.nav-tabs>button{margin-right:0;line-height:1.42857143;border:2px solid #ddd;border-radius:10px 10px 0 0}.nav-tabs>button:hover{background-color:#25bbfc;border-color:#428bca;color:#eaf2f9;border-bottom-color:transparent;}.nav-tabs>button.active,.nav-tabs>button.active:hover,.nav-tabs>button.active:focus{color:#f7fdfd;background-color:#1aae0d;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs>li.active>a,.nav-tabs>li.active>a:hover,.nav-tabs>li.active>a:focus{color:#428bca;background-color:#e5e5e5;border:1px solid #ddd;border-bottom-color:transparent;cursor:default}.nav-tabs.nav-justified{width:100%;border-bottom:0}.nav-tabs.nav-justified>li{float:none}.nav-tabs.nav-justified>li>a{text-align:center;margin-bottom:5px}.nav-tabs.nav-justified>.dropdown .dropdown-menu{top:auto;left:auto}.nav-status{float:left;margin:0;padding:3px;width:160px;font-weight:400;min-height:600}#bar,#prgbar {background-color: #f1f1f1;border-radius: 14px}#bar {background-color: #3498db;width: 0%;height: 14px}.switch{position:relative;display:inline-block;width:34px;height:16px}.switch input{opacity:0;width:0;height:0}.slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#f55959;-webkit-transition:.4s;transition:.4s}.slider:before{position:absolute;content:\"\";height:12px;width:12px;left:2px;bottom:2px;background-color:#fff;-webkit-transition:.4s;transition:.4s}input:checked+.slider{background-color:#5ca30a}input:focus+.slider{box-shadow:0 0 1px #5ca30a}input:checked+.slider:before{-webkit-transform:translateX(16px);-ms-transform:translateX(16px);transform:translateX(16px)}.slider.round{border-radius:34px}.slider.round:before{border-radius:50%}.button{border:1px solid #06c;background-color:#09c;color:#fff;padding:5px 10px;border-radius: 3px}.button:hover{border:1px solid #09c;background-color:#0ac;color:#fff}.button:disabled,button[disabled]{border:1px solid #999;background-color:#ccc;color:#666}.arrow {margin-left: 5px;font-size: 12px;}\n";
-	request->send_P(200, "text/css", css);
+	if (!LITTLEFS.exists("/style.css"))
+	{
+		request->send(404, "text/plain", "Missing /style.css");
+		return;
+	}
+
+	AsyncWebServerResponse *response = request->beginResponse(LITTLEFS, "/style.css", "text/css", false);
+	response->addHeader("Cache-Control", "public, max-age=3600");
+	request->send(response);
+}
+
+// Serve a static asset for the new chat-style mobile UI from LittleFS.
+// Transparently prefers a "<path>.gz" sibling and sets Content-Encoding: gzip
+// so we can ship pre-compressed JS/CSS without spending RAM on runtime gzip.
+void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime)
+{
+	String gz = String(path) + ".gz";
+	if (LITTLEFS.exists(gz))
+	{
+		AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, gz, mime, false);
+		r->addHeader("Content-Encoding", "gzip");
+		r->addHeader("Cache-Control", "public, max-age=600");
+		request->send(r);
+		return;
+	}
+	if (!LITTLEFS.exists(path))
+	{
+		request->send(404, "text/plain", path);
+		return;
+	}
+	AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, path, mime, false);
+	r->addHeader("Cache-Control", "public, max-age=600");
+	request->send(r);
+}
+
+// Append a JSON-escaped copy of `src` into `dst` (bounded by `cap`, leaving room
+// for a NUL). Skips control characters and CR; encodes \n as "\\n".
+static size_t json_escape_into(char *dst, size_t cap, const char *src)
+{
+	size_t j = 0;
+	for (size_t i = 0; src && src[i] && j + 2 < cap; i++)
+	{
+		unsigned char c = (unsigned char)src[i];
+		if (c == '\\' || c == '"')
+		{
+			dst[j++] = '\\';
+			dst[j++] = (char)c;
+		}
+		else if (c == '\n')
+		{
+			dst[j++] = '\\';
+			dst[j++] = 'n';
+		}
+		else if (c < 0x20)
+		{
+			// drop other control chars (CR, NUL slip-through, etc.)
+		}
+		else
+		{
+			dst[j++] = (char)c;
+		}
+	}
+	dst[j] = 0;
+	return j;
+}
+
+// Called from main.cpp:pkgListUpdate() once per received packet (RF or INET).
+// Increments the RX counter and, when at least one EventSource client is
+// listening, pushes a compact JSON event so the chat UI can show it instantly.
+void publishRawPacket(const char *raw, int channel, int audioLvl, bool tx)
+{
+	if (!tx) g_rxPacketCount++;
+	if (raw == nullptr || raw[0] == 0)
+		return;
+	// Fan out to outbound webhooks regardless of whether a browser is watching
+	// the SSE — webhook_enqueue() is cheap when no slot is enabled.  We don't
+	// fan out our own self-TX (you don't want a Telegram bot echoing your own
+	// posts back at you), only RX traffic.
+	if (!tx)
+		webhook_enqueue(raw, channel, audioLvl);
+	if (raw_packet_events.count() == 0)
+		return; // nobody listening; cheap path
+
+	// Bound the raw line length so a runaway packet can't blow our stack buffer.
+	char esc[360];
+	json_escape_into(esc, sizeof(esc), raw);
+
+	char buf[440];
+	snprintf(buf, sizeof(buf),
+			 "{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"dir\":\"%s\",\"raw\":\"%s\"}",
+			 (long long)time(NULL), channel, audioLvl,
+			 tx ? "tx" : "rx", esc);
+	raw_packet_events.send(buf, "packet", millis() / 1000, 1000);
+}
+
+// Tiny key=value parser for application/x-www-form-urlencoded request bodies.
+// Returns true if `key` was found; copies the URL-decoded value into `out` (cap-bounded).
+static bool form_field(AsyncWebServerRequest *request, const char *key, char *out, size_t cap)
+{
+	if (!request->hasParam(key, true))
+		return false;
+	String v = request->getParam(key, true)->value();
+	strlcpy(out, v.c_str(), cap);
+	return true;
+}
+
+// POST /api/tx/message — body: form fields {to, text}.  Calls sendAPRSMessage().
+void api_tx_message(AsyncWebServerRequest *request)
+{
+	char to[16] = {0};
+	char text[200] = {0};
+	if (!form_field(request, "to", to, sizeof(to)) || to[0] == 0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing to\"}");
+		return;
+	}
+	if (!form_field(request, "text", text, sizeof(text)) || text[0] == 0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing text\"}");
+		return;
+	}
+	// Pad addressee to 9 chars (APRS message format wants exactly 9 in <toCall  >).
+	String dest = String(to);
+	dest.toUpperCase();
+	sendAPRSMessage(dest, String(text), config.msg_encrypt);
+	g_txPacketCount++;
+
+	// Echo our own TX into the chat feed so the user sees what they sent.
+	// Build a representative TNC2 line — we don't try to mirror the exact
+	// path / msgid that sendAPRSMessage queues internally; the browser only
+	// needs src + addressee + text to render this in the timeline.
+	{
+		char src[16];
+		if (config.aprs_ssid > 0)
+			snprintf(src, sizeof(src), "%s-%u", config.aprs_mycall, (unsigned)config.aprs_ssid);
+		else
+			strlcpy(src, config.aprs_mycall, sizeof(src));
+		char tnc2[260];
+		snprintf(tnc2, sizeof(tnc2), "%s>APE32L::%-9s:%s",
+				 src, dest.c_str(), text);
+		publishRawPacket(tnc2, 0, 0, /*tx=*/true);
+	}
+
+	request->send(200, "application/json", "{\"ok\":true}");
+}
+
+// Build an APRS uncompressed lat/lon string: ddmm.hhN/dddmm.hhW
+static void format_aprs_latlon(double lat, double lon, char *out, size_t cap, char symbol_table, char symbol_code)
+{
+	char ns = (lat >= 0) ? 'N' : 'S';
+	char ew = (lon >= 0) ? 'E' : 'W';
+	double alat = lat < 0 ? -lat : lat;
+	double alon = lon < 0 ? -lon : lon;
+	int latDeg = (int)alat;
+	double latMin = (alat - latDeg) * 60.0;
+	int lonDeg = (int)alon;
+	double lonMin = (alon - lonDeg) * 60.0;
+	snprintf(out, cap, "%02d%05.2f%c%c%03d%05.2f%c%c",
+			 latDeg, latMin, ns, symbol_table,
+			 lonDeg, lonMin, ew, symbol_code);
+}
+
+// POST /api/tx/position — body: {lat, lon, comment?, symbol_table?, symbol_code?, dest?}
+void api_tx_position(AsyncWebServerRequest *request)
+{
+	char latS[24] = {0};
+	char lonS[24] = {0};
+	char comment[64] = {0};
+	char symT[2] = "/";
+	char symC[2] = ">";
+	char destSel[8] = {0};
+	if (!form_field(request, "lat", latS, sizeof(latS)) ||
+		!form_field(request, "lon", lonS, sizeof(lonS)))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing lat/lon\"}");
+		return;
+	}
+	form_field(request, "comment", comment, sizeof(comment));
+	form_field(request, "symbol_table", symT, sizeof(symT));
+	form_field(request, "symbol_code", symC, sizeof(symC));
+	form_field(request, "dest", destSel, sizeof(destSel)); // "rf" | "inet" | "" (both)
+	double lat = atof(latS);
+	double lon = atof(lonS);
+	if (lat == 0.0 && lon == 0.0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"bad lat/lon\"}");
+		return;
+	}
+	char pos[32];
+	format_aprs_latlon(lat, lon, pos, sizeof(pos), symT[0], symC[0]);
+
+	// Source callsign: prefer aprs_mycall (with optional SSID).
+	char src[16];
+	if (config.aprs_ssid > 0)
+		snprintf(src, sizeof(src), "%s-%u", config.aprs_mycall, (unsigned)config.aprs_ssid);
+	else
+		snprintf(src, sizeof(src), "%s", config.aprs_mycall);
+
+	// Build TNC2: SRC>APE32L,WIDE1-1:!POS<comment>
+	char tnc2[200];
+	snprintf(tnc2, sizeof(tnc2), "%s>APE32L,WIDE1-1:!%s%s", src, pos, comment);
+
+	uint8_t channel = RF_CHANNEL;
+	if (strcasecmp(destSel, "inet") == 0)
+		channel = INET_CHANNEL;
+	else if (destSel[0] == 0)
+	{
+		channel = 0;
+		if (config.trk_loc2rf) channel |= RF_CHANNEL;
+		if (config.trk_loc2inet) channel |= INET_CHANNEL;
+		if (channel == 0) channel = RF_CHANNEL;
+	}
+
+	bool ok = pkgTxPush(tnc2, strlen(tnc2), 0, channel);
+	if (ok) {
+		g_txPacketCount++;
+		// Mirror our position into the SSE so the chat UI plots us on the map
+		// and shows the beacon in the timeline.
+		publishRawPacket(tnc2, 0, 0, /*tx=*/true);
+	}
+	char resp[96];
+	snprintf(resp, sizeof(resp), "{\"ok\":%s,\"raw\":\"%s\"}", ok ? "true" : "false", "(see /api/packets/stream)");
+	request->send(ok ? 200 : 503, "application/json", resp);
+}
+
+// GET /api/webhooks — list current webhook slots as JSON.
+void api_webhooks_list(AsyncWebServerRequest *request)
+{
+	AsyncResponseStream *s = request->beginResponseStream("application/json");
+	if (!s) { request->send(500, "text/plain", "alloc failed"); return; }
+	s->addHeader("Cache-Control", "no-cache");
+	s->print('[');
+	char esc[260];
+	for (int i = 0; i < WEBHOOK_SLOTS; i++)
+	{
+		const auto &w = config.webhooks[i];
+		if (i) s->print(',');
+		s->print('{');
+		s->printf("\"slot\":%d,\"enabled\":%s,\"event_mask\":%u,",
+				  i, w.enabled ? "true" : "false", (unsigned)w.event_mask);
+		json_escape_into(esc, sizeof(esc), w.name);          s->printf("\"name\":\"%s\",", esc);
+		json_escape_into(esc, sizeof(esc), w.url);           s->printf("\"url\":\"%s\",", esc);
+		json_escape_into(esc, sizeof(esc), w.body_template); s->printf("\"body_template\":\"%s\",", esc);
+		json_escape_into(esc, sizeof(esc), w.filter_callsign); s->printf("\"filter_callsign\":\"%s\"", esc);
+		s->print('}');
+	}
+	s->print(']');
+	request->send(s);
+}
+
+// POST /api/webhooks — body fields: slot, enabled, event_mask, name, url, body_template, filter_callsign.
+// Saves to /default.cfg so config persists across reboot.
+void api_webhooks_save(AsyncWebServerRequest *request)
+{
+	char slotS[8] = {0};
+	if (!form_field(request, "slot", slotS, sizeof(slotS)))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing slot\"}");
+		return;
+	}
+	int slot = atoi(slotS);
+	if (slot < 0 || slot >= WEBHOOK_SLOTS)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"bad slot\"}");
+		return;
+	}
+	auto &w = config.webhooks[slot];
+	char tmp[8] = {0};
+	if (form_field(request, "enabled", tmp, sizeof(tmp)))
+		w.enabled = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y');
+	if (form_field(request, "event_mask", tmp, sizeof(tmp)))
+		w.event_mask = (uint8_t)atoi(tmp);
+	form_field(request, "name", w.name, sizeof(w.name));
+	form_field(request, "url", w.url, sizeof(w.url));
+	form_field(request, "body_template", w.body_template, sizeof(w.body_template));
+	form_field(request, "filter_callsign", w.filter_callsign, sizeof(w.filter_callsign));
+	bool saved = saveConfiguration("/default.cfg", config);
+	char resp[64];
+	snprintf(resp, sizeof(resp), "{\"ok\":%s}", saved ? "true" : "false");
+	request->send(saved ? 200 : 500, "application/json", resp);
+}
+
+// POST /api/webhooks/test — body: slot. Synchronously fires a test event.
+void api_webhooks_test(AsyncWebServerRequest *request)
+{
+	char slotS[8] = {0};
+	if (!form_field(request, "slot", slotS, sizeof(slotS)))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing slot\"}");
+		return;
+	}
+	int slot = atoi(slotS);
+	char err[32] = {0};
+	int rc = webhook_test(slot, err, sizeof(err));
+	char resp[96];
+	// rc == 0 means "queued"; the actual HTTP fire happens on the worker task.
+	// Anything else is a synchronous error (bad slot, slot empty, queue full).
+	snprintf(resp, sizeof(resp),
+			 "{\"ok\":%s,\"queued\":%s,\"err\":\"%s\"}",
+			 rc == 0 ? "true" : "false",
+			 rc == 0 ? "true" : "false",
+			 err);
+	request->send(rc == 0 ? 202 : 400, "application/json", resp);
+}
+
+// POST /api/identity — set callsign + SSID across all roles in one go.
+// Fields: callsign (uppercase, max 9 chars), ssid (0-15).  We mirror the
+// value into aprs_mycall / msg_mycall / trk_mycall / digi_mycall so a single
+// edit from the chat UI changes everything the user expects.
+void api_identity_set(AsyncWebServerRequest *request)
+{
+	char call[12] = {0};
+	char ssidS[8] = {0};
+	bool gotCall = form_field(request, "callsign", call, sizeof(call));
+	bool gotSsid = form_field(request, "ssid", ssidS, sizeof(ssidS));
+	if (!gotCall && !gotSsid)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"no fields\"}");
+		return;
+	}
+
+	if (gotCall)
+	{
+		// Uppercase + strip whitespace; reject empty.
+		char clean[12] = {0};
+		size_t j = 0;
+		for (size_t i = 0; call[i] && j < sizeof(clean) - 1; i++)
+		{
+			char c = call[i];
+			if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+			if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') clean[j++] = c;
+		}
+		clean[j] = 0;
+		if (j == 0)
+		{
+			request->send(400, "application/json", "{\"ok\":false,\"err\":\"empty callsign\"}");
+			return;
+		}
+		strlcpy(config.aprs_mycall, clean, sizeof(config.aprs_mycall));
+		strlcpy(config.msg_mycall,  clean, sizeof(config.msg_mycall));
+		strlcpy(config.trk_mycall,  clean, sizeof(config.trk_mycall));
+		strlcpy(config.digi_mycall, clean, sizeof(config.digi_mycall));
+	}
+	if (gotSsid)
+	{
+		int s = atoi(ssidS);
+		if (s < 0) s = 0;
+		if (s > 15) s = 15;
+		config.aprs_ssid = (uint8_t)s;
+		config.trk_ssid  = (uint8_t)s;
+		config.digi_ssid = (uint8_t)s;
+	}
+
+	bool saved = saveConfiguration("/default.cfg", config);
+	char resp[160];
+	snprintf(resp, sizeof(resp),
+			 "{\"ok\":%s,\"callsign\":\"%s\",\"ssid\":%u}",
+			 saved ? "true" : "false",
+			 config.aprs_mycall, (unsigned)config.aprs_ssid);
+	request->send(saved ? 200 : 500, "application/json", resp);
+}
+
+// GET /api/radio — current radio settings (freq in MHz, CTCSS in 0.1 Hz units
+// per SR110 convention, sql_level 0-9, rf_power 0=low/1=high).  Also returns
+// rf_type and AFSK modem state so the chat UI can diagnose "why no RX".
+void api_radio_get(AsyncWebServerRequest *request)
+{
+	extern volatile int8_t adcEn; // from main.cpp; 1 = ADC sampling, -1 = halted
+	extern int mVrms;             // from main.cpp; running RMS of incoming audio (mV)
+	int sqlPin = -1;
+	if (config.rf_sql_gpio >= 0)
+		sqlPin = digitalRead(config.rf_sql_gpio);
+	char buf[440];
+	snprintf(buf, sizeof(buf),
+			 "{\"freq_rx\":%.4f,\"freq_tx\":%.4f,"
+			 "\"tone_rx\":%d,\"tone_tx\":%d,"
+			 "\"sql_level\":%u,\"rf_power\":%s,"
+			 "\"band\":%u,\"rf_en\":%s,\"volume\":%u,"
+			 "\"rf_type\":%u,\"modem\":%u,\"adc_en\":%d,"
+			 "\"sql_active\":%u,\"mvrms\":%d,\"sql_pin\":%d}",
+			 (double)config.freq_rx, (double)config.freq_tx,
+			 config.tone_rx, config.tone_tx,
+			 (unsigned)config.sql_level, config.rf_power ? "true" : "false",
+			 (unsigned)config.band, config.rf_en ? "true" : "false",
+			 (unsigned)config.volume,
+			 (unsigned)config.rf_type, (unsigned)config.modem_type,
+			 (int)adcEn, (unsigned)config.rf_sql_active,
+			 mVrms, sqlPin);
+	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
+	r->addHeader("Cache-Control", "no-cache");
+	request->send(r);
+}
+
+// POST /api/radio — change one or more radio settings.  Any field absent
+// from the form body is left at its current value.  Supports a `freq` alias
+// that sets both RX and TX (the common case for simplex APRS).  Triggers a
+// safe RF re-init via the main loop.
+void api_radio_set(AsyncWebServerRequest *request)
+{
+	bool changed = false;
+	char tmp[24];
+
+	if (form_field(request, "freq", tmp, sizeof(tmp)) && tmp[0])
+	{
+		float f = atof(tmp);
+		if (f >= 100.0f && f <= 530.0f) {
+			config.freq_rx = f;
+			config.freq_tx = f;
+			changed = true;
+		}
+	}
+	if (form_field(request, "freq_rx", tmp, sizeof(tmp)) && tmp[0])
+	{
+		float f = atof(tmp);
+		if (f >= 100.0f && f <= 530.0f) { config.freq_rx = f; changed = true; }
+	}
+	if (form_field(request, "freq_tx", tmp, sizeof(tmp)) && tmp[0])
+	{
+		float f = atof(tmp);
+		if (f >= 100.0f && f <= 530.0f) { config.freq_tx = f; changed = true; }
+	}
+	if (form_field(request, "tone_rx", tmp, sizeof(tmp)))   { config.tone_rx   = atoi(tmp); changed = true; }
+	if (form_field(request, "tone_tx", tmp, sizeof(tmp)))   { config.tone_tx   = atoi(tmp); changed = true; }
+	if (form_field(request, "sql_level", tmp, sizeof(tmp))) { config.sql_level = (uint8_t)atoi(tmp); changed = true; }
+	if (form_field(request, "volume", tmp, sizeof(tmp)))    { config.volume    = (uint8_t)atoi(tmp); changed = true; }
+	if (form_field(request, "rf_power", tmp, sizeof(tmp)))
+	{
+		config.rf_power = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y' || tmp[0] == 'h');
+		changed = true;
+	}
+	if (form_field(request, "rf_en", tmp, sizeof(tmp)))
+	{
+		config.rf_en = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y');
+		changed = true;
+	}
+
+	if (!changed)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"no fields\"}");
+		return;
+	}
+
+	bool saved = saveConfiguration("/default.cfg", config);
+	// Defer the actual radio re-init to loop() — the radio init does
+	// blocking serial I/O that we don't want on the AsyncWebServer task.
+	rfModuleReinitPending = true;
+
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+			 "{\"ok\":%s,\"freq_rx\":%.4f,\"freq_tx\":%.4f,"
+			 "\"tone_rx\":%d,\"tone_tx\":%d,\"sql_level\":%u,\"rf_power\":%s}",
+			 saved ? "true" : "false",
+			 (double)config.freq_rx, (double)config.freq_tx,
+			 config.tone_rx, config.tone_tx,
+			 (unsigned)config.sql_level, config.rf_power ? "true" : "false");
+	request->send(saved ? 200 : 500, "application/json", buf);
+}
+
+// GET /api/me — small JSON status doc consumed by the mobile UI on load.
+void api_me(AsyncWebServerRequest *request)
+{
+	char buf[384];
+	IPAddress ip = WiFi.localIP();
+	snprintf(buf, sizeof(buf),
+			 "{\"callsign\":\"%s\",\"ssid\":%u,\"version\":\"%s\","
+			 "\"ip\":\"%u.%u.%u.%u\",\"free_heap\":%u,\"uptime\":%lu,"
+			 "\"rx_count\":%lu,\"tx_count\":%lu}",
+			 config.aprs_mycall, (unsigned)config.aprs_ssid, VERSION,
+			 ip[0], ip[1], ip[2], ip[3],
+			 (unsigned)ESP.getFreeHeap(), (unsigned long)(millis() / 1000),
+			 (unsigned long)g_rxPacketCount, (unsigned long)g_txPacketCount);
+	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
+	r->addHeader("Cache-Control", "no-cache");
+	request->send(r);
+}
+
+// GET /api/packets/recent — last N stored packets (most recent first), used
+// to hydrate the chat list when the page loads / reconnects.
+void api_packets_recent(AsyncWebServerRequest *request)
+{
+	AsyncResponseStream *s = request->beginResponseStream("application/json");
+	if (!s)
+	{
+		request->send(500, "text/plain", "stream alloc failed");
+		return;
+	}
+	s->addHeader("Cache-Control", "no-cache");
+
+	// Collect non-empty entries with their times so we can sort newest-first
+	// without copying the raw payloads (just indices).
+	struct IdxTime { int idx; time_t t; };
+	IdxTime entries[PKGLISTSIZE];
+	int n = 0;
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		pkgListType pkg = getPkgList(i);
+		if (pkg.time > 0 && pkg.raw && pkg.raw[0])
+		{
+			entries[n].idx = i;
+			entries[n].t = pkg.time;
+			n++;
+		}
+	}
+	// Simple insertion sort — PKGLISTSIZE is small (20-30).
+	for (int i = 1; i < n; i++)
+	{
+		IdxTime k = entries[i];
+		int j = i - 1;
+		while (j >= 0 && entries[j].t < k.t)
+		{
+			entries[j + 1] = entries[j];
+			j--;
+		}
+		entries[j + 1] = k;
+	}
+
+	s->print('[');
+	bool first = true;
+	char esc[360];
+	for (int i = 0; i < n; i++)
+	{
+		pkgListType pkg = getPkgList(entries[i].idx);
+		if (pkg.raw == nullptr || pkg.raw[0] == 0)
+			continue;
+		if (!first)
+			s->print(',');
+		first = false;
+		json_escape_into(esc, sizeof(esc), pkg.raw);
+		s->printf("{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"raw\":\"%s\"}",
+				  (long long)pkg.time, (int)pkg.channel,
+				  (int)pkg.audio_level, esc);
+	}
+	s->print(']');
+	request->send(s);
 }
 
 void handle_jquery(AsyncWebServerRequest *request)
@@ -677,6 +1428,24 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	else
 		strcat(webString, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disconnect</td>\n");
 	strcat(webString, "</tr>\n");
+	strcat(webString, "<tr>\n");
+	strcat(webString, "<td>STA IP</td>\n");
+	IPAddress staIp = WiFi.localIP();
+	bool staHasIp = WiFi.isConnected() && (staIp[0] || staIp[1] || staIp[2] || staIp[3]);
+	if (staHasIp)
+	{
+		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background:#d8ffd8; color:#034f03;\"><b>%s</b></td>\n", staIp.toString().c_str());
+		strcat(webString, temp_buffer);
+	}
+	else if (config.wifi_mode & WIFI_STA_FIX)
+	{
+		strcat(webString, "<td style=\"background:#fff6cc; color:#7a5d00;\">Waiting DHCP</td>\n");
+	}
+	else
+	{
+		strcat(webString, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">STA disabled</td>\n");
+	}
+	strcat(webString, "</tr>\n");
 	strcat(webString, "</table>\n");
 	strcat(webString, "<br />\n");
 #ifdef BLUETOOTH
@@ -763,11 +1532,10 @@ void handle_dashboard(AsyncWebServerRequest *request)
 	strcat(webString, "</table>\n");
 	strcat(webString, "</div>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("dashboard", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 	lastHeardTimeout = millis() + 500;
 	lastHeard_Flag = true;
 }
@@ -785,6 +1553,7 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	{
 		return; // Memory allocation failed
 	}
+	char temp_buffer[64];
 
 	strcpy(html, "<table style=\"background:white;border-collapse: unset;\">\n");
 	strcat(html, "<tr>\n");
@@ -850,13 +1619,42 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	strcat(html, "<br />\n");
 	strcat(html, "<table>\n");
 	strcat(html, "<tr>\n");
+	strcat(html, "<th colspan=\"2\">WiFi STA</th>\n");
+	strcat(html, "</tr>\n");
+	strcat(html, "<tr>\n");
+	strcat(html, "<td style=\"width: 60px;text-align: right;\">LINK:</td>\n");
+	IPAddress staIp = WiFi.localIP();
+	bool staEnabled = (config.wifi_mode & WIFI_STA_FIX);
+	bool staHasIp = WiFi.isConnected() && (staIp[0] || staIp[1] || staIp[2] || staIp[3]);
+	if (staHasIp)
+		strcat(html, "<td style=\"background:#0b0; color:#030;\"><b>Connected</b></td>\n");
+	else if (staEnabled)
+		strcat(html, "<td style=\"background:#fff6cc; color:#7a5d00;\">Connecting...</td>\n");
+	else
+		strcat(html, "<td style=\"background:#606060; color:#b0b0b0;\" aria-disabled=\"true\">Disabled</td>\n");
+	strcat(html, "</tr>\n");
+	strcat(html, "<tr>\n");
+	strcat(html, "<td style=\"width: 60px;text-align: right;\">IP:</td>\n");
+	if (staHasIp)
+	{
+		snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background:#d8ffd8; color:#034f03;\"><b>%s</b></td>\n", staIp.toString().c_str());
+		strcat(html, temp_buffer);
+	}
+	else
+	{
+		strcat(html, "<td style=\"background:#ffffff; color:#999999;\">-</td>\n");
+	}
+	strcat(html, "</tr>\n");
+	strcat(html, "</table>\n");
+	strcat(html, "<br />\n");
+	strcat(html, "<table>\n");
+	strcat(html, "<tr>\n");
 	strcat(html, "<th colspan=\"2\">STATISTICS</th>\n");
 	strcat(html, "</tr>\n");
 	strcat(html, "<tr>\n");
 	strcat(html, "<td style=\"width: 60px;text-align: right;\">RADIO RX:</td>\n");
 
 	// Convert numeric values to strings using temporary buffers
-	char temp_buffer[64];
 	snprintf(temp_buffer, sizeof(temp_buffer), "<td style=\"background: #ffffff;\">%lu</td>\n", status.rxCount);
 	strcat(html, temp_buffer);
 
@@ -941,11 +1739,10 @@ void handle_sidebar(AsyncWebServerRequest *request)
 	strcat(html, "$(window).trigger('resize');\n");
 	strcat(html, "</script>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("Sidebar", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
 }
 
 void handle_symbol(AsyncWebServerRequest *request)
@@ -1085,11 +1882,10 @@ void handle_sysinfo(AsyncWebServerRequest *request)
 	strcat(html, "</table>\n");
 
 	// request->send(200, "text/html", html); // send to someones browser when asked
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("Sysinfo", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
 }
 
 void event_lastHeard(bool gethtml)
@@ -1793,11 +2589,10 @@ void handle_storage(AsyncWebServerRequest *request)
 
 	strcat(webString, "</body>\n</html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("Sensor", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString); // Free the allocated memory
 	adcEn = 1;
 	dacEn = 0;
 }
@@ -2095,18 +2890,17 @@ void handle_radio(AsyncWebServerRequest *request)
 		config.rf_en = radioEnable;
 		// Using dynamic memory allocation instead of String
 		char *html = allocateStringMemory(64); // Small buffer for "OK"
-		if (html)
-		{
-			strcpy(html, "OK");
-			request->send(200, "text/html", html); // send to someones browser when asked
-			free(html);							   // Free the allocated memory
+			if (html)
+			{
+				strcpy(html, "OK");
+				request->send(200, "text/html", html); // send to someones browser when asked
+				free(html);							   // Free the allocated memory
+			}
+			saveConfiguration("/default.cfg", config);
+			requestRFModuleReinit();
 		}
-		saveConfiguration("/default.cfg", config);
-		delay(500);
-		RF_MODULE(false);
-	}
-	else if (request->hasArg("commitTNC"))
-	{
+		else if (request->hasArg("commitTNC"))
+		{
 		bool hpf = 0;
 		bool lpf = 0;
 		for (uint8_t i = 0; i < request->args(); i++)
@@ -2531,11 +3325,10 @@ void handle_radio(AsyncWebServerRequest *request)
 		// request->send(200, "text/html", html); // send to someones browser when asked
 		//request->send_P(200, "text/html", html);
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Sysinfo", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -2812,11 +3605,10 @@ void handle_vpn(AsyncWebServerRequest *request)
 		strcat(html, "</form>");
 
 		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("VPN", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -3164,11 +3956,10 @@ void handle_mqtt(AsyncWebServerRequest *request)
 		strcat(html, "</form>\n");
 
 		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("MQTT", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 #endif
@@ -3495,11 +4286,10 @@ void handle_msg(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table>");
 
 		// request->send(200, "text/html", html); // send to someones browser when asked
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("MSG", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -5579,12 +6369,10 @@ void handle_mod(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table>\n");
 #endif
 
-		const char* dataType = "text/html";
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("MOD", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory	
 	}
 }
 
@@ -6782,11 +7570,10 @@ void handle_system(AsyncWebServerRequest *request)
 		strcat(html, "</form><br />");
 #endif
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("System", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html);
 	}
 }
 
@@ -7764,11 +8551,10 @@ void handle_igate(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("IGATE", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -8541,11 +9327,10 @@ void handle_digi(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("digi", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -8987,11 +9772,10 @@ void handle_wx(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Weather", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -9506,11 +10290,10 @@ void handle_tlm(AsyncWebServerRequest *request)
 		strcat(html, "</td></tr></table><br />\n");
 		strcat(html, "</form><br />");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Telemetry", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -10034,11 +10817,10 @@ void handle_sensor(AsyncWebServerRequest *request)
 
 		strcat(html, "</script>\n");
 
-		AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+		AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 		response->addHeader("Sensor", "content");
 		response->addHeader("Cache-Control", "no-cache");
 		request->send(response);
-		free(html); // Free the allocated memory
 	}
 }
 
@@ -10813,11 +11595,10 @@ void handle_tracker(AsyncWebServerRequest *request)
 	strcat(html, "</td></tr></table><br />\n");
 	strcat(html, "</form><br />");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("Tracker", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory	
 }
 
 void handle_wireless(AsyncWebServerRequest *request)
@@ -11223,11 +12004,10 @@ void handle_wireless(AsyncWebServerRequest *request)
 		strcat(html, "</form>");
 #endif
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)html);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, html);
 	response->addHeader("wifi", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(html); // Free the allocated memory
 
 	}
 }
@@ -11322,6 +12102,49 @@ void handle_ws(char *Raw, size_t len, uint16_t mVrms)
 				sprintf(jsonMsg, "{\"Active\":\"0\",\"mVrms\":\"0\",\"RAW\":\"\",\"timeStamp\":\"%li\"}", timeStamp);
 			ws.textAll(jsonMsg);
 			free(jsonMsg);
+		}
+	}
+}
+
+void handle_ws_audio_samples(const float *samples, size_t len, uint16_t sampleRate)
+{
+	if (samples == nullptr || len == 0 || sampleRate == 0)
+	{
+		return;
+	}
+
+	if (ws_audio.count() < 1)
+	{
+		audioMonitorBufferLen = 0;
+		audioMonitorAccumulator = 0;
+		return;
+	}
+
+	for (size_t i = 0; i < len; i++)
+	{
+		audioMonitorAccumulator += AUDIO_MONITOR_RATE;
+		if (audioMonitorAccumulator < sampleRate)
+		{
+			continue;
+		}
+		audioMonitorAccumulator -= sampleRate;
+
+		float s = samples[i];
+		if (s > 1.0f)
+		{
+			s = 1.0f;
+		}
+		else if (s < -1.0f)
+		{
+			s = -1.0f;
+		}
+
+		const int16_t pcm = clampToInt16((int32_t)(s * 32767.0f));
+		audioMonitorBuffer[audioMonitorBufferLen++] = linearToMuLaw(pcm);
+		if (audioMonitorBufferLen >= AUDIO_MONITOR_CHUNK)
+		{
+			ws_audio.binaryAll(audioMonitorBuffer, audioMonitorBufferLen);
+			audioMonitorBufferLen = 0;
 		}
 	}
 }
@@ -11450,11 +12273,416 @@ void handle_test(AsyncWebServerRequest *request)
 
 	strcat(webString, "</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("Test", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString); // Free the allocated memory
+}
+
+void handle_audio(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	const char *audioPage = R"HTML(
+	<div style="max-width:860px;margin:auto;">
+	<table>
+	<th colspan="2"><span><b>Browser RX/TX Audio</b></span></th>
+	<tr><td align="right"><b>Status:</b></td><td align="left"><span id="audioStatus" style="color:#c0392b;font-weight:600;">Stopped</span></td></tr>
+	<tr><td align="right"><b>Listen:</b></td><td align="left">
+	<button class="button" id="audioToggleBtn" type="button">Start Listening</button>
+	<button class="button" id="audioMuteBtn" type="button">Mute</button>
+	</td></tr>
+<tr><td align="right"><b>Volume:</b></td><td align="left"><input id="audioVolume" type="range" min="0" max="100" value="70" style="width:260px;"> <span id="audioVolumeValue">70%</span></td></tr>
+<tr><td align="right"><b>Buffer:</b></td><td align="left"><span id="audioQueue">0 ms</span></td></tr>
+<tr><td align="right"><b>Level:</b></td><td align="left">
+<div style="width:300px;height:12px;border:1px solid #888;border-radius:10px;overflow:hidden;background:#f1f1f1;">
+<div id="audioLevelBar" style="height:100%;width:0%;background:linear-gradient(90deg,#2ecc71,#f1c40f,#e74c3c);transition:width .08s linear;"></div>
+	</div>
+	</td></tr>
+	<tr><td align="right"><b>Format:</b></td><td align="left"><span id="audioCodec">8kHz mu-law mono</span></td></tr>
+	<tr><td align="right"><b>Audio RX/TX:</b></td><td align="left">
+	RX <input id="audioFreqRx" type="number" min="100" max="1000" step="0.0001" style="width:120px;"> MHz
+	TX <input id="audioFreqTx" type="number" min="100" max="1000" step="0.0001" style="width:120px;"> MHz
+	<button class="button" id="audioFreqApplyBtn" type="button">Apply</button>
+	</td></tr>
+	<tr><td align="right"><b>TX Mic:</b></td><td align="left"><span id="audioMicStatus" style="font-weight:600;color:#7f8c8d;">Idle</span></td></tr>
+	</table>
+	<div style="margin-top:12px;">
+	<button id="audioPttBtn" type="button" style="width:100%;height:140px;font-size:38px;font-weight:800;border-radius:14px;border:2px solid #922;background:#c0392b;color:#fff;">HOLD TO TALK</button>
+	</div>
+	<div style="font-size:9pt;color:#555;margin-top:8px;">
+	Press and hold PTT to transmit browser microphone audio. Release to stop TX.
+	</div>
+	</div>
+	<script type="text/javascript">
+	(function(){
+  if (window.__audioMonitor && typeof window.__audioMonitor.stop === "function") {
+    window.__audioMonitor.stop();
+  }
+
+  const monitor = {
+    running: false,
+    muted: false,
+    ws: null,
+    audioCtx: null,
+    gainNode: null,
+	    procNode: null,
+	    queue: [],
+	    queueOffset: 0,
+	    queuedSamples: 0,
+	    sampleRate: 8000,
+    currentSample: 0,
+	    resampleAcc: 0,
+	    level: 0,
+	    txActive: false,
+	    micStream: null,
+	    micCtx: null,
+	    micSrc: null,
+	    micProc: null,
+	    micMute: null
+	  };
+
+  const elStatus = document.getElementById("audioStatus");
+  const elToggle = document.getElementById("audioToggleBtn");
+  const elMute = document.getElementById("audioMuteBtn");
+  const elVol = document.getElementById("audioVolume");
+  const elVolVal = document.getElementById("audioVolumeValue");
+	  const elQueue = document.getElementById("audioQueue");
+	  const elLevel = document.getElementById("audioLevelBar");
+	  const elCodec = document.getElementById("audioCodec");
+	  const elFreqRx = document.getElementById("audioFreqRx");
+	  const elFreqTx = document.getElementById("audioFreqTx");
+	  const elFreqApply = document.getElementById("audioFreqApplyBtn");
+	  const elPtt = document.getElementById("audioPttBtn");
+	  const elMic = document.getElementById("audioMicStatus");
+
+	  function setStatus(txt, color) {
+	    elStatus.textContent = txt;
+	    elStatus.style.color = color || "#2c3e50";
+	  }
+
+	  function setMicStatus(txt, color) {
+	    elMic.textContent = txt;
+	    elMic.style.color = color || "#7f8c8d";
+	  }
+
+	  function mulawToLinear(uVal) {
+	    uVal = (~uVal) & 0xFF;
+	    const sign = uVal & 0x80;
+    const exponent = (uVal >> 4) & 0x07;
+    const mantissa = uVal & 0x0F;
+    let sample = ((mantissa << 3) + 0x84) << exponent;
+	    sample -= 0x84;
+	    return sign ? -sample : sample;
+	  }
+
+	  function linearToMulaw(v) {
+	    let pcm = Math.max(-1, Math.min(1, v));
+	    pcm = (pcm * 32767) | 0;
+	    let sign = (pcm < 0) ? 0x80 : 0;
+	    if (pcm < 0) pcm = -pcm;
+	    if (pcm > 32635) pcm = 32635;
+	    pcm += 0x84;
+	    let exponent = 7;
+	    for (let expMask = 0x4000; (pcm & expMask) === 0 && exponent > 0; expMask >>= 1) {
+	      exponent--;
+	    }
+	    const mantissa = (pcm >> (exponent + 3)) & 0x0F;
+	    return (~(sign | (exponent << 4) | mantissa)) & 0xFF;
+	  }
+
+  function setVolume(vol) {
+    const gain = Math.max(0, Math.min(1, vol));
+    if (monitor.gainNode) {
+      monitor.gainNode.gain.value = monitor.muted ? 0 : gain;
+    }
+  }
+
+  function clearQueue() {
+    monitor.queue = [];
+    monitor.queueOffset = 0;
+    monitor.queuedSamples = 0;
+    monitor.currentSample = 0;
+    monitor.resampleAcc = 0;
+  }
+
+  function popQueueSample() {
+    if (monitor.queue.length === 0) {
+      return 0;
+    }
+    const chunk = monitor.queue[0];
+    const sample = chunk[monitor.queueOffset++];
+    monitor.queuedSamples--;
+    if (monitor.queueOffset >= chunk.length) {
+      monitor.queue.shift();
+      monitor.queueOffset = 0;
+    }
+    return sample;
+  }
+
+  function ensureAudioPath() {
+    if (!monitor.audioCtx) {
+      monitor.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      monitor.gainNode = monitor.audioCtx.createGain();
+      monitor.procNode = monitor.audioCtx.createScriptProcessor(1024, 1, 1);
+      monitor.procNode.onaudioprocess = function(e) {
+        const out = e.outputBuffer.getChannelData(0);
+        const outputRate = monitor.audioCtx.sampleRate;
+        for (let i = 0; i < out.length; i++) {
+          monitor.resampleAcc += monitor.sampleRate;
+          while (monitor.resampleAcc >= outputRate) {
+            monitor.currentSample = popQueueSample();
+            monitor.resampleAcc -= outputRate;
+          }
+          out[i] = monitor.currentSample;
+        }
+      };
+      monitor.procNode.connect(monitor.gainNode);
+      monitor.gainNode.connect(monitor.audioCtx.destination);
+    }
+    setVolume(parseInt(elVol.value, 10) / 100.0);
+  }
+
+	  function stop() {
+	    monitor.running = false;
+	    elToggle.textContent = "Start Listening";
+	    setStatus("Stopped", "#c0392b");
+	    monitor.txActive = false;
+	    elPtt.style.background = "#c0392b";
+	    if (monitor.ws) {
+	      if (monitor.ws.readyState === WebSocket.OPEN) {
+	        monitor.ws.send("tx_stop");
+	      }
+	      monitor.ws.onopen = null;
+	      monitor.ws.onclose = null;
+	      monitor.ws.onmessage = null;
+      monitor.ws.onerror = null;
+      monitor.ws.close();
+      monitor.ws = null;
+    }
+    clearQueue();
+    if (monitor.audioCtx && monitor.audioCtx.state !== "closed") {
+      monitor.audioCtx.suspend();
+    }
+  }
+
+	  async function start() {
+	    ensureAudioPath();
+	    await monitor.audioCtx.resume();
+    clearQueue();
+
+    const wsProto = (window.location.protocol === "https:") ? "wss://" : "ws://";
+    monitor.ws = new WebSocket(wsProto + location.host + "/ws_audio");
+    monitor.ws.binaryType = "arraybuffer";
+
+	    monitor.ws.onopen = function() {
+	      monitor.running = true;
+	      elToggle.textContent = "Stop Listening";
+	      setStatus("Connected", "#27ae60");
+	    };
+
+    monitor.ws.onclose = function() {
+      if (monitor.running) {
+        setStatus("Disconnected", "#e67e22");
+      }
+      stop();
+    };
+
+    monitor.ws.onerror = function() {
+      setStatus("Socket error", "#e74c3c");
+    };
+
+    monitor.ws.onmessage = function(event) {
+      if (typeof event.data === "string") {
+        try {
+	          const msg = JSON.parse(event.data);
+	          if (msg.type === "cfg") {
+	            monitor.sampleRate = parseInt(msg.rate || 8000, 10);
+	            elCodec.textContent = (monitor.sampleRate + "Hz " + (msg.codec || "mu-law") + " mono");
+	            if (msg.tx) elFreqTx.value = parseFloat(msg.tx).toFixed(4);
+	            if (msg.rx) elFreqRx.value = parseFloat(msg.rx).toFixed(4);
+	          } else if (msg.type === "freq" && msg.ok) {
+	            if (msg.tx) elFreqTx.value = parseFloat(msg.tx).toFixed(4);
+	            if (msg.rx) elFreqRx.value = parseFloat(msg.rx).toFixed(4);
+	          } else if (msg.type === "tx" && msg.state === "off") {
+	            monitor.txActive = false;
+	            elPtt.style.background = "#c0392b";
+	            setMicStatus("Idle", "#7f8c8d");
+	          }
+	        } catch (_) {}
+	        return;
+      }
+
+      const ulaw = new Uint8Array(event.data);
+      const pcm = new Float32Array(ulaw.length);
+      let peak = 0;
+      for (let i = 0; i < ulaw.length; i++) {
+        const s = mulawToLinear(ulaw[i]) / 32768.0;
+        pcm[i] = s;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      monitor.level = peak;
+      monitor.queue.push(pcm);
+      monitor.queuedSamples += pcm.length;
+
+      const maxSamples = monitor.sampleRate * 2; // keep <= 2 seconds queued
+      while (monitor.queuedSamples > maxSamples && monitor.queue.length > 0) {
+        monitor.queuedSamples -= monitor.queue[0].length;
+        monitor.queue.shift();
+        monitor.queueOffset = 0;
+      }
+    };
+  }
+
+	  function toggle() {
+	    if (monitor.running) {
+	      stop();
+	    } else {
+      start().catch(function() {
+        setStatus("Audio start failed", "#e74c3c");
+      });
+    }
+  }
+
+	  function toggleMute() {
+    monitor.muted = !monitor.muted;
+    elMute.textContent = monitor.muted ? "Unmute" : "Mute";
+    setVolume(parseInt(elVol.value, 10) / 100.0);
+	  }
+
+	  async function ensureMicPath() {
+	    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+	      throw new Error("mic_api_missing");
+	    }
+	    if (!monitor.micStream) {
+	      monitor.micStream = await navigator.mediaDevices.getUserMedia({
+	        audio: {
+	          echoCancellation: false,
+	          noiseSuppression: false,
+	          autoGainControl: false
+	        }
+	      });
+	      monitor.micCtx = new (window.AudioContext || window.webkitAudioContext)();
+	      monitor.micSrc = monitor.micCtx.createMediaStreamSource(monitor.micStream);
+	      monitor.micProc = monitor.micCtx.createScriptProcessor(1024, 1, 1);
+	      monitor.micMute = monitor.micCtx.createGain();
+	      monitor.micMute.gain.value = 0;
+	      monitor.micProc.onaudioprocess = function(e) {
+	        if (!monitor.txActive || !monitor.ws || monitor.ws.readyState !== WebSocket.OPEN) {
+	          return;
+	        }
+	        const input = e.inputBuffer.getChannelData(0);
+	        const inRate = monitor.micCtx.sampleRate || 48000;
+	        const step = inRate / monitor.sampleRate;
+	        const outLen = Math.max(1, Math.floor(input.length / step));
+	        const out = new Uint8Array(outLen);
+	        let src = 0;
+	        for (let i = 0; i < outLen; i++) {
+	          const idx = Math.min(input.length - 1, Math.floor(src));
+	          out[i] = linearToMulaw(input[idx] || 0);
+	          src += step;
+	        }
+	        monitor.ws.send(out.buffer);
+	      };
+	      monitor.micSrc.connect(monitor.micProc);
+	      monitor.micProc.connect(monitor.micMute);
+	      monitor.micMute.connect(monitor.micCtx.destination);
+	    }
+	    if (monitor.micCtx && monitor.micCtx.state === "suspended") {
+	      await monitor.micCtx.resume();
+	    }
+	  }
+
+	  async function startTx() {
+	    if (!monitor.running) {
+	      await start();
+	    }
+	    await ensureMicPath();
+	    if (monitor.ws && monitor.ws.readyState === WebSocket.OPEN) {
+	      monitor.ws.send("tx_start");
+	      monitor.txActive = true;
+	      elPtt.style.background = "#27ae60";
+	      setMicStatus("TX Active", "#27ae60");
+	    }
+	  }
+
+	  function stopTx() {
+	    if (monitor.ws && monitor.ws.readyState === WebSocket.OPEN) {
+	      monitor.ws.send("tx_stop");
+	    }
+	    monitor.txActive = false;
+	    elPtt.style.background = "#c0392b";
+	    setMicStatus("Idle", "#7f8c8d");
+	  }
+
+	  function applyFreq() {
+	    const tx = parseFloat(elFreqTx.value);
+	    const rx = parseFloat(elFreqRx.value);
+	    if (!Number.isFinite(tx) || !Number.isFinite(rx)) {
+	      return;
+	    }
+	    if (!monitor.ws || monitor.ws.readyState !== WebSocket.OPEN) {
+	      start().then(function() {
+	        monitor.ws.send("set_freq:" + tx.toFixed(4) + "," + rx.toFixed(4));
+	      }).catch(function(){});
+	      return;
+	    }
+	    monitor.ws.send("set_freq:" + tx.toFixed(4) + "," + rx.toFixed(4));
+	  }
+
+	  elToggle.addEventListener("click", toggle);
+	  elMute.addEventListener("click", toggleMute);
+	  elFreqApply.addEventListener("click", applyFreq);
+	  elVol.addEventListener("input", function() {
+	    elVolVal.textContent = elVol.value + "%";
+	    setVolume(parseInt(elVol.value, 10) / 100.0);
+	  });
+
+	  ["mousedown", "touchstart"].forEach(function(evt) {
+	    elPtt.addEventListener(evt, function(e) {
+	      e.preventDefault();
+	      startTx().catch(function() {
+	        setMicStatus("Mic denied/error", "#c0392b");
+	      });
+	    }, { passive: false });
+	  });
+	  ["mouseup", "mouseleave", "touchend", "touchcancel"].forEach(function(evt) {
+	    elPtt.addEventListener(evt, function(e) {
+	      e.preventDefault();
+	      stopTx();
+	    }, { passive: false });
+	  });
+
+	  setInterval(function() {
+    const qMs = monitor.sampleRate > 0 ? Math.round((monitor.queuedSamples * 1000) / monitor.sampleRate) : 0;
+    elQueue.textContent = qMs + " ms";
+    elLevel.style.width = Math.min(100, Math.round(monitor.level * 100)) + "%";
+    monitor.level *= 0.85;
+	  }, 100);
+
+	  window.__audioMonitor = { stop: stop };
+	  setMicStatus("Idle", "#7f8c8d");
+	})();
+	</script>
+	)HTML";
+
+	const size_t requiredLen = strlen(audioPage) + 1;
+	char *webString = allocateStringMemory(requiredLen + 64);
+	if (!webString)
+	{
+		request->send(500, "text/html", "Memory allocation failed");
+		return;
+	}
+	strcpy(webString, audioPage);
+
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
+	response->addHeader("Audio", "content");
+	response->addHeader("Cache-Control", "no-cache");
+	request->send(response);
 }
 
 void handle_about(AsyncWebServerRequest *request)
@@ -11753,11 +12981,10 @@ void handle_about(AsyncWebServerRequest *request)
 	#endif
 	strcat(webString, "</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("About", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 }
 
 void handle_gnss(AsyncWebServerRequest *request)
@@ -11901,11 +13128,10 @@ void handle_gnss(AsyncWebServerRequest *request)
 
 	strcat(webString, "</body></html>\n");
 
-	AsyncWebServerResponse *response = request->beginResponse(200, "text/html", (const char *)webString);
+	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
 	response->addHeader("GNSS", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
-	free(webString);
 }
 
 void handle_default()
@@ -11937,18 +13163,110 @@ void handleUpload(AsyncWebServerRequest *request, String filename, size_t index,
     }
 }
 
+static void stopAudioTxSession()
+{
+	if (audioTxPttActive)
+	{
+		audioTxPttActive = false;
+		audioTxClearBuffer();
+		webAudioPttRequest = -1;
+	}
+	audioTxOwnerId = 0;
+}
+
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
 {
 
 	if (type == WS_EVT_CONNECT)
 	{
-
 		log_d("Websocket client connection received");
+		if (server == &ws_audio)
+		{
+			char cfgMsg[160];
+			snprintf(cfgMsg, sizeof(cfgMsg), "{\"type\":\"cfg\",\"codec\":\"mulaw\",\"rate\":%u,\"tx\":%.4f,\"rx\":%.4f}", AUDIO_TX_RATE, config.freq_tx, config.freq_rx);
+			client->text(cfgMsg);
+		}
 	}
 	else if (type == WS_EVT_DISCONNECT)
 	{
-
+		if (server == &ws_audio && audioTxOwnerId == client->id())
+		{
+			stopAudioTxSession();
+		}
 		log_d("Client disconnected");
+	}
+	else if (type == WS_EVT_DATA && server == &ws_audio)
+	{
+		AwsFrameInfo *info = (AwsFrameInfo *)arg;
+		if (info && info->opcode == WS_TEXT && info->final && info->index == 0)
+		{
+			char cmd[160];
+			const size_t cmdLen = (len < (sizeof(cmd) - 1)) ? len : (sizeof(cmd) - 1);
+			memcpy(cmd, data, cmdLen);
+			cmd[cmdLen] = '\0';
+
+			if (strcmp(cmd, "ping") == 0)
+			{
+				client->text("pong");
+			}
+			else if (strcmp(cmd, "tx_start") == 0)
+			{
+				if (!config.rf_en || config.rf_type == RF_NONE)
+				{
+					client->text("{\"type\":\"tx\",\"ok\":0,\"reason\":\"rf_disabled\"}");
+				}
+				else if (audioTxOwnerId != 0 && audioTxOwnerId != client->id())
+				{
+					client->text("{\"type\":\"tx\",\"ok\":0,\"reason\":\"busy\"}");
+				}
+				else if (getTransmit() && !audioTxPttActive)
+				{
+					client->text("{\"type\":\"tx\",\"ok\":0,\"reason\":\"modem_busy\"}");
+				}
+				else
+				{
+					audioTxOwnerId = client->id();
+					audioTxClearBuffer();
+					audioTxPttActive = true;
+					webAudioPttRequest = 1;
+					client->text("{\"type\":\"tx\",\"ok\":1,\"state\":\"on\"}");
+				}
+			}
+			else if (strcmp(cmd, "tx_stop") == 0)
+			{
+				if (audioTxOwnerId == 0 || audioTxOwnerId == client->id())
+				{
+					stopAudioTxSession();
+					client->text("{\"type\":\"tx\",\"ok\":1,\"state\":\"off\"}");
+				}
+			}
+			else if (strncmp(cmd, "set_freq:", 9) == 0)
+			{
+				float txf = 0.0f;
+				float rxf = 0.0f;
+				if (sscanf(cmd + 9, "%f,%f", &txf, &rxf) == 2 && txf >= 100.0f && txf <= 1000.0f && rxf >= 100.0f && rxf <= 1000.0f)
+				{
+					config.freq_tx = txf;
+					config.freq_rx = rxf;
+					saveConfiguration("/default.cfg", config);
+					requestRFModuleReinit();
+					char ack[120];
+					snprintf(ack, sizeof(ack), "{\"type\":\"freq\",\"ok\":1,\"tx\":%.4f,\"rx\":%.4f}", config.freq_tx, config.freq_rx);
+					client->text(ack);
+				}
+				else
+				{
+					client->text("{\"type\":\"freq\",\"ok\":0,\"reason\":\"invalid\"}");
+				}
+			}
+		}
+		else if (info && info->opcode == WS_BINARY && info->final && info->index == 0)
+		{
+			if (audioTxPttActive && audioTxOwnerId == client->id())
+			{
+				audioTxPushSamples(data, len);
+			}
+		}
 	}
 }
 
@@ -11989,10 +13307,51 @@ void webService()
 		return;
 	}
 	ws.onEvent(onWsEvent);
+	ws_audio.onEvent(onWsEvent);
+	if (taskAudioTxHandle == nullptr)
+	{
+		xTaskCreatePinnedToCore(taskAudioTx, "AudioTx", 4096, nullptr, 1, &taskAudioTxHandle, 0);
+	}
 
 	// web client handlers
+	// New chat-style mobile UI lives at "/" as static files in LittleFS (data/index.html etc.).
+	// The legacy multi-tab configuration UI is now reachable at "/settings".
 	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/index.html", "text/html"); });
+	async_server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/app.js", "application/javascript"); });
+	async_server.on("/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/app.css", "text/css"); });
+	async_server.on("/manifest.webmanifest", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/manifest.webmanifest", "application/manifest+json"); });
+	async_server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ setMainPage(request); });
+
+	// JSON API for the new mobile UI
+	async_server.on("/api/me", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_me(request); });
+	async_server.on("/api/packets/recent", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_packets_recent(request); });
+	async_server.on("/api/tx/message", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_tx_message(request); });
+	async_server.on("/api/tx/position", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_tx_position(request); });
+	async_server.on("/api/identity", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_identity_set(request); });
+	async_server.on("/api/radio", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_radio_get(request); });
+	async_server.on("/api/radio", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_radio_set(request); });
+	// Register the more-specific /api/webhooks/test route BEFORE /api/webhooks
+	// because AsyncWebServer matches by prefix (url.startsWith(uri + "/"))
+	// and the first matching handler wins.
+	async_server.on("/api/webhooks/test", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_webhooks_test(request); });
+	async_server.on("/api/webhooks", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_webhooks_list(request); });
+	async_server.on("/api/webhooks", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_webhooks_save(request); });
+	async_server.addHandler(&raw_packet_events); // SSE on /api/packets/stream
 	async_server.on("/symbol", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ handle_symbol(request); });
 	// async_server.on("/symbol2", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12025,6 +13384,8 @@ void webService()
 					{ handle_tlm(request); });
 	async_server.on("/sensor", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_sensor(request); });
+	async_server.on("/audio", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ handle_audio(request); });
 	async_server.on("/system", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_system(request); });
 	async_server.on("/wireless", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12144,5 +13505,6 @@ void webService()
 	async_server.begin();
 	async_websocket.addHandler(&ws);
 	async_websocket.addHandler(&ws_gnss);
+	async_server.addHandler(&ws_audio);
 	async_websocket.begin();
 }

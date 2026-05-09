@@ -333,7 +333,13 @@ typedef struct Config_Struct
 	bool rf_pd_active = 1;
 	bool rf_pwr_active = 0;
 	bool rf_ptt_active = 0;
+#ifdef CONFIG_IDF_TARGET_ESP32
+	int8_t adc_gpio = 36;
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
 	int8_t adc_gpio = 1;
+#else
+	int8_t adc_gpio = 0;
+#endif
 	int8_t dac_gpio = 18;
 	int8_t adc_sel_gpio = -1;
 	int8_t dac_sel_gpio = 17;
@@ -489,6 +495,23 @@ typedef struct Config_Struct
 	char msg_key[33];
 	uint8_t msg_retry;
 	uint16_t msg_interval;
+
+	// Outbound webhooks for forwarding RX packets (Telegram, Discord, etc.)
+	// Up to 4 destinations.  See src/webhook.cpp for the templating syntax.
+	#define WEBHOOK_SLOTS 4
+	#define WEBHOOK_EVT_ANY      0x01
+	#define WEBHOOK_EVT_MSG_TO_ME 0x02
+	#define WEBHOOK_EVT_POSITION 0x04
+	#define WEBHOOK_EVT_STATUS   0x08
+	struct WebhookEntry {
+		bool enabled;
+		uint8_t event_mask;     // bitwise OR of WEBHOOK_EVT_*
+		char name[24];
+		char url[192];          // GET-style URL for simple webhooks (template-substituted)
+		char body_template[256];// JSON body template; empty -> default JSON
+		char filter_callsign[10];// substring filter on src callsign; empty = all
+	};
+	WebhookEntry webhooks[WEBHOOK_SLOTS];
 
 } Configuration;
 
