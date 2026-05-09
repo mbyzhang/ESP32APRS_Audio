@@ -1379,6 +1379,9 @@ void logWeather(double lat, double lon, double speed, double course)
 #ifndef DEFAULT_WIFI_AP_PASS
 #define DEFAULT_WIFI_AP_PASS "aprsthnetwork"
 #endif
+#ifndef DEFAULT_HOST_NAME
+#define DEFAULT_HOST_NAME "ESP32APRS_Audio"
+#endif
 
 static bool isHexChar(char c)
 {
@@ -2087,9 +2090,63 @@ void defaultConfig()
     config.digi_tlm_interval = 0;
     config.igate_tlm_interval = 0;
     config.wx_tlm_interval = 0;
-    sprintf(config.host_name, "ESP32APRS_Audio");
+    strlcpy(config.host_name, DEFAULT_HOST_NAME, sizeof(config.host_name));
 
     config.fx25_mode = 2; // Used modem mode FX.25 RX+TX
+}
+
+static bool applyDotenvWifiDefaults()
+{
+#ifdef DOTENV_WIFI_DEFAULTS
+    bool changed = false;
+
+    if ((config.wifi_mode & WIFI_STA_FIX) == 0)
+    {
+        config.wifi_mode |= WIFI_STA_FIX;
+        changed = true;
+    }
+    if (!config.wifi_sta[0].enable)
+    {
+        config.wifi_sta[0].enable = true;
+        changed = true;
+    }
+    if (strcmp(config.wifi_sta[0].wifi_ssid, DEFAULT_WIFI_STA_SSID) != 0)
+    {
+        strlcpy(config.wifi_sta[0].wifi_ssid, DEFAULT_WIFI_STA_SSID, sizeof(config.wifi_sta[0].wifi_ssid));
+        changed = true;
+    }
+    if (strcmp(config.wifi_sta[0].wifi_pass, DEFAULT_WIFI_STA_PASS) != 0)
+    {
+        strlcpy(config.wifi_sta[0].wifi_pass, DEFAULT_WIFI_STA_PASS, sizeof(config.wifi_sta[0].wifi_pass));
+        changed = true;
+    }
+    for (int i = 1; i < 5; i++)
+    {
+        if (config.wifi_sta[i].enable || config.wifi_sta[i].wifi_ssid[0] != 0 || config.wifi_sta[i].wifi_pass[0] != 0)
+        {
+            config.wifi_sta[i].enable = false;
+            config.wifi_sta[i].wifi_ssid[0] = 0;
+            config.wifi_sta[i].wifi_pass[0] = 0;
+            changed = true;
+        }
+    }
+    if (config.uart0_enable)
+    {
+        config.uart0_enable = false;
+        changed = true;
+    }
+    if (config.ext_tnc_enable || config.ext_tnc_channel != 0)
+    {
+        config.ext_tnc_enable = false;
+        config.ext_tnc_channel = 0;
+        changed = true;
+    }
+
+    log_i(".env WiFi STA defaults active: %s", config.wifi_sta[0].wifi_ssid);
+    return changed;
+#else
+    return false;
+#endif
 }
 
 unsigned long NTP_Timeout;
@@ -2409,6 +2466,219 @@ pkgListType getPkgList(int idx)
     return ret;
 }
 
+static void serialCopySegment(char *dst, size_t dstLen, const char *start, size_t len)
+{
+    if (dst == nullptr || dstLen == 0)
+        return;
+    if (start == nullptr)
+    {
+        dst[0] = '\0';
+        return;
+    }
+    if (len >= dstLen)
+        len = dstLen - 1;
+    memcpy(dst, start, len);
+    dst[len] = '\0';
+}
+
+static void serialTrimTrailingSpaces(char *value)
+{
+    if (value == nullptr)
+        return;
+    size_t len = strlen(value);
+    while (len > 0 && value[len - 1] == ' ')
+        value[--len] = '\0';
+}
+
+static void serialSplitTnc2(const char *raw, char *from, size_t fromLen, char *to, size_t toLen, char *path, size_t pathLen, char *info, size_t infoLen)
+{
+    if (from && fromLen)
+        from[0] = '\0';
+    if (to && toLen)
+        to[0] = '\0';
+    if (path && pathLen)
+        path[0] = '\0';
+    if (info && infoLen)
+        info[0] = '\0';
+    if (raw == nullptr)
+        return;
+
+    const char *gt = strchr(raw, '>');
+    const char *colon = strchr(raw, ':');
+    if (gt == nullptr || colon == nullptr || gt > colon)
+    {
+        serialCopySegment(info, infoLen, raw, strlen(raw));
+        return;
+    }
+
+    serialCopySegment(from, fromLen, raw, gt - raw);
+    const char *dstStart = gt + 1;
+    const char *comma = (const char *)memchr(dstStart, ',', colon - dstStart);
+    const char *dstEnd = comma ? comma : colon;
+    serialCopySegment(to, toLen, dstStart, dstEnd - dstStart);
+    if (comma != nullptr && comma + 1 < colon)
+        serialCopySegment(path, pathLen, comma + 1, colon - comma - 1);
+    serialCopySegment(info, infoLen, colon + 1, strcspn(colon + 1, "\r\n"));
+}
+
+static const char *serialAprsInfoType(const char *info)
+{
+    if (info == nullptr || info[0] == '\0')
+        return "packet";
+    switch (info[0])
+    {
+    case ':':
+        return "message";
+    case '!':
+    case '=':
+    case '/':
+    case '@':
+    case '\'':
+    case '`':
+    case '$':
+        return "position";
+    case ';':
+        return "object";
+    case ')':
+        return "item";
+    case '>':
+        return "status";
+    case '_':
+    case '#':
+    case '*':
+        return "weather";
+    case 'T':
+        return "telemetry";
+    case '?':
+        return "query";
+    case '}':
+        return "third-party";
+    default:
+        return "packet";
+    }
+}
+
+static bool serialParseAprsPosition(const char *raw, double &lat, double &lon)
+{
+    if (raw == nullptr || raw[0] == '\0')
+        return false;
+
+    struct pbuf_t aprs;
+    memset(&aprs, 0, sizeof(aprs));
+    size_t rawLen = strcspn(raw, "\r\n");
+    if (rawLen == 0)
+        return false;
+    if (rawLen >= sizeof(aprs.data))
+        rawLen = sizeof(aprs.data) - 1;
+
+    memcpy(aprs.data, raw, rawLen);
+    aprs.data[rawLen] = '\0';
+    aprs.packet_len = rawLen;
+    aprs.buf_len = sizeof(aprs.data);
+
+    char *gt = strchr(aprs.data, '>');
+    char *colon = strchr(aprs.data, ':');
+    if (gt == nullptr || colon == nullptr || gt > colon)
+        return false;
+
+    char *dstStart = gt + 1;
+    char *comma = (char *)memchr(dstStart, ',', colon - dstStart);
+    char *dstEnd = comma ? comma : colon;
+    char *dash = (char *)memchr(dstStart, '-', dstEnd - dstStart);
+    aprs.srccall_end = gt;
+    aprs.dstname = dstStart;
+    aprs.dstname_len = dstEnd - dstStart;
+    aprs.dstcall_len = dstEnd - dstStart;
+    aprs.dstcall_end = dstEnd;
+    aprs.dstcall_end_or_ssid = dash ? dash : dstEnd;
+    aprs.info_start = colon + 1;
+
+    ParseAPRS parser;
+    if (!parser.parse_aprs(&aprs) || !(aprs.flags & F_HASPOS))
+        return false;
+
+    lat = aprs.lat;
+    lon = aprs.lng;
+    return true;
+}
+
+static void serialPrintEscapedValue(const char *value)
+{
+    if (value == nullptr)
+        return;
+    for (const char *p = value; *p != '\0'; ++p)
+    {
+        const unsigned char c = (unsigned char)*p;
+        if (c == '\\' || c == '"')
+        {
+            Serial.write('\\');
+            Serial.write(c);
+        }
+        else if (c >= 0x20 && c <= 0x7e)
+        {
+            Serial.write(c);
+        }
+        else if (c == '\r')
+        {
+            Serial.print("\\r");
+        }
+        else if (c == '\n')
+        {
+            Serial.print("\\n");
+        }
+        else
+        {
+            Serial.printf("\\x%02X", c);
+        }
+    }
+}
+
+static void serialPrintDecodedAprs(const char *raw, bool channel, uint16_t audioLvl)
+{
+    if (raw == nullptr || raw[0] == '\0')
+        return;
+
+    char from[16];
+    char to[16];
+    char path[160];
+    char info[260];
+    char target[16] = "";
+    char text[260] = "";
+    double lat = 0.0;
+    double lon = 0.0;
+    const bool hasPosition = serialParseAprsPosition(raw, lat, lon);
+
+    serialSplitTnc2(raw, from, sizeof(from), to, sizeof(to), path, sizeof(path), info, sizeof(info));
+    if (info[0] == ':' && strlen(info) > 10 && info[10] == ':')
+    {
+        serialCopySegment(target, sizeof(target), info + 1, 9);
+        serialTrimTrailingSpaces(target);
+        serialCopySegment(text, sizeof(text), info + 11, strlen(info + 11));
+    }
+    else
+    {
+        serialCopySegment(text, sizeof(text), info, strlen(info));
+    }
+
+    Serial.printf("APRS_RX source=%s type=%s from=%s to=%s", channel ? "INET" : "RF", serialAprsInfoType(info), from[0] ? from : "-", to[0] ? to : "-");
+    if (path[0] != '\0')
+        Serial.printf(" path=%s", path);
+    if (target[0] != '\0')
+        Serial.printf(" target=%s", target);
+    if (hasPosition)
+        Serial.printf(" lat=%.6f lon=%.6f", lat, lon);
+    if (audioLvl > 0)
+    {
+        const double vrms = (double)audioLvl / 1000.0;
+        Serial.printf(" audio=%.1fdBV", 20.0F * log10(vrms));
+    }
+    Serial.print(" text=\"");
+    serialPrintEscapedValue(text);
+    Serial.print("\" raw=\"");
+    serialPrintEscapedValue(raw);
+    Serial.println("\"");
+}
+
 int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t audioLvl)
 {
     size_t len;
@@ -2600,6 +2870,8 @@ int pkgListUpdate(char *call, char *raw, uint16_t type, bool channel, uint16_t a
     psramUnlock();
     lastHeard_Flag = true;
     lastHeardTimeout = millis() + 1000;
+    serialPrintDecodedAprs(raw, channel, channel ? 0 : audioLvl);
+    event_aprsTraffic(raw, channel ? "INET" : "RF", channel ? 0 : audioLvl);
     return i;
 }
 
@@ -2674,6 +2946,7 @@ bool pkgTxPush(const char *info, size_t len, int dly, uint8_t Ch)
     //   }
     // }
 
+    bool queued = false;
     // Add
     for (int i = 0; i < PKGTXSIZE; i++)
     {
@@ -2688,11 +2961,14 @@ bool pkgTxPush(const char *info, size_t len, int dly, uint8_t Ch)
             txQueue[i].Active = true;
             txQueue[i].timeStamp = millis();
             txQueue[i].Channel = Ch;
+            queued = true;
             break;
         }
     }
     psramUnlock();
-    return true;
+    if (queued)
+        event_aprsTraffic(info, "TX", 0);
+    return queued;
 }
 
 bool pkgTxSend()
@@ -3383,6 +3659,12 @@ void setup()
         {
             saveConfiguration("/default.cfg", config);
         }
+    }
+
+    if (applyDotenvWifiDefaults())
+    {
+        log_i("Applied .env WiFi STA defaults and saved /default.cfg");
+        saveConfiguration("/default.cfg", config);
     }
 
     //setCpuFrequencyMhz(config.cpuFreq);
@@ -7724,6 +8006,72 @@ uint16_t wifiDisCount = 0;
 unsigned long vpnTimeout = 0;
 unsigned long mitiWifiTimeout = 0;
 
+static void buildSanitizedHostname(char *out, size_t outLen)
+{
+    if (out == nullptr || outLen == 0)
+    {
+        return;
+    }
+
+    size_t pos = 0;
+    const char *src = config.host_name;
+    if (src == nullptr || src[0] == '\0')
+    {
+        src = "esp32aprs-audio";
+    }
+
+    for (size_t i = 0; src[i] != '\0' && pos < (outLen - 1); ++i)
+    {
+        char c = src[i];
+        if (c >= 'A' && c <= 'Z')
+        {
+            c = (char)(c - 'A' + 'a');
+        }
+
+        const bool isAlphaNum = ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'));
+        const bool isDashLike = (c == '-' || c == '_' || c == '.' || c == ' ');
+        if (isAlphaNum)
+        {
+            out[pos++] = c;
+        }
+        else if (isDashLike)
+        {
+            if (pos > 0 && out[pos - 1] != '-')
+            {
+                out[pos++] = '-';
+            }
+        }
+    }
+
+    while (pos > 0 && out[pos - 1] == '-')
+    {
+        pos--;
+    }
+    out[pos] = '\0';
+
+    if (pos == 0)
+    {
+        strlcpy(out, "esp32aprs-audio", outLen);
+    }
+}
+
+static void applyHostnameToWifiInterfaces()
+{
+    char host[32];
+    buildSanitizedHostname(host, sizeof(host));
+    WiFi.setHostname(host);
+    WiFi.softAPsetHostname(host);
+}
+
+static void serialPrintStaIp()
+{
+    if (!WiFi.isConnected())
+        return;
+    IPAddress staIp = WiFi.localIP();
+    Serial.printf("ESP32APRS_STA_IP=%s\n", staIp.toString().c_str());
+    Serial.printf("ESP32APRS_WEB_URL=http://%s/\n", staIp.toString().c_str());
+}
+
 void wifiConnection()
 {
     WiFi.disconnect(true, true, 500);
@@ -7760,9 +8108,10 @@ void wifiConnection()
         }
     }
     esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    WiFi.setHostname(config.host_name);
+    applyHostnameToWifiInterfaces();
     if (wifiMulti.run(10000) == WL_CONNECTED)
     {
+        serialPrintStaIp();
         wifiDisCount = 0;
         pingTimeout = millis() + 60000;
         NTP_Timeout = millis() + 2000;
@@ -7884,6 +8233,16 @@ void onEvent(arduino_event_id_t event, arduino_event_info_t info)
 #endif
         log_d("WiFi Connected");
         break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+    {
+        wifiDisCount = 0;
+        wifiDisconnecting = false;
+        IPAddress staIp(info.got_ip.ip_info.ip.addr);
+        serialPrintStaIp();
+        log_i("ESP32APRS_STA_IP=%s", staIp.toString().c_str());
+        log_i("ESP32APRS_WEB_URL=http://%s/", staIp.toString().c_str());
+        break;
+    }
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         log_d("WiFi Disconnected");
         wifiDisCount++;
@@ -8077,6 +8436,7 @@ void taskNetwork(void *pvParameters)
     {
         WiFi.mode(WIFI_MODE_NULL);
     }
+    applyHostnameToWifiInterfaces();
 
     if (config.wifi_mode & WIFI_STA_FIX)
     {
@@ -8116,6 +8476,7 @@ void taskNetwork(void *pvParameters)
 
     pingTimeout = millis() + 10000;
     unsigned long timeNetworkOld = millis();
+    unsigned long serialIpAnnounceTimeout = 0;
     timeNetwork = 0;
 
 #ifdef PPPOS
@@ -8162,6 +8523,11 @@ void taskNetwork(void *pvParameters)
         timerNetwork = micros() - timerNetwork_old;
         vTaskDelay(10 / portTICK_PERIOD_MS);
         timerNetwork_old = micros();
+        if (WiFi.isConnected() && millis() > serialIpAnnounceTimeout)
+        {
+            serialIpAnnounceTimeout = millis() + 10000;
+            serialPrintStaIp();
+        }
 
 #ifdef PPPOS
         if (config.ppp_enable)
@@ -8333,6 +8699,7 @@ void taskNetwork(void *pvParameters)
                             igateTLM.RX++;
 
                             log_d("INET: %s\n", line.c_str());
+                            event_aprsTraffic(line.c_str(), "INET", 0);
                             start_val = line.indexOf(":", 10); // Search of info in ax25
                             if (start_val > 5)
                             {

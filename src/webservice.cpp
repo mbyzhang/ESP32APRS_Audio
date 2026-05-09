@@ -158,6 +158,7 @@ extern pppType pppStatus;
 // Create an Event Source on /events
 AsyncEventSource lastheard_events("/eventHeard");
 AsyncEventSource message_events("/eventMsg");
+AsyncEventSource traffic_events("/eventTraffic");
 
 char *webString;
 
@@ -368,6 +369,499 @@ void handle_logout(AsyncWebServerRequest *request)
 	free(webString); // Free the allocated memory
 }
 
+static void boundedAppend(char *dst, size_t dstLen, const char *src)
+{
+	if (dst == nullptr || src == nullptr || dstLen == 0)
+		return;
+
+	size_t used = strlen(dst);
+	if (used >= dstLen - 1)
+		return;
+
+	size_t remaining = dstLen - used - 1;
+	strncat(dst, src, remaining);
+}
+
+static void copySegment(char *dst, size_t dstLen, const char *start, size_t len)
+{
+	if (dst == nullptr || dstLen == 0)
+		return;
+
+	if (start == nullptr)
+	{
+		dst[0] = '\0';
+		return;
+	}
+
+	if (len >= dstLen)
+		len = dstLen - 1;
+	memcpy(dst, start, len);
+	dst[len] = '\0';
+}
+
+static void trimTrailingSpace(char *value)
+{
+	if (value == nullptr)
+		return;
+
+	size_t len = strlen(value);
+	while (len > 0 && value[len - 1] == ' ')
+	{
+		value[--len] = '\0';
+	}
+}
+
+static void appendJsonString(char *dst, size_t dstLen, const char *value)
+{
+	boundedAppend(dst, dstLen, "\"");
+	if (value != nullptr)
+	{
+		for (const char *p = value; *p != '\0'; ++p)
+		{
+			char tmp[8];
+			const unsigned char c = (unsigned char)*p;
+			if (c == '"' || c == '\\')
+			{
+				tmp[0] = '\\';
+				tmp[1] = (char)c;
+				tmp[2] = '\0';
+				boundedAppend(dst, dstLen, tmp);
+			}
+			else if (c == '\n')
+			{
+				boundedAppend(dst, dstLen, "\\n");
+			}
+			else if (c == '\r')
+			{
+				boundedAppend(dst, dstLen, "\\r");
+			}
+			else if (c == '\t')
+			{
+				boundedAppend(dst, dstLen, "\\t");
+			}
+			else if (c < 0x20)
+			{
+				snprintf(tmp, sizeof(tmp), "\\u%04x", c);
+				boundedAppend(dst, dstLen, tmp);
+			}
+			else
+			{
+				tmp[0] = (char)c;
+				tmp[1] = '\0';
+				boundedAppend(dst, dstLen, tmp);
+			}
+		}
+	}
+	boundedAppend(dst, dstLen, "\"");
+}
+
+static void appendJsonField(char *dst, size_t dstLen, const char *name, const char *value)
+{
+	boundedAppend(dst, dstLen, "\"");
+	boundedAppend(dst, dstLen, name);
+	boundedAppend(dst, dstLen, "\":");
+	appendJsonString(dst, dstLen, value);
+}
+
+static const char *aprsTrafficType(const char *info)
+{
+	if (info == nullptr || info[0] == '\0')
+		return "packet";
+
+	switch (info[0])
+	{
+	case ':':
+		return "message";
+	case '!':
+	case '=':
+	case '/':
+	case '@':
+	case '\'':
+	case '`':
+	case '$':
+		return "position";
+	case ';':
+		return "object";
+	case ')':
+		return "item";
+	case '>':
+		return "status";
+	case '_':
+	case '#':
+	case '*':
+		return "weather";
+	case 'T':
+		return "telemetry";
+	case '?':
+		return "query";
+	case '}':
+		return "third-party";
+	default:
+		return "packet";
+	}
+}
+
+static void splitTnc2(const char *raw, char *from, size_t fromLen, char *to, size_t toLen, char *path, size_t pathLen, char *info, size_t infoLen)
+{
+	if (from && fromLen)
+		from[0] = '\0';
+	if (to && toLen)
+		to[0] = '\0';
+	if (path && pathLen)
+		path[0] = '\0';
+	if (info && infoLen)
+		info[0] = '\0';
+	if (raw == nullptr)
+		return;
+
+	const char *gt = strchr(raw, '>');
+	const char *colon = strchr(raw, ':');
+	if (gt == nullptr || colon == nullptr || gt > colon)
+	{
+		copySegment(info, infoLen, raw, strlen(raw));
+		return;
+	}
+
+	copySegment(from, fromLen, raw, gt - raw);
+
+	const char *dstStart = gt + 1;
+	const char *comma = (const char *)memchr(dstStart, ',', colon - dstStart);
+	const char *dstEnd = comma ? comma : colon;
+	copySegment(to, toLen, dstStart, dstEnd - dstStart);
+
+	if (comma != nullptr && comma + 1 < colon)
+		copySegment(path, pathLen, comma + 1, colon - comma - 1);
+
+	const char *infoStart = colon + 1;
+	size_t infoSize = strcspn(infoStart, "\r\n");
+	copySegment(info, infoLen, infoStart, infoSize);
+}
+
+static bool parseAprsTrafficPosition(const char *raw, double &lat, double &lon)
+{
+	if (raw == nullptr || raw[0] == '\0')
+		return false;
+
+	struct pbuf_t aprs;
+	memset(&aprs, 0, sizeof(aprs));
+
+	size_t rawLen = strcspn(raw, "\r\n");
+	if (rawLen == 0)
+		return false;
+	if (rawLen >= sizeof(aprs.data))
+		rawLen = sizeof(aprs.data) - 1;
+
+	memcpy(aprs.data, raw, rawLen);
+	aprs.data[rawLen] = '\0';
+	aprs.packet_len = rawLen;
+	aprs.buf_len = sizeof(aprs.data);
+
+	char *gt = strchr(aprs.data, '>');
+	char *colon = strchr(aprs.data, ':');
+	if (gt == nullptr || colon == nullptr || gt > colon)
+		return false;
+
+	char *dstStart = gt + 1;
+	char *comma = (char *)memchr(dstStart, ',', colon - dstStart);
+	char *dstEnd = comma ? comma : colon;
+	char *dash = (char *)memchr(dstStart, '-', dstEnd - dstStart);
+
+	aprs.srccall_end = gt;
+	aprs.dstname = dstStart;
+	aprs.dstname_len = dstEnd - dstStart;
+	aprs.dstcall_len = dstEnd - dstStart;
+	aprs.dstcall_end = dstEnd;
+	aprs.dstcall_end_or_ssid = dash ? dash : dstEnd;
+	aprs.info_start = colon + 1;
+
+	ParseAPRS parser;
+	if (!parser.parse_aprs(&aprs))
+		return false;
+	if (!(aprs.flags & F_HASPOS))
+		return false;
+
+	lat = aprs.lat;
+	lon = aprs.lng;
+	return true;
+}
+
+static void extractAprsMessageTarget(const char *info, char *target, size_t targetLen, char *body, size_t bodyLen)
+{
+	if (target && targetLen)
+		target[0] = '\0';
+	if (body && bodyLen)
+		body[0] = '\0';
+	if (info == nullptr)
+		return;
+
+	if (info[0] == ':' && strlen(info) > 10 && info[10] == ':')
+	{
+		copySegment(target, targetLen, info + 1, 9);
+		trimTrailingSpace(target);
+		copySegment(body, bodyLen, info + 11, strlen(info + 11));
+	}
+	else
+	{
+		copySegment(body, bodyLen, info, strlen(info));
+	}
+}
+
+static bool buildAprsTrafficJson(char *json, size_t jsonLen, const char *raw, const char *source, uint16_t audioLvl, time_t timestamp)
+{
+	if (json == nullptr || jsonLen == 0 || raw == nullptr || raw[0] == '\0')
+		return false;
+
+	char from[16];
+	char to[16];
+	char path[160];
+	char info[260];
+	char target[16];
+	char body[260];
+	double lat = 0.0;
+	double lon = 0.0;
+	bool hasPosition = false;
+	char tmp[96];
+
+	splitTnc2(raw, from, sizeof(from), to, sizeof(to), path, sizeof(path), info, sizeof(info));
+	extractAprsMessageTarget(info, target, sizeof(target), body, sizeof(body));
+	hasPosition = parseAprsTrafficPosition(raw, lat, lon);
+
+	json[0] = '\0';
+	snprintf(tmp, sizeof(tmp), "{\"ts\":%lu,", (unsigned long)timestamp);
+	boundedAppend(json, jsonLen, tmp);
+	appendJsonField(json, jsonLen, "source", source ? source : "");
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "type", aprsTrafficType(info));
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "from", from);
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "to", to);
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "path", path);
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "target", target);
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "body", body);
+	boundedAppend(json, jsonLen, ",");
+	appendJsonField(json, jsonLen, "raw", raw);
+
+	if (hasPosition)
+	{
+		snprintf(tmp, sizeof(tmp), ",\"lat\":%.6f,\"lon\":%.6f", lat, lon);
+		boundedAppend(json, jsonLen, tmp);
+	}
+
+	if (audioLvl > 0)
+	{
+		const double vrms = (double)audioLvl / 1000.0;
+		const double audioDbv = 20.0F * log10(vrms);
+		snprintf(tmp, sizeof(tmp), ",\"audio\":%.1f", audioDbv);
+		boundedAppend(json, jsonLen, tmp);
+	}
+
+	boundedAppend(json, jsonLen, "}");
+	return true;
+}
+
+static String event_aprsTrafficHistory()
+{
+	char *html = allocateStringMemory(16384);
+	if (html == nullptr)
+		return String("[]");
+
+	html[0] = '\0';
+	boundedAppend(html, 16384, "[");
+	bool hasEntry = false;
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		pkgListType pkg = getPkgList(i);
+		if (pkg.time <= 0 || pkg.raw == nullptr || pkg.raw[0] == '\0')
+			continue;
+
+		char obj[1024];
+		if (!buildAprsTrafficJson(obj, sizeof(obj), pkg.raw, pkg.channel ? "INET" : "RF", pkg.audio_level, pkg.time))
+			continue;
+
+		if (strlen(html) + strlen(obj) + 4 >= 16384)
+			break;
+
+		if (hasEntry)
+			boundedAppend(html, 16384, ",");
+		boundedAppend(html, 16384, obj);
+		hasEntry = true;
+	}
+	boundedAppend(html, 16384, "]");
+
+	String result(html);
+	free(html);
+	return result;
+}
+
+void event_aprsTraffic(const char *raw, const char *source, uint16_t audioLvl)
+{
+	if (raw == nullptr || raw[0] == '\0' || traffic_events.count() == 0)
+		return;
+
+	char *json = allocateStringMemory(1280);
+	if (json == nullptr)
+		return;
+
+	if (buildAprsTrafficJson(json, 1280, raw, source, audioLvl, time(NULL)))
+	{
+		traffic_events.send(json, "aprsTraffic", time(NULL), 1000);
+	}
+	free(json);
+}
+
+static const char *browserLocationCallsign()
+{
+	if (strlen(config.trk_mycall) > 0 && strcmp(config.trk_mycall, "NOCALL") != 0)
+		return config.trk_mycall;
+	if (strlen(config.msg_mycall) > 0 && strcmp(config.msg_mycall, "NOCALL") != 0)
+		return config.msg_mycall;
+	if (strlen(config.aprs_mycall) > 0 && strcmp(config.aprs_mycall, "NOCALL") != 0)
+		return config.aprs_mycall;
+	return nullptr;
+}
+
+static void sanitizeAprsComment(const String &input, char *out, size_t outLen)
+{
+	if (out == nullptr || outLen == 0)
+		return;
+
+	size_t pos = 0;
+	for (size_t i = 0; i < input.length() && pos < outLen - 1; ++i)
+	{
+		char c = input.charAt(i);
+		if (c >= 0x20 && c <= 0x7e)
+			out[pos++] = c;
+	}
+	out[pos] = '\0';
+}
+
+static bool buildBrowserLocationPacket(double lat, double lon, double alt, double speedKmh, double courseDeg, const char *comment, char *packet, size_t packetLen)
+{
+	if (packet == nullptr || packetLen == 0)
+		return false;
+
+	const char *mycall = browserLocationCallsign();
+	if (mycall == nullptr)
+		return false;
+
+	int latDD, latMM, latSS, lonDD, lonMM, lonSS;
+	DD_DDDDDtoDDMMSS(lat, &latDD, &latMM, &latSS);
+	DD_DDDDDtoDDMMSS(lon, &lonDD, &lonMM, &lonSS);
+
+	const char latNS = lat < 0 ? 'S' : 'N';
+	const char lonEW = lon < 0 ? 'W' : 'E';
+	const char table = config.trk_symbol[0] ? config.trk_symbol[0] : '/';
+	const char symbol = config.trk_symbol[1] ? config.trk_symbol[1] : '>';
+	const int course = (courseDeg >= 0 && courseDeg <= 360) ? (int)(courseDeg + 0.5) : 0;
+	const int speedKnots = speedKmh > 0 ? (int)((speedKmh * 0.5399568) + 0.5) : 0;
+	const int altitudeFeet = alt > 0 ? (int)((alt * 3.28084) + 0.5) : 0;
+
+	char header[96];
+	if (config.trk_ssid > 0)
+		snprintf(header, sizeof(header), "%s-%d>APE32A", mycall, config.trk_ssid);
+	else
+		snprintf(header, sizeof(header), "%s>APE32A", mycall);
+
+	if (config.trk_path < 5)
+	{
+		if (config.trk_path > 0)
+		{
+			char suffix[8];
+			snprintf(suffix, sizeof(suffix), "-%d", config.trk_path);
+			boundedAppend(header, sizeof(header), suffix);
+		}
+	}
+	else
+	{
+		boundedAppend(header, sizeof(header), ",");
+		boundedAppend(header, sizeof(header), getPath(config.trk_path).c_str());
+	}
+
+	char location[180];
+	snprintf(location, sizeof(location), "!%02d%02d.%02d%c%c%03d%02d.%02d%c%c%03d/%03d",
+			 latDD, latMM, latSS, latNS, table, lonDD, lonMM, lonSS, lonEW, symbol, course, speedKnots);
+	if (altitudeFeet > 0)
+	{
+		char altText[16];
+		snprintf(altText, sizeof(altText), "/A=%06d", altitudeFeet);
+		boundedAppend(location, sizeof(location), altText);
+	}
+	if (comment != nullptr && comment[0] != '\0')
+	{
+		boundedAppend(location, sizeof(location), " ");
+		boundedAppend(location, sizeof(location), comment);
+	}
+
+	snprintf(packet, packetLen, "%s:%s", header, location);
+	return true;
+}
+
+void handle_browser_location(AsyncWebServerRequest *request)
+{
+	if (!request->authenticate(config.http_username, config.http_password))
+	{
+		return request->requestAuthentication();
+	}
+
+	if (!request->hasArg("lat") || !request->hasArg("lon") || !isValidNumber(request->arg("lat")) || !isValidNumber(request->arg("lon")))
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid-location\"}");
+		return;
+	}
+
+	const double lat = atof(request->arg("lat").c_str());
+	const double lon = atof(request->arg("lon").c_str());
+	const double alt = request->hasArg("alt") && isValidNumber(request->arg("alt")) ? atof(request->arg("alt").c_str()) : 0.0;
+	const double speed = request->hasArg("speed") && isValidNumber(request->arg("speed")) ? atof(request->arg("speed").c_str()) : 0.0;
+	const double course = request->hasArg("course") && isValidNumber(request->arg("course")) ? atof(request->arg("course").c_str()) : 0.0;
+
+	if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"error\":\"invalid-range\"}");
+		return;
+	}
+
+	char comment[80];
+	if (request->hasArg("comment"))
+		sanitizeAprsComment(request->arg("comment"), comment, sizeof(comment));
+	else
+		strlcpy(comment, "Browser GPS", sizeof(comment));
+
+	char packet[300];
+	if (!buildBrowserLocationPacket(lat, lon, alt, speed, course, comment, packet, sizeof(packet)))
+	{
+		request->send(409, "application/json", "{\"ok\":false,\"error\":\"set-callsign\"}");
+		return;
+	}
+
+	bool sendRf = request->hasArg("rf") ? request->arg("rf") == "1" : config.trk_loc2rf;
+	bool sendInet = request->hasArg("inet") ? request->arg("inet") == "1" : config.trk_loc2inet;
+	if (!sendRf && !sendInet)
+	{
+		sendRf = config.msg_rf;
+		sendInet = config.msg_inet;
+	}
+
+	uint8_t sendMode = 0;
+	if (sendRf)
+		sendMode |= RF_CHANNEL;
+	if (sendInet)
+		sendMode |= INET_CHANNEL;
+
+	if (sendMode == 0)
+	{
+		request->send(409, "application/json", "{\"ok\":false,\"error\":\"no-channel\"}");
+		return;
+	}
+
+	pkgTxPush(packet, strlen(packet), 0, sendMode);
+	request->send(200, "application/json", "{\"ok\":true}");
+}
+
 void setMainPage(AsyncWebServerRequest *request)
 {
 	if (!request->authenticate(config.http_username, config.http_password))
@@ -375,26 +869,25 @@ void setMainPage(AsyncWebServerRequest *request)
 		return request->requestAuthentication();
 	}
 
-	// Using dynamic memory allocation instead of String
-	char *webString = allocateStringMemory(12000); // Initial buffer size, adjust as needed
+	static constexpr size_t MAIN_PAGE_HTML_CAPACITY = 52000;
+	char *webString = allocateStringMemory(MAIN_PAGE_HTML_CAPACITY);
 	if (!webString)
 	{
-		return; // Memory allocation failed
+		log_e("Main page allocation failed (%u bytes)", static_cast<unsigned>(MAIN_PAGE_HTML_CAPACITY));
+		request->send(500, "text/plain", "Main page allocation failed");
+		return;
 	}
 
 	strcpy(webString, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
-	strcat(webString, "<meta name=\"robots\" content=\"index\" />\n");
-	strcat(webString, "<meta name=\"robots\" content=\"follow\" />\n");
 	strcat(webString, "<meta name=\"language\" content=\"English\" />\n");
 	strcat(webString, "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />\n");
-	strcat(webString, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n");
+	strcat(webString, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\" />\n");
 	strcat(webString, "<meta name=\"GENERATOR\" content=\"configure 20230924\" />\n");
 	strcat(webString, "<meta name=\"Author\" content=\"Mr.Somkiat Nakhonthai (HS5TQA)\" />\n");
-	strcat(webString, "<meta name=\"Description\" content=\"Web Embedded Configuration\" />\n");
+	strcat(webString, "<meta name=\"Description\" content=\"APRS Web UI\" />\n");
 	strcat(webString, "<meta name=\"KeyWords\" content=\"ESP32,ESP32C3,AFSK,APRS\" />\n");
 	strcat(webString, "<meta http-equiv=\"Cache-Control\" content=\"no-cache, no-store, must-revalidate\" />\n");
 	strcat(webString, "<meta http-equiv=\"pragma\" content=\"no-cache\" />\n");
-	strcat(webString, "<link rel=\"shortcut icon\" href=\"http://aprs.dprns.com/favicon.ico\" type=\"image/x-icon\" />\n");
 	strcat(webString, "<meta http-equiv=\"Expires\" content=\"0\" />\n");
 
 	char temp_buffer[512];
@@ -411,163 +904,256 @@ void setMainPage(AsyncWebServerRequest *request)
 	strcat(webString, "<link rel=\"stylesheet\" type=\"text/css\" href=\"/style.css\" />\n");
 	strcat(webString, "<script src=\"/jquery-3.7.1.js\"></script>\n");
 	strcat(webString, "<script type=\"text/javascript\">\n");
-	strcat(webString, "function selectTab(evt, tabName) {\n");
-	strcat(webString, "var i, tabcontent, tablinks;\n");
-	strcat(webString, "tablinks = document.getElementsByClassName(\"nav-tabs\");\n");
-	strcat(webString, "for (i = 0; i < tablinks.length; i++) {\n");
-	strcat(webString, "tablinks[i].className = tablinks[i].className.replace(\" active\", \"\");\n");
-	strcat(webString, "}\n");
-	strcat(webString, "\n");
-	strcat(webString, "//document.getElementById(tabName).style.display = \"block\";\n");
-	strcat(webString, "if (tabName == 'DashBoard') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/dashboard\");\n");
-	strcat(webString, "} else if (tabName == 'Radio') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/radio\");\n");
-	strcat(webString, "} else if (tabName == 'IGATE') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/igate\");\n");
-	strcat(webString, "} else if (tabName == 'DIGI') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/digi\");\n");
-	strcat(webString, "} else if (tabName == 'TRACKER') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/tracker\");\n");
-	strcat(webString, "} else if (tabName == 'WX') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/wx\");\n");
-	strcat(webString, "} else if (tabName == 'TLM') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/tlm\");\n");
-	strcat(webString, "} else if (tabName == 'SENSOR') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/sensor\");\n");
-	strcat(webString, "} else if (tabName == 'Audio') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/audio\");\n");
-	strcat(webString, "} else if (tabName == 'VPN') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/vpn\");\n");
+	strcat(webString, R"APRSJS(
+let settingsLoaded=false;
+let db=null;
+let eventSource=null;
+let autoWatchId=null;
+let lastAutoFix=null;
+const recentKeys={};
+const trackCache={};
+
+function el(id){return document.getElementById(id);}
+function setStatus(text){const node=el('linkState'); if(node) node.textContent=text;}
+function fmtTime(ts){const d=ts?new Date(ts*1000):new Date(); return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});}
+function escapeHtml(v){return String(v||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function packetKey(pkt){return (pkt.source||'')+'|'+(pkt.raw||'');}
+function isDuplicate(pkt){const key=packetKey(pkt); const now=Date.now(); if(recentKeys[key] && now-recentKeys[key]<5000) return true; recentKeys[key]=now; return false;}
+
+function showSegment(name){
+  const channel=name==='channel';
+  el('channelView').hidden=!channel;
+  el('settingsView').hidden=channel;
+  el('segChannel').classList.toggle('active', channel);
+  el('segSettings').classList.toggle('active', !channel);
+  if(!channel && !settingsLoaded){settingsLoaded=true; selectTab(null,'DashBoard');}
+}
+
+function selectTab(evt, tabName){
+  const routes={DashBoard:'/dashboard',Radio:'/radio',IGATE:'/igate',DIGI:'/digi',TRACKER:'/tracker',WX:'/wx',TLM:'/tlm',SENSOR:'/sensor',Audio:'/audio',VPN:'/vpn',
+)APRSJS");
 #ifdef MQTT
-	strcat(webString, "} else if (tabName == 'MQTT') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/mqtt\");\n");
+	strcat(webString, "MQTT:'/mqtt',");
 #endif
-	strcat(webString, "} else if (tabName == 'MSG') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/msg\");\n");
-	strcat(webString, "} else if (tabName == 'WiFi') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/wireless\");\n");
-	strcat(webString, "} else if (tabName == 'MOD') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/mod\");\n");
-	strcat(webString, "} else if (tabName == 'System') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/system\");\n");
-	strcat(webString, "} else if (tabName == 'File') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/storage\");\n");
-	strcat(webString, "} else if (tabName == 'About') {\n");
-	strcat(webString, "$(\"#contentmain\").load(\"/about\");\n");
-	strcat(webString, "}\n");
-	strcat(webString, "\n");
-	strcat(webString, "if (evt != null) evt.currentTarget.className += \" active\";\n");
-	strcat(webString, "}\n");
-	strcat(webString, "if (!!window.EventSource) {");
-	strcat(webString, "var source = new EventSource('/eventHeard');");
+	strcat(webString, R"APRSJS(
+MSG:'/msg',WiFi:'/wireless',MOD:'/mod',System:'/system',File:'/storage',About:'/about'};
+  const route=routes[tabName]||'/dashboard';
+  jQuery('#contentmain').load(route);
+  document.querySelectorAll('.settings-tabs button').forEach(btn=>btn.classList.toggle('active', btn.dataset.tab===tabName));
+  if(evt && evt.currentTarget) evt.currentTarget.classList.add('active');
+}
 
-	strcat(webString, "source.addEventListener('open', function(e) {");
-	strcat(webString, "console.log(\"Events Connected\");");
-	strcat(webString, "}, false);");
-	strcat(webString, "source.addEventListener('error', function(e) {");
-	strcat(webString, "if (e.target.readyState != EventSource.OPEN) {");
-	strcat(webString, "console.log(\"Events Disconnected\");");
-	strcat(webString, "}\n}, false);");
-	strcat(webString, "source.addEventListener('lastHeard', function(e) {");
-	// strcat(webString, "console.log(\"lastHeard\", e.data);");
-	strcat(webString, "var lh=document.getElementById(\"aprsTable\");");
-	strcat(webString, "if(lh != null) {renderTable(e.data);}");
-	strcat(webString, "}, false);\n}");
-	strcat(webString, "if (!!window.EventSource) {");
-	strcat(webString, "var source = new EventSource('/eventMsg');");
+function openDb(){
+  if(!('indexedDB' in window)) return Promise.resolve(null);
+  return new Promise(resolve=>{
+    const req=indexedDB.open('aprs-channel',1);
+    req.onupgradeneeded=()=>{
+      const d=req.result;
+      if(!d.objectStoreNames.contains('packets')){
+        const packets=d.createObjectStore('packets',{keyPath:'id',autoIncrement:true});
+        packets.createIndex('ts','ts',{unique:false});
+      }
+      if(!d.objectStoreNames.contains('tracks')){
+        const tracks=d.createObjectStore('tracks',{keyPath:'id',autoIncrement:true});
+        tracks.createIndex('call','call',{unique:false});
+        tracks.createIndex('ts','ts',{unique:false});
+      }
+    };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>resolve(null);
+  });
+}
 
-	strcat(webString, "source.addEventListener('open', function(e) {");
-	strcat(webString, "console.log(\"Events MSG Connected\");");
-	strcat(webString, "}, false);");
-	strcat(webString, "source.addEventListener('error', function(e) {");
-	strcat(webString, "if (e.target.readyState != EventSource.OPEN) {");
-	strcat(webString, "console.log(\"Events MSG Disconnected\");");
-	strcat(webString, "}\n}, false);");
-	strcat(webString, "source.addEventListener('chatMsg', function(e) {");
-	// strcat(webString, "console.log(\"lastHeard\", e.data);");
-	strcat(webString, "var lh=document.getElementById(\"chatMsg\");");
-	strcat(webString, "if(lh != null) {lh.innerHTML = e.data;}");
-	strcat(webString, "}, false);\n}\n");
-	//strcat(webString, "</script>\n");
+function putStore(storeName, value){
+  if(!db) return;
+  const tx=db.transaction(storeName,'readwrite');
+  tx.objectStore(storeName).add(value);
+}
 
-	strcat(webString, "let sortDirection = {};\n");
-	strcat(webString, "let currentSortKey = \"time\";\n\n");
-	strcat(webString, "function renderTable(raw) {\n");
-	// strcat(webString, "const tableBody = document.getElementById(\"aprsTableBody\");\n");
-	// //strcat(webString, "const tableBody = document.querySelector(\"#aprsTable tbody\");\n");
-	// strcat(webString, "if(tableBody == null) {return;}\n");
-	strcat(webString, "var data=JSON.parse(raw);\n");	
-	strcat(webString, "lastHeardSort(data);\n");
-	strcat(webString, "document.querySelectorAll(\"#aprsTable th[data-sort]\")\n");
-	strcat(webString, ".forEach(header => {\n\n");
-	strcat(webString, "header.addEventListener(\"click\", () => {\n\n");
-	strcat(webString, "const key = header.dataset.sort;\n\n");
-	strcat(webString, "sortDirection[key] = !sortDirection[key];\n");
-	strcat(webString, "currentSortKey = key;\n\n");	
-	strcat(webString, "clearArrows();\n\n");
-	strcat(webString, "const arrowSpan = header.querySelector(\".arrow\");\n");
-	strcat(webString, "arrowSpan.textContent = sortDirection[key] ? \"▲\" : \"▼\";\n\n");
-	strcat(webString, "lastHeardSort(data);\n");
-	strcat(webString, "printLastHeard(data);\n");
-	strcat(webString, "});\n\n");
-	strcat(webString, "});\n\n");
-	strcat(webString, "printLastHeard(data);\n");
-	strcat(webString, "}\n\n");
+function savePacket(pkt){putStore('packets', pkt);}
+function saveTrack(pkt){
+  if(typeof pkt.lat!=='number' || typeof pkt.lon!=='number') return;
+  const call=pkt.from||pkt.call||'BROWSER';
+  const track={call,lat:pkt.lat,lon:pkt.lon,ts:pkt.ts||Math.floor(Date.now()/1000),source:pkt.source||'BROWSER'};
+  trackCache[call]=track;
+  putStore('tracks', track);
+  renderTracks();
+}
 
-	strcat(webString, "function printLastHeard(data) {\n");
-	strcat(webString, "const tableBody = document.getElementById(\"aprsTableBody\");\n");
-	//strcat(webString, "const tableBody = document.querySelector(\"#aprsTable tbody\");\n");
-	strcat(webString, "if(tableBody == null) {return;}\n");
-	strcat(webString, "tableBody.innerHTML = \"\";\n");
-	strcat(webString, "data.forEach(row => {\n");
-	strcat(webString, "const tr = document.createElement(\"tr\");\n");
-	strcat(webString, "tr.innerHTML = `\n");
-	strcat(webString, "<td>${row.time}</td>\n");
-	strcat(webString, "<td><img src=\"http://aprs.nakhonthai.net/symbols/icons/${row.icon}\"></td>\n");
-	strcat(webString, "<td>${row.callsign}</td>\n");
-	strcat(webString, "<td align=\"left\">${row.path}</td>\n");
-	strcat(webString, "<td>${row.dx !== null ? row.dx : \"-\"}</td>\n");
-	strcat(webString, "<td>${row.packet}</td>\n");
-	strcat(webString, "<td style=\"color:green;\">${row.audio !== '-' ? row.audio + \"dBV\" : \"-\"}</td>\n");
-	strcat(webString, "`;\n");
-	strcat(webString, "tableBody.appendChild(tr);\n");
-	strcat(webString, "});\n");
-	strcat(webString, "}\n\n");
+function loadRecentPackets(){
+  if(!db) return;
+  const tx=db.transaction('packets','readonly');
+  const req=tx.objectStore('packets').getAll();
+  req.onsuccess=()=>{
+    const rows=(req.result||[]).slice(-60);
+    rows.forEach(pkt=>renderPacket(pkt,true));
+    scrollMessages();
+  };
+}
 
-	strcat(webString, "function clearArrows() {\n");
-	strcat(webString, "document.querySelectorAll(\".arrow\").forEach(a => a.textContent = \"\");\n");
-	strcat(webString, "}\n\n");
-	strcat(webString, "function lastHeardSort(data) {\nvar key=currentSortKey;\n");
-	strcat(webString, "data.sort((a, b) => {\n\n");
-	strcat(webString, "let valA = a[key];\n");
-	strcat(webString, "let valB = b[key];\n\n");
-	strcat(webString, "if (key === \"time\") {\n");
-	//strcat(webString, "// Parse time in dd hh:mm:ss format\n");
-	strcat(webString, "const [dayTime, timePart] = valA.split(' ');\n");
-	strcat(webString, "const [hours, minutes, seconds] = timePart.split(':');\n");
-	strcat(webString, "valA = parseInt(dayTime) * 86400 + parseInt(hours) * 3600 + parseInt(minutes) * 60 + parseInt(seconds);\n");
-	//strcat(webString, "                \n");
-	strcat(webString, "const [dayTimeB, timePartB] = valB.split(' ');\n");
-	strcat(webString, "const [hoursB, minutesB, secondsB] = timePartB.split(':');\n");
-	strcat(webString, "valB = parseInt(dayTimeB) * 86400 + parseInt(hoursB) * 3600 + parseInt(minutesB) * 60 + parseInt(secondsB);\n");
-	strcat(webString, "}\n\n");
-	strcat(webString, "if (valA === null) return 1;\n");
-	strcat(webString, "if (valB === null) return -1;\n\n");
-	strcat(webString, "if (valA < valB) return sortDirection[key] ? -1 : 1;\n");
-	strcat(webString, "if (valA > valB) return sortDirection[key] ? 1 : -1;\n");
-	strcat(webString, "return 0;\n");
-	strcat(webString, "});\n\n");
-	strcat(webString, "}\n\n");
+function loadTrackCache(){
+  if(!db) return;
+  const tx=db.transaction('tracks','readonly');
+  const req=tx.objectStore('tracks').getAll();
+  req.onsuccess=()=>{
+    (req.result||[]).forEach(t=>{
+      if(!trackCache[t.call] || (t.ts||0)>(trackCache[t.call].ts||0)) trackCache[t.call]=t;
+    });
+    renderTracks();
+  };
+}
+
+function renderTracks(){
+  const list=el('trackList');
+  if(!list) return;
+  const rows=Object.keys(trackCache).sort().map(call=>trackCache[call]);
+  if(rows.length===0){list.innerHTML='<div class="empty-note">No positions</div>'; return;}
+  list.innerHTML=rows.map(t=>`<div class="track-row"><b>${escapeHtml(t.call)}</b><span>${Number(t.lat).toFixed(5)}, ${Number(t.lon).toFixed(5)}</span><small>${escapeHtml(t.source)} ${fmtTime(t.ts)}</small></div>`).join('');
+}
+
+function renderPacket(pkt, historical){
+  const list=el('messageList');
+  if(!list) return;
+  const item=document.createElement('article');
+  const outgoing=pkt.source==='TX';
+  item.className='aprs-message '+(outgoing?'outgoing':'incoming')+' type-'+escapeHtml(pkt.type||'packet');
+  const target=pkt.type==='message' && pkt.target ? ' -> '+pkt.target : '';
+  const text=pkt.body || pkt.raw || '';
+  const meta=[pkt.source||'', pkt.type||'packet', pkt.path||''].filter(Boolean).join(' | ');
+  item.innerHTML=`<div class="msg-meta"><b>${escapeHtml(pkt.from||'APRS')}</b><span>${escapeHtml(target)}</span><time>${fmtTime(pkt.ts)}</time></div><div class="msg-body">${escapeHtml(text)}</div><div class="msg-raw">${escapeHtml(meta)}</div>`;
+  list.appendChild(item);
+  while(list.children.length>120) list.removeChild(list.firstElementChild);
+  if(!historical) scrollMessages();
+}
+
+function handlePacket(pkt, historical){
+  if(!pkt || !pkt.raw) return;
+  if(isDuplicate(pkt)) return;
+  renderPacket(pkt, historical);
+  savePacket(pkt);
+  saveTrack(pkt);
+}
+
+function handleHistory(raw){
+  try{
+    const rows=JSON.parse(raw);
+    rows.sort((a,b)=>(a.ts||0)-(b.ts||0)).forEach(pkt=>handlePacket(pkt,true));
+    scrollMessages();
+  }catch(e){}
+}
+
+function connectTraffic(){
+  if(!window.EventSource){setStatus('SSE unavailable'); return;}
+  eventSource=new EventSource('/eventTraffic');
+  eventSource.addEventListener('open',()=>setStatus('Listening'));
+  eventSource.addEventListener('error',()=>setStatus('Reconnecting'));
+  eventSource.addEventListener('trafficHistory', e=>handleHistory(e.data));
+  eventSource.addEventListener('aprsTraffic', e=>{try{handlePacket(JSON.parse(e.data),false);}catch(err){}});
+}
+
+function scrollMessages(){
+  const list=el('messageList');
+  if(list) list.scrollTop=list.scrollHeight;
+}
+
+function clearScreen(){
+  const list=el('messageList');
+  if(list) list.innerHTML='';
+}
+
+function sendChat(evt){
+  evt.preventDefault();
+  const to=el('toCall').value.trim().toUpperCase();
+  const msg=el('msgText').value.trim();
+  if(!to || !msg) return;
+  const data=new FormData();
+  data.append('toCall',to);
+  data.append('msg',msg);
+  data.append('commitChat','1');
+  fetch('/msg',{method:'POST',body:data,credentials:'same-origin'}).then(()=>{
+    el('msgText').value='';
+  });
+}
+
+function gpsPayload(pos){
+  const c=pos.coords;
+  const data=new FormData();
+  data.append('lat', c.latitude);
+  data.append('lon', c.longitude);
+  if(c.altitude!==null) data.append('alt', c.altitude);
+  if(c.speed!==null) data.append('speed', c.speed*3.6);
+  if(c.heading!==null) data.append('course', c.heading);
+  data.append('comment','Browser GPS');
+  data.append('rf', el('gpsRf').checked ? '1':'0');
+  data.append('inet', el('gpsInet').checked ? '1':'0');
+  return data;
+}
+
+function rememberBrowserFix(pos){
+  const c=pos.coords;
+  saveTrack({from:'BROWSER',lat:c.latitude,lon:c.longitude,ts:Math.floor(Date.now()/1000),source:'BROWSER'});
+}
+
+function sendBrowserLocation(pos){
+  rememberBrowserFix(pos);
+  return fetch('/api/browser-location',{method:'POST',body:gpsPayload(pos),credentials:'same-origin'})
+    .then(r=>r.json()).then(j=>{setStatus(j.ok?'GPS sent':'GPS not sent'); return j;})
+    .catch(()=>setStatus('GPS failed'));
+}
+
+function requestGps(){
+  if(!navigator.geolocation){setStatus('GPS unavailable'); return;}
+  setStatus('GPS request');
+  navigator.geolocation.getCurrentPosition(pos=>sendBrowserLocation(pos), ()=>setStatus('GPS blocked'), {enableHighAccuracy:true, maximumAge:10000, timeout:15000});
+}
+
+function distanceM(a,b){
+  if(!a||!b) return Infinity;
+  const R=6371000, dLat=(b.latitude-a.latitude)*Math.PI/180, dLon=(b.longitude-a.longitude)*Math.PI/180;
+  const lat1=a.latitude*Math.PI/180, lat2=b.latitude*Math.PI/180;
+  const x=Math.sin(dLat/2)**2+Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));
+}
+
+function toggleAutoGps(){
+  if(autoWatchId!==null){
+    navigator.geolocation.clearWatch(autoWatchId);
+    autoWatchId=null;
+    el('autoGps').classList.remove('active');
+    setStatus('Listening');
+    return;
+  }
+  if(!navigator.geolocation){setStatus('GPS unavailable'); return;}
+  el('autoGps').classList.add('active');
+  autoWatchId=navigator.geolocation.watchPosition(pos=>{
+    rememberBrowserFix(pos);
+    const c=pos.coords;
+    const now=Date.now();
+    const fix={latitude:c.latitude,longitude:c.longitude,time:now};
+    if(!lastAutoFix || now-lastAutoFix.time>60000 || distanceM(lastAutoFix,fix)>25){
+      lastAutoFix=fix;
+      sendBrowserLocation(pos);
+    }
+  }, ()=>setStatus('GPS blocked'), {enableHighAccuracy:true, maximumAge:10000, timeout:20000});
+}
+
+async function appInit(){
+  db=await openDb();
+  loadRecentPackets();
+  loadTrackCache();
+  connectTraffic();
+  renderTracks();
+  el('composeForm').addEventListener('submit', sendChat);
+  el('toCall').addEventListener('input', e=>e.target.value=e.target.value.toUpperCase());
+}
+)APRSJS");
 	strcat(webString, "</script>\n");
 	strcat(webString, "</head>\n");
-	//strcat(webString, "\n");
-	strcat(webString, "<body onload=\"selectTab(event, 'DashBoard')\">\n");
+	strcat(webString, "<body onload=\"appInit()\">\n");
 	strcat(webString, "\n");
-	strcat(webString, "<div class=\"container\">\n");
-	strcat(webString, "<div class=\"header\">\n");
-	// strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\">ESP32IGate Firmware V" + String(VERSION) + "</div>\n");
-	// strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
+	strcat(webString, "<div class=\"app-shell\">\n");
+	strcat(webString, "<header class=\"app-bar\">\n");
+	strcat(webString, "<div class=\"app-title\">\n");
 	if (strlen(config.host_name) > 0)
 	{
 		snprintf(temp_buffer, sizeof(temp_buffer), "<h1>%s</h1>\n", config.host_name);
@@ -577,61 +1163,70 @@ void setMainPage(AsyncWebServerRequest *request)
 	{
 		strcat(webString, "<h1>ESP32APRS_Audio</h1>\n");
 	}
-	strcat(webString, "<div style=\"font-size: 8px; text-align: right; padding-right: 8px;\"><a href=\"/logout\">[LOG OUT]</a></div>\n");
-	strcat(webString, "<div class=\"row\">\n");
-	strcat(webString, "<ul class=\"nav nav-tabs\" style=\"margin: 5px;\">\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DashBoard')\">DashBoard</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Radio')\" id=\"btnRadio\">Radio</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'IGATE')\">IGATE</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'DIGI')\">DIGI</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TRACKER')\">TRACKER</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WX')\">WX</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'TLM')\">TLM</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'SENSOR')\">SENSOR</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'Audio')\">Audio</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'VPN')\">VPN</button>\n");
+	strcat(webString, "<span id=\"linkState\">Starting</span>\n");
+	strcat(webString, "</div>\n");
+	strcat(webString, "<a class=\"logout-link\" href=\"/logout\">LOG OUT</a>\n");
+	strcat(webString, "</header>\n");
+	strcat(webString, "<nav class=\"segment-bar\">\n");
+	strcat(webString, "<button id=\"segChannel\" class=\"active\" type=\"button\" onclick=\"showSegment('channel')\">CHANNEL</button>\n");
+	strcat(webString, "<button id=\"segSettings\" type=\"button\" onclick=\"showSegment('settings')\">SETTINGS</button>\n");
+	strcat(webString, "</nav>\n");
+	strcat(webString, "<main id=\"channelView\" class=\"channel-view\">\n");
+	strcat(webString, "<section class=\"traffic-pane\">\n");
+	strcat(webString, "<div class=\"traffic-tools\"><button type=\"button\" onclick=\"clearScreen()\">CLEAR</button><button id=\"gpsOnce\" type=\"button\" onclick=\"requestGps()\">GPS</button><button id=\"autoGps\" type=\"button\" onclick=\"toggleAutoGps()\">AUTO</button><label><input id=\"gpsRf\" type=\"checkbox\" checked>RF</label><label><input id=\"gpsInet\" type=\"checkbox\" checked>INET</label></div>\n");
+	strcat(webString, "<div id=\"messageList\" class=\"message-list\"></div>\n");
+	strcat(webString, "<form id=\"composeForm\" class=\"compose-bar\" autocomplete=\"off\">\n");
+	strcat(webString, "<input id=\"toCall\" name=\"toCall\" type=\"text\" maxlength=\"9\" placeholder=\"CALL\" />\n");
+	strcat(webString, "<input id=\"msgText\" name=\"msg\" type=\"text\" maxlength=\"180\" placeholder=\"APRS message\" />\n");
+	strcat(webString, "<button type=\"submit\">SEND</button>\n");
+	strcat(webString, "</form>\n");
+	strcat(webString, "</section>\n");
+	strcat(webString, "<aside class=\"track-pane\"><div class=\"track-title\">TRACKS</div><div id=\"trackList\"><div class=\"empty-note\">No positions</div></div></aside>\n");
+	strcat(webString, "</main>\n");
+	strcat(webString, "<section id=\"settingsView\" class=\"settings-view\" hidden>\n");
+	strcat(webString, "<div class=\"settings-card\">\n");
+	strcat(webString, "<div class=\"settings-head\"><b>SETTINGS</b><button type=\"button\" onclick=\"showSegment('channel')\">CHANNEL</button></div>\n");
+	strcat(webString, "<ul class=\"nav settings-tabs\">\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"DashBoard\" onclick=\"selectTab(event, 'DashBoard')\">DashBoard</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"Radio\" onclick=\"selectTab(event, 'Radio')\" id=\"btnRadio\">Radio</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"IGATE\" onclick=\"selectTab(event, 'IGATE')\">IGATE</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"DIGI\" onclick=\"selectTab(event, 'DIGI')\">DIGI</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"TRACKER\" onclick=\"selectTab(event, 'TRACKER')\">TRACKER</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"WX\" onclick=\"selectTab(event, 'WX')\">WX</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"TLM\" onclick=\"selectTab(event, 'TLM')\">TLM</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"SENSOR\" onclick=\"selectTab(event, 'SENSOR')\">SENSOR</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"Audio\" onclick=\"selectTab(event, 'Audio')\">Audio</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"VPN\" onclick=\"selectTab(event, 'VPN')\">VPN</button>\n");
 #ifdef MQTT
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"MQTT\" onclick=\"selectTab(event, 'MQTT')\">MQTT</button>\n");
 #endif
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MSG')\">MSG</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'WiFi')\">WiFi</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'MOD')\">MOD</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'System')\">System</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'File')\">File</button>\n");
-	strcat(webString, "<button class=\"nav-tabs\" onclick=\"selectTab(event, 'About')\">About</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"MSG\" onclick=\"selectTab(event, 'MSG')\">MSG</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"WiFi\" onclick=\"selectTab(event, 'WiFi')\">WiFi</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"MOD\" onclick=\"selectTab(event, 'MOD')\">MOD</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"System\" onclick=\"selectTab(event, 'System')\">System</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"File\" onclick=\"selectTab(event, 'File')\">File</button>\n");
+	strcat(webString, "<button type=\"button\" data-tab=\"About\" onclick=\"selectTab(event, 'About')\">About</button>\n");
 	strcat(webString, "</ul>\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "</div>\n");
-	strcat(webString, "\n");
-
 	strcat(webString, "<div class=\"contentwide\" id=\"contentmain\">\n");
-	strcat(webString, "\n");
 	strcat(webString, "</div>\n");
-	strcat(webString, "<br />\n");
+	strcat(webString, "</div>\n");
+	strcat(webString, "</section>\n");
 	strcat(webString, "<div class=\"footer\">\n");
-	strcat(webString, "ESP32APRS_Audio Web Configuration<br />Copy right ©2023.\n");
-	strcat(webString, "<br />\n");
+	strcat(webString, "ESP32APRS_Audio Web UI<br />Copy right ©2023.\n");
 	strcat(webString, "</div>\n");
 	strcat(webString, "</div>\n");
-	strcat(webString, "<!-- <script type=\"text/javascript\" src=\"/nice-select.min.js\"></script> -->\n");
-	strcat(webString, "<script type=\"text/javascript\">\n");
-	strcat(webString, "var selectize = document.querySelectorAll('select')\n");
-	strcat(webString, "var options = { searchable: true };\n");
-	strcat(webString, "selectize.forEach(function (select) {\n");
-	strcat(webString, "if (select.length > 30 && null === select.onchange && !select.name.includes(\"ExtendedId\")) {\n");
-	strcat(webString, "select.classList.add(\"small\", \"selectize\");\n");
-	strcat(webString, "tabletd = select.closest('td');\n");
-	strcat(webString, "tabletd.style.cssText = 'overflow-x:unset';\n");
-	strcat(webString, "NiceSelect.bind(select, options);\n");
-	strcat(webString, "}\n");
-	strcat(webString, "});\n");
-	strcat(webString, "</script>\n");
 	strcat(webString, "</body>\n");
 	strcat(webString, "</html>");
 
 
 	AsyncWebServerResponse *response = beginOwnedHtmlResponse(request, webString);
-	response->addHeader("Sensor", "content");
+	if (response == nullptr)
+	{
+		request->send(500, "text/plain", "Main page response failed");
+		return;
+	}
+	log_d("Main page HTML length=%u bytes", static_cast<unsigned>(strlen(webString)));
+	response->addHeader("WebUI", "content");
 	response->addHeader("Cache-Control", "no-cache");
 	request->send(response);
 	lastHeardTimeout = 0;
@@ -11082,14 +11677,19 @@ void handle_wireless(AsyncWebServerRequest *request)
 					strcpy(config.wifi_ap_ssid, request->arg(i).c_str());
 				}
 			}
-			if (request->argName(i) == "wifi_passAP")
-			{
-				if (request->arg(i) != "")
+				if (request->argName(i) == "wifi_passAP")
 				{
-					strcpy(config.wifi_ap_pass, request->arg(i).c_str());
+					if (request->arg(i) != "")
+					{
+						strcpy(config.wifi_ap_pass, request->arg(i).c_str());
+					}
+				}
+				if (request->argName(i) == "wifi_hostname")
+				{
+					strncpy(config.host_name, request->arg(i).c_str(), sizeof(config.host_name) - 1);
+					config.host_name[sizeof(config.host_name) - 1] = '\0';
 				}
 			}
-		}
 		if (wifiAP)
 		{
 			config.wifi_mode |= WIFI_AP_FIX;
@@ -11149,18 +11749,23 @@ void handle_wireless(AsyncWebServerRequest *request)
 				}
 			}
 
-			if (request->argName(i) == "wifi_pwr")
-			{
-				if (request->arg(i) != "")
+				if (request->argName(i) == "wifi_pwr")
 				{
-					if (isValidNumber(request->arg(i)))
+					if (request->arg(i) != "")
 					{
-						config.wifi_power = (int8_t)request->arg(i).toInt();
-						WiFi.setTxPower((wifi_power_t)config.wifi_power);
+						if (isValidNumber(request->arg(i)))
+						{
+							config.wifi_power = (int8_t)request->arg(i).toInt();
+							WiFi.setTxPower((wifi_power_t)config.wifi_power);
+						}
 					}
 				}
+				if (request->argName(i) == "wifi_hostname")
+				{
+					strncpy(config.host_name, request->arg(i).c_str(), sizeof(config.host_name) - 1);
+					config.host_name[sizeof(config.host_name) - 1] = '\0';
+				}
 			}
-		}
 		if (wifiSTA)
 		{
 			config.wifi_mode |= WIFI_STA_FIX;
@@ -11312,8 +11917,20 @@ void handle_wireless(AsyncWebServerRequest *request)
 				free(temp_pass);
 			}
 		}
-		strcat(html, "</tr>\n");
-		strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
+			strcat(html, "</tr>\n");
+			strcat(html, "<tr>\n");
+			strcat(html, "<td align=\"right\"><b>Hostname:</b></td>\n");
+			{
+				char *temp_host = allocateStringMemory(512);
+				if (temp_host)
+				{
+					snprintf(temp_host, 512, "<td style=\"text-align: left;\"><input size=\"31\" maxlength=\"31\" class=\"form-control\" name=\"wifi_hostname\" type=\"text\" value=\"%s\" /></td>\n", config.host_name);
+					strcat(html, temp_host);
+					free(temp_host);
+				}
+			}
+			strcat(html, "</tr>\n");
+			strcat(html, "<tr><td colspan=\"2\" align=\"right\">\n");
 		strcat(html, "<div><button class=\"button\" type='submit' id='submitWiFiAP'  name=\"commitWiFiAP\"> Apply Change </button></div>\n");
 		strcat(html, "<input type=\"hidden\" name=\"commitWiFiAP\"/>\n");
 		strcat(html, "</td></tr></table><br />\n");
@@ -11345,9 +11962,14 @@ void handle_wireless(AsyncWebServerRequest *request)
 		}
 		strcat(html, "</select>\n");
 		strcat(html, "</td>\n");
-		strcat(html, "</tr>\n");
-		for (int n = 0; n < 5; n++)
-		{
+			strcat(html, "</tr>\n");
+			strcat(html, "<tr>\n");
+			strcat(html, "<td align=\"right\"><b>Hostname:</b></td>\n");
+			snprintf(tempHtml, sizeof(tempHtml), "<td style=\"text-align: left;\"><input size=\"31\" maxlength=\"31\" name=\"wifi_hostname\" type=\"text\" value=\"%s\" /></td>\n", config.host_name);
+			strcat(html, tempHtml);
+			strcat(html, "</tr>\n");
+			for (int n = 0; n < 5; n++)
+			{
 			strcat(html, "<tr>\n");
 			snprintf(tempHtml, sizeof(tempHtml), "<td align=\"right\"><b>Station #%d:</b></td>\n", n + 1);
 			strcat(html, tempHtml);
@@ -12782,6 +13404,8 @@ void webService()
 #endif
 	async_server.on("/msg", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_msg(request); });
+	async_server.on("/api/browser-location", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ handle_browser_location(request); });
 	async_server.on("/mod", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
 					{ handle_mod(request); });
 	async_server.on("/default", HTTP_GET | HTTP_POST, [](AsyncWebServerRequest *request)
@@ -12914,6 +13538,15 @@ void webService()
 	String html = event_chatMessage(true);
     client->send(html.c_str(), "chatMsg", time(NULL), 5000); });
 	async_server.addHandler(&message_events);
+
+	traffic_events.onConnect([](AsyncEventSourceClient *client)
+							 {
+    if(client->lastId()){
+      log_d("Traffic client reconnected! Last message ID that it got is: %u\n", client->lastId());
+    }
+    String history = event_aprsTrafficHistory();
+    client->send(history.c_str(), "trafficHistory", time(NULL), 5000); });
+	async_server.addHandler(&traffic_events);
 
 	async_server.onNotFound(notFound);
 	async_server.begin();

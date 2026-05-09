@@ -140,5 +140,6 @@ void handle_ws_gnss(char *nmea);
 void handle_ws_gnss(char *nmea, size_t size);
 void event_lastHeard(bool gethtml=false);
 String event_chatMessage(bool gethtml=false);
+void event_aprsTraffic(const char *raw, const char *source, uint16_t audioLvl = 0);
 
 #endif
