@@ -370,7 +370,7 @@ void handle_logout(AsyncWebServerRequest *request)
 
 void setMainPage(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -992,7 +992,7 @@ void handle_dashboard(AsyncWebServerRequest *request)
 
 void handle_sidebar(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -1747,7 +1747,7 @@ String event_chatMessage(bool gethtml)
 
 void handle_storage(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2049,7 +2049,7 @@ void handle_storage(AsyncWebServerRequest *request)
 
 void handle_download(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2137,7 +2137,7 @@ void handle_download(AsyncWebServerRequest *request)
 
 void handle_delete(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2177,7 +2177,7 @@ void handle_delete(AsyncWebServerRequest *request)
 
 void handle_format(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2203,7 +2203,7 @@ void handle_format(AsyncWebServerRequest *request)
 
 void handle_radio(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -2784,7 +2784,7 @@ void handle_radio(AsyncWebServerRequest *request)
 
 void handle_vpn(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -3065,7 +3065,7 @@ void handle_vpn(AsyncWebServerRequest *request)
 #ifdef MQTT
 void handle_mqtt(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -3416,7 +3416,7 @@ void handle_mqtt(AsyncWebServerRequest *request)
 
 void handle_msg(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -3745,7 +3745,7 @@ void handle_msg(AsyncWebServerRequest *request)
 
 void handle_mod(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -5828,7 +5828,7 @@ void handle_mod(AsyncWebServerRequest *request)
 
 void handle_system(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -7029,7 +7029,7 @@ void handle_system(AsyncWebServerRequest *request)
 
 void handle_igate(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -8010,7 +8010,7 @@ void handle_igate(AsyncWebServerRequest *request)
 
 void handle_digi(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -8786,7 +8786,7 @@ void handle_digi(AsyncWebServerRequest *request)
 
 void handle_wx(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -9231,7 +9231,7 @@ void handle_wx(AsyncWebServerRequest *request)
 
 void handle_tlm(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -9751,7 +9751,7 @@ extern TaskHandle_t taskSensorHandle;
 
 void handle_sensor(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -10276,7 +10276,7 @@ void handle_sensor(AsyncWebServerRequest *request)
 
 void handle_tracker(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -11053,7 +11053,7 @@ void handle_tracker(AsyncWebServerRequest *request)
 
 void handle_wireless(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -11731,7 +11731,7 @@ void handle_test(AsyncWebServerRequest *request)
 
 void handle_audio(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
@@ -12137,7 +12137,7 @@ void handle_audio(AsyncWebServerRequest *request)
 
 void handle_about(AsyncWebServerRequest *request)
 {
-	if (!request->authenticate(config.http_username, config.http_password))
+	if (false && !request->authenticate(config.http_username, config.http_password))
 	{
 		return request->requestAuthentication();
 	}
