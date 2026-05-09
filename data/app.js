@@ -148,21 +148,65 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// ---------- Filter (browser-side, applied to renderPacket) ---------------
+// The chat UI displays *every* packet the firmware reports.  An optional
+// filter narrows what the user sees on the screen — server-side state is
+// untouched, so toggling the filter never loses traffic from the SSE.
+const filterState = { text: '', mode: 'any' };
+const allPackets  = [];      // ring of every packet we've seen, for re-filter
+const ALL_MAX     = 600;
+
+function packetMatchesFilter(parsed) {
+  const q = filterState.text;
+  if (!q) return true;
+  const me = (fullCall() || '').toUpperCase();
+  const src = (parsed.src || '').toUpperCase();
+  const dst = (parsed.addressee || parsed.dst || '').toUpperCase();
+  const txt = (parsed.message || parsed.comment || parsed.info || '').toUpperCase();
+  switch (filterState.mode) {
+    case 'src':  return src.startsWith(q) || src.includes(q);
+    case 'dst':  return dst.startsWith(q) || dst.includes(q);
+    case 'text': return txt.includes(q);
+    case 'me':   return src === me || dst === me ||
+                        src.startsWith(me) || dst.startsWith(me);
+    case 'any':
+    default:     return src.includes(q) || dst.includes(q) || txt.includes(q);
+  }
+}
+
+function applyFilterToFeed() {
+  // Cheap full re-render from the in-memory ring; preserves scroll position.
+  const wasAtBottom = isAtBottom();
+  feed.innerHTML = '';
+  for (const pkt of allPackets) renderPacketInternal(pkt, /*recordOnly*/false);
+  if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+}
+
 function renderPacket(pkt) {
   const key = pkt.ts + '|' + pkt.raw;
   if (seen.has(key)) return;
   seen.add(key);
   if (seen.size > 2000) {
-    // bound memory
     const drop = seen.values().next().value;
     seen.delete(drop);
   }
+  allPackets.push(pkt);
+  if (allPackets.length > ALL_MAX) allPackets.shift();
+  renderPacketInternal(pkt, true);
+}
 
+function renderPacketInternal(pkt, recordSideEffects) {
   const parsed = parseTnc2(pkt.raw) || { src:'?', type:'unknown' };
   parsed.ts = pkt.ts;
   parsed.audio = pkt.audio;
   parsed.ch = pkt.ch;
   parsed.dir = pkt.dir || 'rx';
+
+  // Side effects (track DB, map plot) happen on first render only — we don't
+  // want to re-record points every time the filter is toggled.
+  if (recordSideEffects) recordTrackPoint(parsed);
+
+  if (!packetMatchesFilter(parsed)) return;
 
   const wasAtBottom = isAtBottom();
 
@@ -209,8 +253,6 @@ function renderPacket(pkt) {
   while (feed.children.length > 400) feed.removeChild(feed.firstChild);
 
   if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
-
-  recordTrackPoint(parsed);
 }
 
 function isAtBottom() {
@@ -566,27 +608,288 @@ document.addEventListener('click', async (e) => {
 $('#hookBtn').addEventListener('click', openHooks);
 $('#hookClose').addEventListener('click', closeHooks);
 
-// ---------- FM voice (Phase 5 — scaffolding only) -------------------------
-// The firmware already exposes /ws_audio on port 81 (see webservice.cpp's
-// onWsEvent).  The intended browser-side flow is:
-//   • RX monitor: server sends 8 kHz mono i16 LE PCM frames; browser plays
-//     them via an AudioWorklet so the audio stream never blocks the main
-//     thread.  Simple decimation/filtering happens in the worklet.
-//   • TX (PTT):  browser captures mic via getUserMedia, downsamples to 8
-//     kHz mono, sends binary frames; firmware writes to DAC and toggles PTT.
-// All DSP (AGC, VAD, level meter, optional Opus encoding) runs in the
-// browser so the ESP32 only has to push bytes around.
+// ---------- FM voice — RX monitor + TX PTT --------------------------------
+// Talks to /ws_audio on port 81 (see src/webservice.cpp:onWsEvent).
+// Wire format:
+//   server → browser (binary): μ-law @ 8 kHz mono, 320-byte chunks
+//   server → browser (text):   JSON {type:"cfg"|"tx"|...}
+//   browser → server (text):   "tx_start" | "tx_stop" | "ping" | "set_freq:tx,rx"
+//   browser → server (binary): μ-law @ 8 kHz mono mic capture
 //
-// We deliberately do not auto-connect the audio WS yet — wiring it up
-// should land in a follow-up change with a proper PTT button + worklet.
-const VoiceFM = {
-  ws: null,
-  startMonitor() { /* TODO: connect ws://${host}:81/ws_audio, play PCM */ },
-  stopMonitor()  { /* TODO */ },
-  pttDown()      { /* TODO: getUserMedia → AudioWorklet → ws.send(pcm) */ },
-  pttUp()        { /* TODO */ },
-};
-window.VoiceFM = VoiceFM; // exposed for future UI binding
+// All resampling and μ-law conversion runs in the browser via a plain
+// ScriptProcessorNode.  AudioWorklet would be cleaner but ScriptProcessor
+// works on every browser/OS combo without an extra worklet file in
+// LittleFS — important when flash is the scarce resource.
+
+const VoiceFM = (() => {
+  const state = {
+    ws: null,
+    monitoring: false,
+    txActive: false,
+    muted: false,
+    sampleRate: 8000,        // server-pushed; usually 8000
+    audioCtx: null,
+    gainNode: null,
+    procNode: null,
+    queue: [],               // Float32Array chunks awaiting playback
+    queueOffset: 0,
+    queuedSamples: 0,
+    lastSample: 0,
+    resampleAcc: 0,
+    rxLevel: 0,
+    txLevel: 0,
+    micStream: null,
+    micCtx: null,
+    micProc: null,
+  };
+
+  // ---------- μ-law (G.711) <-> linear int16 ------------------------------
+  function mulawToLinear(u) {
+    u = (~u) & 0xFF;
+    const sign = u & 0x80;
+    const exponent = (u >> 4) & 0x07;
+    const mantissa = u & 0x0F;
+    let s = ((mantissa << 3) + 0x84) << exponent;
+    s -= 0x84;
+    return sign ? -s : s;
+  }
+  function linearToMulaw(v) {
+    let pcm = Math.max(-1, Math.min(1, v));
+    pcm = (pcm * 32767) | 0;
+    const sign = (pcm < 0) ? 0x80 : 0;
+    if (pcm < 0) pcm = -pcm;
+    if (pcm > 32635) pcm = 32635;
+    pcm += 0x84;
+    let exp = 7;
+    for (let m = 0x4000; (pcm & m) === 0 && exp > 0; m >>= 1) exp--;
+    const mant = (pcm >> (exp + 3)) & 0x0F;
+    return (~(sign | (exp << 4) | mant)) & 0xFF;
+  }
+
+  function clearQueue() {
+    state.queue = [];
+    state.queueOffset = 0;
+    state.queuedSamples = 0;
+    state.lastSample = 0;
+    state.resampleAcc = 0;
+  }
+
+  function popSample() {
+    if (state.queue.length === 0) return 0;
+    const c = state.queue[0];
+    const v = c[state.queueOffset++];
+    state.queuedSamples--;
+    if (state.queueOffset >= c.length) {
+      state.queue.shift();
+      state.queueOffset = 0;
+    }
+    return v;
+  }
+
+  function ensureAudioPath() {
+    if (state.audioCtx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    state.audioCtx = new Ctx();
+    state.gainNode = state.audioCtx.createGain();
+    state.procNode = state.audioCtx.createScriptProcessor(1024, 1, 1);
+    state.procNode.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      const outRate = state.audioCtx.sampleRate;
+      let peak = 0;
+      for (let i = 0; i < out.length; i++) {
+        state.resampleAcc += state.sampleRate;
+        while (state.resampleAcc >= outRate) {
+          state.lastSample = popSample();
+          state.resampleAcc -= outRate;
+        }
+        const s = state.lastSample;
+        out[i] = s;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      // Decay-tracked peak for VU-style meter
+      state.rxLevel = Math.max(state.rxLevel * 0.85, peak);
+    };
+    state.procNode.connect(state.gainNode);
+    state.gainNode.connect(state.audioCtx.destination);
+    setVolumePercent(parseInt($('#vpVol').value, 10) || 80);
+  }
+
+  function setVolumePercent(p) {
+    const g = Math.max(0, Math.min(1, p / 100));
+    if (state.gainNode) state.gainNode.gain.value = state.muted ? 0 : g;
+  }
+
+  function setStatus(txt, cls) {
+    const el = $('#vpStatus');
+    if (!el) return;
+    el.textContent = txt;
+    el.className = cls || 'dim';
+  }
+
+  function wsUrl() {
+    const proto = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+    // The audio WS lives on port 81 (async_websocket).  Use explicit port
+    // so the chat UI (port 80) can reach it from the same origin.
+    return `${proto}${location.hostname}:81/ws_audio`;
+  }
+
+  async function startMonitor() {
+    if (state.monitoring) return;
+    ensureAudioPath();
+    try { await state.audioCtx.resume(); } catch (_) {}
+    clearQueue();
+    state.ws = new WebSocket(wsUrl());
+    state.ws.binaryType = 'arraybuffer';
+    state.ws.onopen = () => {
+      state.monitoring = true;
+      $('#vpToggle').classList.add('on');
+      $('#vpToggle').textContent = 'Stop';
+      setStatus('● live', 'ok');
+    };
+    state.ws.onclose = () => {
+      const wasOn = state.monitoring;
+      cleanupWs();
+      if (wasOn) setStatus('disconnected', 'warn');
+    };
+    state.ws.onerror = () => setStatus('socket error', 'err');
+    state.ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'cfg' && msg.rate) {
+            state.sampleRate = parseInt(msg.rate, 10);
+          } else if (msg.type === 'tx' && msg.state === 'off') {
+            // Server forced TX off (e.g. another client took it)
+            stopTx(/*localOnly*/true);
+          }
+        } catch (_) {}
+        return;
+      }
+      const ulaw = new Uint8Array(ev.data);
+      const pcm = new Float32Array(ulaw.length);
+      for (let i = 0; i < ulaw.length; i++) pcm[i] = mulawToLinear(ulaw[i]) / 32768;
+      state.queue.push(pcm);
+      state.queuedSamples += pcm.length;
+      // Cap latency at ~2 s so we don't drift forever on a slow link
+      const max = state.sampleRate * 2;
+      while (state.queuedSamples > max && state.queue.length) {
+        state.queuedSamples -= state.queue[0].length;
+        state.queue.shift();
+        state.queueOffset = 0;
+      }
+    };
+  }
+
+  function cleanupWs() {
+    if (state.ws) {
+      try { state.ws.onopen = state.ws.onclose = state.ws.onmessage = state.ws.onerror = null; } catch (_) {}
+      try { state.ws.close(); } catch (_) {}
+      state.ws = null;
+    }
+    state.monitoring = false;
+    state.txActive = false;
+    $('#vpToggle').classList.remove('on');
+    $('#vpToggle').textContent = 'Listen';
+    $('#vpPtt').classList.remove('live');
+  }
+
+  function stopMonitor() {
+    if (!state.monitoring && !state.ws) return;
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      try { state.ws.send('tx_stop'); } catch (_) {}
+    }
+    cleanupWs();
+    clearQueue();
+    if (state.audioCtx && state.audioCtx.state !== 'closed') {
+      state.audioCtx.suspend().catch(() => {});
+    }
+    setStatus('idle');
+  }
+
+  async function ensureMicPath() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('mic API missing');
+    }
+    if (state.micStream) return;
+    state.micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    state.micCtx = new Ctx();
+    const src = state.micCtx.createMediaStreamSource(state.micStream);
+    state.micProc = state.micCtx.createScriptProcessor(1024, 1, 1);
+    const muteSink = state.micCtx.createGain(); muteSink.gain.value = 0;
+    state.micProc.onaudioprocess = (e) => {
+      if (!state.txActive || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      const inp = e.inputBuffer.getChannelData(0);
+      const inRate = state.micCtx.sampleRate || 48000;
+      const step = inRate / state.sampleRate;
+      const outLen = Math.max(1, Math.floor(inp.length / step));
+      const out = new Uint8Array(outLen);
+      let s = 0, peak = 0;
+      for (let i = 0; i < outLen; i++) {
+        const idx = Math.min(inp.length - 1, Math.floor(s));
+        const v = inp[idx] || 0;
+        out[i] = linearToMulaw(v);
+        const a = Math.abs(v); if (a > peak) peak = a;
+        s += step;
+      }
+      state.txLevel = Math.max(state.txLevel * 0.85, peak);
+      state.ws.send(out.buffer);
+    };
+    src.connect(state.micProc);
+    state.micProc.connect(muteSink);
+    muteSink.connect(state.micCtx.destination);
+    if (state.micCtx.state === 'suspended') await state.micCtx.resume();
+  }
+
+  async function startTx() {
+    if (!state.monitoring) await startMonitor();
+    try { await ensureMicPath(); }
+    catch (e) { setStatus('mic denied', 'err'); return; }
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send('tx_start');
+      state.txActive = true;
+      $('#vpPtt').classList.add('live');
+      setStatus('TX', 'err'); // red looks right for "live mic on air"
+    }
+  }
+
+  function stopTx(localOnly = false) {
+    if (!localOnly && state.ws && state.ws.readyState === WebSocket.OPEN) {
+      try { state.ws.send('tx_stop'); } catch (_) {}
+    }
+    state.txActive = false;
+    $('#vpPtt').classList.remove('live');
+    if (state.monitoring) setStatus('● live', 'ok');
+  }
+
+  function toggleMute() {
+    state.muted = !state.muted;
+    $('#vpMute').textContent = state.muted ? '🔈' : '🔇';
+    setVolumePercent(parseInt($('#vpVol').value, 10) || 80);
+  }
+
+  // 10 Hz UI tick: meters + queue depth
+  setInterval(() => {
+    const rxBar = $('#vpRxBar'), txBar = $('#vpTxBar'), q = $('#vpQueue');
+    if (rxBar) rxBar.style.width = Math.min(100, Math.round(state.rxLevel * 100)) + '%';
+    if (txBar) txBar.style.width = Math.min(100, Math.round(state.txLevel * 100)) + '%';
+    if (q) {
+      const ms = state.sampleRate ? Math.round((state.queuedSamples * 1000) / state.sampleRate) : 0;
+      q.textContent = ms + ' ms';
+    }
+    state.rxLevel *= 0.85;
+    state.txLevel *= 0.85;
+  }, 100);
+
+  return {
+    startMonitor, stopMonitor, startTx, stopTx, toggleMute, setVolumePercent,
+    state,
+  };
+})();
+window.VoiceFM = VoiceFM;
 
 // ---------- Station sheet (callsign + frequency) -------------------------
 
@@ -655,6 +958,57 @@ $('#stationBtn').addEventListener('click', openStation);
 $('#stationClose').addEventListener('click', closeStation);
 $('#stSaveId').addEventListener('click', saveIdentity);
 $('#stSaveRadio').addEventListener('click', saveRadio);
+
+// ---------- Filter wiring -------------------------------------------------
+const filterIn   = $('#filterInput');
+const filterMode = $('#filterMode');
+const filterBar  = $('#filterBar');
+const filterClr  = $('#filterClear');
+function applyFilter() {
+  filterState.text = (filterIn.value || '').trim().toUpperCase();
+  filterState.mode = filterMode.value;
+  filterBar.classList.toggle('active', !!filterState.text);
+  applyFilterToFeed();
+}
+filterIn.addEventListener('input', applyFilter);
+filterMode.addEventListener('change', applyFilter);
+filterClr.addEventListener('click', () => { filterIn.value = ''; applyFilter(); filterIn.focus(); });
+
+// ---------- Voice panel wiring -------------------------------------------
+const voicePanel = $('#voicePanel');
+$('#voiceBtn').addEventListener('click', () => {
+  const wasHidden = voicePanel.hidden;
+  voicePanel.hidden = !wasHidden;
+  $('#voiceBtn').classList.toggle('on', !voicePanel.hidden);
+});
+$('#vpToggle').addEventListener('click', () => {
+  if (VoiceFM.state.monitoring) VoiceFM.stopMonitor();
+  else VoiceFM.startMonitor();
+});
+$('#vpVol').addEventListener('input', (e) => VoiceFM.setVolumePercent(+e.target.value));
+$('#vpMute').addEventListener('click', () => VoiceFM.toggleMute());
+
+// Hold-to-talk PTT (touch + mouse + keyboard space)
+const ptt = $('#vpPtt');
+const pttDown = (e) => { e.preventDefault(); VoiceFM.startTx(); };
+const pttUp   = (e) => { e.preventDefault(); VoiceFM.stopTx();  };
+['mousedown', 'touchstart'].forEach(ev => ptt.addEventListener(ev, pttDown, { passive: false }));
+['mouseup', 'mouseleave', 'touchend', 'touchcancel'].forEach(ev => ptt.addEventListener(ev, pttUp, { passive: false }));
+window.addEventListener('keydown', (e) => {
+  // Space-to-talk only when the voice panel is visible AND no text input is focused.
+  if (e.code !== 'Space' || voicePanel.hidden || e.repeat) return;
+  const tag = (document.activeElement?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  e.preventDefault();
+  VoiceFM.startTx();
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code !== 'Space' || voicePanel.hidden) return;
+  const tag = (document.activeElement?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  e.preventDefault();
+  VoiceFM.stopTx();
+});
 // Frequency presets
 document.addEventListener('click', (e) => {
   const b = e.target.closest('#stationOverlay .preset');

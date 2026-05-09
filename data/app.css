@@ -32,6 +32,47 @@ a{color:#58a6ff;text-decoration:none}
 #topbar #meCall{font-weight:600}
 #topbar .actions{display:flex;gap:8px}
 #topbar .actions a,#topbar .actions button{padding:6px 10px;font-size:13px}
+#topbar .actions button.on{background:#238636;border-color:#2ea043}
+
+/* Filter bar — sticky just below the topbar */
+#filterBar{
+  display:flex;gap:6px;align-items:center;
+  padding:6px 8px;border-bottom:1px solid #21262d;background:#0d1117;
+  position:sticky;top:51px;z-index:4
+}
+#filterBar input[type=text]{flex:1 1 auto;padding:6px 10px;font-size:13px;text-transform:uppercase}
+#filterBar select{
+  background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;
+  padding:6px 8px;font-size:12px;flex:0 0 auto
+}
+#filterBar button{padding:4px 8px;font-size:14px}
+#filterBar.active{background:#1b2433;border-bottom-color:#58a6ff}
+
+/* Voice panel — slides above feed, persistent while monitoring */
+#voicePanel{
+  display:flex;flex-direction:column;gap:6px;
+  padding:8px 10px;border-bottom:1px solid #21262d;background:#11161d
+}
+#voicePanel[hidden]{display:none}
+#voicePanel .vp-row{display:flex;align-items:center;gap:8px}
+#voicePanel #vpToggle{padding:6px 12px}
+#voicePanel #vpToggle.on{background:#238636;border-color:#2ea043}
+#voicePanel #vpVol{flex:1 1 auto}
+#voicePanel .vp-meter{
+  flex:1 1 auto;height:8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;overflow:hidden
+}
+#voicePanel #vpRxBar,#voicePanel #vpTxBar{
+  height:100%;width:0%;background:linear-gradient(90deg,#2ea043,#f0883e,#f85149);
+  transition:width 60ms linear
+}
+#voicePanel .ptt{
+  margin-top:6px;padding:18px;border-radius:14px;
+  background:#1f6feb;border:1px solid #1f6feb;color:#fff;
+  font-weight:700;letter-spacing:.05em;font-size:14px;
+  user-select:none;-webkit-user-select:none;touch-action:manipulation
+}
+#voicePanel .ptt.live{background:#da3633;border-color:#da3633;animation:pttPulse 700ms infinite}
+@keyframes pttPulse{0%{filter:brightness(1)}50%{filter:brightness(1.25)}100%{filter:brightness(1)}}
 
 #feed{
   flex:1 1 auto;overflow-y:auto;

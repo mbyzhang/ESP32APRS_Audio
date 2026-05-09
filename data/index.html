@@ -14,12 +14,26 @@
     <span id="meFreq" class="dim"></span>
   </button>
   <div class="actions">
+    <button id="voiceBtn" class="ghost" title="FM voice (monitor / PTT)">🎙</button>
     <button id="mapBtn" class="ghost" title="Map of stations">🗺</button>
     <button id="gpsBtn" class="ghost" title="Toggle GPS beacon">📍</button>
     <button id="hookBtn" class="ghost" title="Webhooks">🔔</button>
     <a id="settingsLink" class="ghost" href="/settings" title="Settings">⚙️</a>
   </div>
 </header>
+
+<div id="filterBar">
+  <input id="filterInput" type="text" autocomplete="off" spellcheck="false"
+         placeholder="filter (callsign prefix, e.g. M0XYZ)">
+  <select id="filterMode" title="What the filter applies to">
+    <option value="any">any field</option>
+    <option value="src">src callsign</option>
+    <option value="dst">addressee</option>
+    <option value="text">message text</option>
+    <option value="me">to or from me</option>
+  </select>
+  <button id="filterClear" class="ghost" type="button" title="Clear filter">✕</button>
+</div>
 
 <div id="stationOverlay" hidden>
   <div class="sheet">
@@ -100,6 +114,30 @@
   <button id="mapClose" class="ghost" type="button">✕</button>
   <div id="map"></div>
   <div id="mapStatus" class="dim">loading map…</div>
+</div>
+
+<div id="voicePanel" hidden>
+  <div class="vp-row">
+    <button id="vpToggle" type="button">Listen</button>
+    <span id="vpStatus" class="dim">idle</span>
+  </div>
+  <div class="vp-row">
+    <span class="dim">vol</span>
+    <input id="vpVol" type="range" min="0" max="100" value="80">
+    <button id="vpMute" type="button" class="ghost" title="Mute">🔇</button>
+  </div>
+  <div class="vp-row">
+    <span class="dim" style="width:30px">RX</span>
+    <div class="vp-meter"><div id="vpRxBar"></div></div>
+    <span id="vpQueue" class="dim" style="font-variant-numeric:tabular-nums">0 ms</span>
+  </div>
+  <div class="vp-row">
+    <span class="dim" style="width:30px">TX</span>
+    <div class="vp-meter"><div id="vpTxBar"></div></div>
+  </div>
+  <button id="vpPtt" type="button" class="ptt">
+    <span>HOLD&nbsp;TO&nbsp;TALK</span>
+  </button>
 </div>
 
 <main id="feed" aria-live="polite"></main>
