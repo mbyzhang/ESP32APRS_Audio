@@ -1486,7 +1486,11 @@ void defaultConfig()
     config.rf_power = LOW;
     config.volume = 6;
     config.mic = 8;
-    config.modem_type = 1;
+    // 0 = MODEM_1200 (Bell 202: 1200/2200 Hz tones — the standard for APRS).
+    // The previous default of 1 was MODEM_1200_V23 (CCITT V.23: 1300/2100 Hz)
+    // which silently fails to decode any APRS traffic on RX even though the
+    // radio is otherwise healthy.
+    config.modem_type = 0;
 
 #if defined(ESP32C3_MINI)
     // config.wifi_power = 74;

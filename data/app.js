@@ -281,15 +281,24 @@ async function loadRadio() {
     const f = (radio.freq_rx ?? 0).toFixed(4);
     // Make it obvious when RF is disabled — a chat app silently ignoring all
     // radio traffic because rf_en=false is a frustrating debug session.
-    // Show freq + audio level so the user can debug "no RX" at a glance.
-    // mvrms = running RMS of demod input in millivolts; if it stays at 0 the
-    // audio path from the SA868 to the ADC is dead (cable / module issue).
+    // Show freq + audio level + modem state so the user can debug "no RX"
+    // at a glance.
+    //   mvrms : running RMS of demod input (mV).  Stays low (~8) in silence,
+    //           jumps to several hundred on real signal.
+    //   dcd   : demodulator carrier-detect counter (0..100).  Must rise
+    //           above 3 for the AFSK decoder to even attempt to decode.
+    //   modem : 0 = Bell 202 (APRS).  Anything else means RX is silently
+    //           broken until you change it from the Station sheet.
     const mv = radio.mvrms ?? 0;
+    const dcd = radio.dcd ?? 0;
     const sq = radio.sql_pin === 0 ? ' · sq' : '';
-    $('#meFreq').textContent = radio.rf_en
-      ? `${f} MHz · ${mv} mV${sq}`
-      : `${f} MHz · RF off`;
-    $('#meFreq').classList.toggle('warn', !radio.rf_en);
+    const modemBad = (radio.modem ?? 0) !== 0;
+    let label;
+    if (!radio.rf_en) label = `${f} MHz · RF off`;
+    else if (modemBad) label = `${f} MHz · WRONG MODEM (${radio.modem})`;
+    else                label = `${f} MHz · ${mv} mV · dcd ${dcd}${sq}`;
+    $('#meFreq').textContent = label;
+    $('#meFreq').classList.toggle('warn', !radio.rf_en || modemBad);
   } catch (_) {}
 }
 function fullCall() {
@@ -905,6 +914,7 @@ function openStation() {
   $('#stToneTx').value = radio.tone_tx ?? 0;
   $('#stPwr').value    = radio.rf_power ? '1' : '0';
   $('#stRfEn').checked = !!radio.rf_en;
+  $('#stModem').value  = String(radio.modem ?? 0);
   $('#stIdRes').textContent = '';
   $('#stRadioRes').textContent = '';
 }
@@ -931,11 +941,12 @@ async function saveRadio() {
   res.textContent = 'applying…'; res.className = 'res';
   // Prefer the simplex single-freq field when filled; otherwise send split.
   const fields = {
-    sql_level: $('#stSql').value,
-    rf_power:  $('#stPwr').value,
-    tone_rx:   $('#stToneRx').value,
-    tone_tx:   $('#stToneTx').value,
-    rf_en:     $('#stRfEn').checked ? '1' : '0',
+    sql_level:  $('#stSql').value,
+    rf_power:   $('#stPwr').value,
+    tone_rx:    $('#stToneRx').value,
+    tone_tx:    $('#stToneTx').value,
+    rf_en:      $('#stRfEn').checked ? '1' : '0',
+    modem_type: $('#stModem').value,
   };
   if ($('#stFreq').value) {
     fields.freq = $('#stFreq').value;

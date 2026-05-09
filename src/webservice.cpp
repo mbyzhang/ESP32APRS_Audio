@@ -1038,17 +1038,19 @@ void api_radio_get(AsyncWebServerRequest *request)
 {
 	extern volatile int8_t adcEn; // from main.cpp; 1 = ADC sampling, -1 = halted
 	extern int mVrms;             // from main.cpp; running RMS of incoming audio (mV)
+	extern uint8_t dcd_cnt;       // from AFSK.cpp; >3 = demodulator gate is open
 	int sqlPin = -1;
 	if (config.rf_sql_gpio >= 0)
 		sqlPin = digitalRead(config.rf_sql_gpio);
-	char buf[440];
+	char buf[488];
 	snprintf(buf, sizeof(buf),
 			 "{\"freq_rx\":%.4f,\"freq_tx\":%.4f,"
 			 "\"tone_rx\":%d,\"tone_tx\":%d,"
 			 "\"sql_level\":%u,\"rf_power\":%s,"
 			 "\"band\":%u,\"rf_en\":%s,\"volume\":%u,"
 			 "\"rf_type\":%u,\"modem\":%u,\"adc_en\":%d,"
-			 "\"sql_active\":%u,\"mvrms\":%d,\"sql_pin\":%d}",
+			 "\"sql_active\":%u,\"mvrms\":%d,\"sql_pin\":%d,"
+			 "\"dcd\":%u}",
 			 (double)config.freq_rx, (double)config.freq_tx,
 			 config.tone_rx, config.tone_tx,
 			 (unsigned)config.sql_level, config.rf_power ? "true" : "false",
@@ -1056,7 +1058,7 @@ void api_radio_get(AsyncWebServerRequest *request)
 			 (unsigned)config.volume,
 			 (unsigned)config.rf_type, (unsigned)config.modem_type,
 			 (int)adcEn, (unsigned)config.rf_sql_active,
-			 mVrms, sqlPin);
+			 mVrms, sqlPin, (unsigned)dcd_cnt);
 	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
 	r->addHeader("Cache-Control", "no-cache");
 	request->send(r);
@@ -1104,6 +1106,17 @@ void api_radio_set(AsyncWebServerRequest *request)
 		config.rf_en = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y');
 		changed = true;
 	}
+	bool modemChanged = false;
+	if (form_field(request, "modem_type", tmp, sizeof(tmp)))
+	{
+		// 0 = MODEM_1200 (Bell 202, APRS), 1 = MODEM_1200_V23, 2 = MODEM_300, 3 = MODEM_9600
+		uint8_t m = (uint8_t)atoi(tmp);
+		if (m <= 3 && m != config.modem_type) {
+			config.modem_type = m;
+			changed = true;
+			modemChanged = true;
+		}
+	}
 
 	if (!changed)
 	{
@@ -1115,6 +1128,14 @@ void api_radio_set(AsyncWebServerRequest *request)
 	// Defer the actual radio re-init to loop() — the radio init does
 	// blocking serial I/O that we don't want on the AsyncWebServer task.
 	rfModuleReinitPending = true;
+	// Modem switch is cheap (no UART, just timer/coefficient reset) so do it
+	// inline; otherwise the user has to wait for an RF reinit just to retry
+	// decoding with the right tone pair.
+	if (modemChanged) {
+		extern void afskSetModem(uint8_t val, bool bpf, uint16_t timeSlot, uint16_t preamble, uint8_t fx25Mode);
+		afskSetModem(config.modem_type, config.audio_lpf, config.tx_timeslot,
+					  config.preamble * 100, config.fx25_mode);
+	}
 
 	char buf[256];
 	snprintf(buf, sizeof(buf),
