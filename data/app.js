@@ -212,6 +212,9 @@ const allPackets  = [];      // ring of every packet we've seen, for re-filter
 const ALL_MAX     = 600;
 
 function packetMatchesFilter(parsed) {
+  // Never hide our own outbound messages; delivery status has to remain
+  // visible even while the user is filtering the receive feed.
+  if (parsed.dir === 'tx') return true;
   const q = filterState.text;
   if (!q) return true;
   const me = (fullCall() || '').toUpperCase();
@@ -276,6 +279,10 @@ function renderPacketInternal(pkt, recordSideEffects) {
   if (parsed.type === 'message' && parsed.addressee === fullCall()) el.classList.add('dm');
 
   const isMsg = parsed.type === 'message';
+  if (parsed.dir === 'tx' && isMsg && parsed.msgid) {
+    const existing = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(String(parsed.msgid))}"]`);
+    if (existing) return;
+  }
   const headRight = parsed.dir === 'tx'
     ? '✓ sent'
     : (pkt.ch === 1 ? 'IS' : (pkt.audio ? `${pkt.audio} dBV` : 'RF'));
@@ -429,6 +436,18 @@ async function sendCurrentMessage() {
   sendBtn.disabled = false;
   if (res.ok) {
     setStatus('sent', 'ok');
+    if (res.body?.msgID) {
+      renderPendingMessage({
+        msgID: res.body.msgID,
+        to,
+        text,
+        status: 'pending',
+        ack: null,
+        ts: Math.floor(Date.now() / 1000),
+        retries_left: null,
+        retries_total: null,
+      });
+    }
     msgIn.value = '';
     // Kick the pending-status poller so the just-sent bubble gets its
     // retry/ack badge populated quickly instead of waiting for the next
@@ -455,6 +474,8 @@ async function pollPendingMessages() {
   // Index by msgID so we can find the matching bubble quickly.
   const byId = new Map();
   for (const m of list) byId.set(String(m.msgID), m);
+
+  for (const entry of list) renderPendingMessage(entry);
 
   // Walk every TX bubble that's still pending.
   for (const el of feed.querySelectorAll('.msg.me[data-msgid]')) {
@@ -483,6 +504,53 @@ async function pollPendingMessages() {
     statusEl.className = 'status ' + cls;
     el.dataset.status = entry.status;
   }
+}
+
+function txRawFromPending(entry) {
+  const src = fullCall() || me.callsign || 'NOCALL';
+  const to = String(entry.to || '').toUpperCase().padEnd(9, ' ').slice(0, 9);
+  const text = String(entry.text || '');
+  return `${src}>APE32L::${to}:${text}{${entry.msgID}`;
+}
+
+function renderPendingMessage(entry) {
+  if (!entry || entry.msgID == null) return;
+  const id = String(entry.msgID);
+  if (!feed.querySelector(`.msg.me[data-msgid="${CSS.escape(id)}"]`)) {
+    renderPacket({
+      ts: entry.ts || Math.floor(Date.now() / 1000),
+      ch: 0,
+      audio: 0,
+      dir: 'tx',
+      raw: txRawFromPending(entry),
+    });
+  }
+  updatePendingMessageStatus(entry);
+}
+
+function updatePendingMessageStatus(entry) {
+  if (!entry || entry.msgID == null) return;
+  const el = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(String(entry.msgID))}"]`);
+  if (!el) return;
+  const statusEl = el.querySelector('.status');
+  if (!statusEl) return;
+  let label, cls;
+  if (entry.status === 'acked') {
+    label = '✓✓ ack';
+    cls   = 'ok';
+  } else if (entry.status === 'failed') {
+    label = '✗ failed';
+    cls   = 'err';
+  } else {
+    const total = Number(entry.retries_total ?? 0);
+    const left = Number(entry.retries_left ?? total);
+    const used = total > 0 ? Math.max(1, total - left + 1) : 1;
+    label = total > 0 ? `retry ${used}/${total}` : 'pending';
+    cls   = 'warn';
+  }
+  statusEl.textContent = label;
+  statusEl.className = 'status ' + cls;
+  el.dataset.status = entry.status || 'pending';
 }
 
 // Poll while page is open.  Cheap: a single small GET on a 3-second cadence.

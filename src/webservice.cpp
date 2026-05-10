@@ -933,10 +933,10 @@ void api_tx_message(AsyncWebServerRequest *request)
 		else
 			strlcpy(src, config.aprs_mycall, sizeof(src));
 		char tnc2[260];
-		snprintf(tnc2, sizeof(tnc2), "%s>APE32L::%-9s:%s",
-				 src, dest.c_str(), text);
-		publishRawPacket(tnc2, 0, 0, /*tx=*/true);
-	}
+			snprintf(tnc2, sizeof(tnc2), "%s>APE32L::%-9s:%s{%u",
+					 src, dest.c_str(), text, (unsigned)assignedMsgID);
+			publishRawPacket(tnc2, 0, 0, /*tx=*/true);
+		}
 
 	char ok[80];
 	snprintf(ok, sizeof(ok), "{\"ok\":true,\"msgID\":%u}", (unsigned)assignedMsgID);
