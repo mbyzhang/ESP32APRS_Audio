@@ -17,6 +17,7 @@ typedef struct
 	uint8_t type;
 	uint16_t msgID;
 	char callsign[10];
+	char path[32];
 	size_t length;
 	char *text;	
 } msgType;
@@ -24,10 +25,10 @@ typedef struct
 int pkgMsg_Find(const char *call, uint16_t msgID, bool rxtx);
 int pkgMsg_Find(uint16_t msg_id);
 msgType getMsgList(int idx);
-int pkgMsgUpdate(const char *call,const char *raw, uint16_t msg_id, int8_t ack, bool rxtx=false);
+int pkgMsgUpdate(const char *call,const char *raw, uint16_t msg_id, int8_t ack, bool rxtx=false, const char *path=nullptr);
 String aesEncryptBase64WithIV(const String &plain, const uint8_t key[16], uint16_t msgID);
 String aesDecryptBase64WithIV(const String &b64, const uint8_t key[16], const char* callsign, uint16_t msgID);
-void sendAPRSMessage(const String &toCall, const String &message, bool encrypt);
+void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, const char *pathOverride=nullptr);
 void handleIncomingAPRS(const String& line);
 void sendAPRSMessageRetry();
 void pkgMsgSort(msgType a[]);

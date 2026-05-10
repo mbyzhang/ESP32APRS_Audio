@@ -899,11 +899,29 @@ static bool form_field(AsyncWebServerRequest *request, const char *key, char *ou
 	return true;
 }
 
-// POST /api/tx/message — body: form fields {to, text}.  Calls sendAPRSMessage().
+static void sanitize_aprs_path(const char *in, char *out, size_t cap)
+{
+	if (!out || cap == 0) return;
+	size_t j = 0;
+	for (size_t i = 0; in && in[i] && j + 1 < cap; i++)
+	{
+		char c = in[i];
+		if (c >= 'a' && c <= 'z') c -= 32;
+		if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == ',')
+			out[j++] = c;
+	}
+	while (j > 0 && out[j - 1] == ',') j--;
+	out[j] = 0;
+	while (out[0] == ',') memmove(out, out + 1, strlen(out));
+}
+
+// POST /api/tx/message — body: form fields {to, text, path?}.  Calls sendAPRSMessage().
 void api_tx_message(AsyncWebServerRequest *request)
 {
 	char to[16] = {0};
 	char text[200] = {0};
+	char pathRaw[40] = {0};
+	char path[32] = {0};
 	if (!form_field(request, "to", to, sizeof(to)) || to[0] == 0)
 	{
 		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing to\"}");
@@ -914,11 +932,13 @@ void api_tx_message(AsyncWebServerRequest *request)
 		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing text\"}");
 		return;
 	}
+	bool pathProvided = form_field(request, "path", pathRaw, sizeof(pathRaw));
+	sanitize_aprs_path(pathRaw, path, sizeof(path));
 	// Pad addressee to 9 chars (APRS message format wants exactly 9 in <toCall  >).
 	String dest = String(to);
 	dest.toUpperCase();
 	extern uint16_t msgID;   // from src/message.cpp; incremented inside sendAPRSMessage
-	sendAPRSMessage(dest, String(text), config.msg_encrypt);
+	sendAPRSMessage(dest, String(text), config.msg_encrypt, pathProvided ? path : nullptr);
 	uint16_t assignedMsgID = msgID;
 	g_txPacketCount++;
 
@@ -932,9 +952,11 @@ void api_tx_message(AsyncWebServerRequest *request)
 			snprintf(src, sizeof(src), "%s-%u", config.aprs_mycall, (unsigned)config.aprs_ssid);
 		else
 			strlcpy(src, config.aprs_mycall, sizeof(src));
+		char pathPart[36] = {0};
+		if (path[0]) snprintf(pathPart, sizeof(pathPart), ",%s", path);
 		char tnc2[260];
-			snprintf(tnc2, sizeof(tnc2), "%s>APE32L::%-9s:%s{%u",
-					 src, dest.c_str(), text, (unsigned)assignedMsgID);
+			snprintf(tnc2, sizeof(tnc2), "%s>APE32L%s::%-9s:%s{%u",
+					 src, pathPart, dest.c_str(), text, (unsigned)assignedMsgID);
 			publishRawPacket(tnc2, 0, 0, /*tx=*/true);
 		}
 
@@ -970,15 +992,18 @@ void api_messages_pending(AsyncWebServerRequest *request)
 			                          "pending";
 		// JSON-escape the message body.
 		char esc[260];
+		char pathEsc[48];
 		json_escape_into(esc, sizeof(esc),
 						  msgQueue[i].text ? msgQueue[i].text : "");
+		json_escape_into(pathEsc, sizeof(pathEsc), msgQueue[i].path);
 		s->printf("{\"msgID\":%u,\"to\":\"%s\",\"text\":\"%s\","
-				  "\"ack\":%d,\"status\":\"%s\","
+				  "\"path\":\"%s\",\"ack\":%d,\"status\":\"%s\","
 				  "\"ts\":%lld,\"age_s\":%lld,"
 				  "\"retries_left\":%d,\"retries_total\":%u}",
 				  (unsigned)msgQueue[i].msgID,
 				  msgQueue[i].callsign,
 				  esc,
+				  pathEsc,
 				  (int)msgQueue[i].ack,
 				  status,
 				  (long long)msgQueue[i].time,
@@ -1006,12 +1031,14 @@ static void format_aprs_latlon(double lat, double lon, char *out, size_t cap, ch
 			 lonDeg, lonMin, ew, symbol_code);
 }
 
-// POST /api/tx/position — body: {lat, lon, comment?, symbol_table?, symbol_code?, dest?}
+// POST /api/tx/position — body: {lat, lon, comment?, path?, symbol_table?, symbol_code?, dest?}
 void api_tx_position(AsyncWebServerRequest *request)
 {
 	char latS[24] = {0};
 	char lonS[24] = {0};
 	char comment[64] = {0};
+	char pathRaw[40] = {0};
+	char path[32] = "WIDE1-1";
 	char symT[2] = "/";
 	char symC[2] = ">";
 	char destSel[8] = {0};
@@ -1025,6 +1052,8 @@ void api_tx_position(AsyncWebServerRequest *request)
 	form_field(request, "symbol_table", symT, sizeof(symT));
 	form_field(request, "symbol_code", symC, sizeof(symC));
 	form_field(request, "dest", destSel, sizeof(destSel)); // "rf" | "inet" | "" (both)
+	if (form_field(request, "path", pathRaw, sizeof(pathRaw)))
+		sanitize_aprs_path(pathRaw, path, sizeof(path));
 	double lat = atof(latS);
 	double lon = atof(lonS);
 	if (lat == 0.0 && lon == 0.0)
@@ -1042,9 +1071,11 @@ void api_tx_position(AsyncWebServerRequest *request)
 	else
 		snprintf(src, sizeof(src), "%s", config.aprs_mycall);
 
-	// Build TNC2: SRC>APE32L,WIDE1-1:!POS<comment>
+	// Build TNC2: SRC>APE32L[,PATH]:!POS<comment>
+	char pathPart[36] = {0};
+	if (path[0]) snprintf(pathPart, sizeof(pathPart), ",%s", path);
 	char tnc2[200];
-	snprintf(tnc2, sizeof(tnc2), "%s>APE32L,WIDE1-1:!%s%s", src, pos, comment);
+	snprintf(tnc2, sizeof(tnc2), "%s>APE32L%s:!%s%s", src, pathPart, pos, comment);
 
 	uint8_t channel = RF_CHANNEL;
 	if (strcasecmp(destSel, "inet") == 0)
@@ -1361,6 +1392,39 @@ void api_radio_set(AsyncWebServerRequest *request)
 			 config.tone_rx, config.tone_tx,
 			 (unsigned)config.sql_level, config.rf_power ? "true" : "false");
 	request->send(saved ? 200 : 500, "application/json", buf);
+}
+
+// POST /api/time — browser-assisted clock sync.  `epoch` is Unix UTC seconds;
+// `tz` is the browser's local UTC offset in hours (e.g. 1 for London summer).
+void api_time_set(AsyncWebServerRequest *request)
+{
+	char epochS[24] = {0};
+	char tzS[16] = {0};
+	if (!form_field(request, "epoch", epochS, sizeof(epochS)) || epochS[0] == 0)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"missing epoch\"}");
+		return;
+	}
+
+	time_t epoch = (time_t)strtoull(epochS, nullptr, 10);
+	if (epoch < 1700000000)
+	{
+		request->send(400, "application/json", "{\"ok\":false,\"err\":\"bad epoch\"}");
+		return;
+	}
+
+	if (form_field(request, "tz", tzS, sizeof(tzS)) && tzS[0])
+		config.timeZone = atof(tzS);
+
+	timeval tv = {epoch, 0};
+	timezone tz = {(int)(config.timeZone * 3600.0f), 0};
+	settimeofday(&tv, &tz);
+
+	char buf[128];
+	snprintf(buf, sizeof(buf),
+			 "{\"ok\":true,\"epoch\":%lld,\"timeZone\":%.2f}",
+			 (long long)time(NULL), (double)config.timeZone);
+	request->send(200, "application/json", buf);
 }
 
 // GET /api/me — small JSON status doc consumed by the mobile UI on load.
@@ -13582,6 +13646,8 @@ void webService()
 					{ api_radio_get(request); });
 	async_server.on("/api/radio", HTTP_POST, [](AsyncWebServerRequest *request)
 					{ api_radio_set(request); });
+	async_server.on("/api/time", HTTP_POST, [](AsyncWebServerRequest *request)
+					{ api_time_set(request); });
 	// Register the more-specific /api/webhooks/test route BEFORE /api/webhooks
 	// because AsyncWebServer matches by prefix (url.startsWith(uri + "/"))
 	// and the first matching handler wins.

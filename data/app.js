@@ -18,11 +18,23 @@ const meIp   = $('#meIp');
 const toCall = $('#toCall');
 const msgIn  = $('#msgInput');
 const sendBtn= $('#sendBtn');
+const pathBtn= $('#pathBtn');
+const pathMenu = $('#pathMenu');
 const gpsBtn = $('#gpsBtn');
 
 let me = { callsign: '', ssid: 0 };
 const seen = new Set();          // dedupe by raw+ts
 const trackDb = openTrackDb();   // opened lazily, IndexedDB; future Phase 3
+const PATH_OPTIONS = [
+  { value: '', label: 'Direct', help: 'No digipeater path. Best for nearby stations or bench testing.' },
+  { value: 'WIDE1-1', label: 'WIDE1-1', help: 'One local hop. Good for handhelds and mobiles near a fill-in digipeater.' },
+  { value: 'WIDE2-1', label: 'WIDE2-1', help: 'One wide-area hop. Common for a home station with a good antenna.' },
+  { value: 'WIDE1-1,WIDE2-1', label: 'WIDE1-1,WIDE2-1', help: 'Typical two-hop mobile path: local fill-in first, then one wide hop.' },
+  { value: 'WIDE1-0,WIDE2-1', label: 'WIDE1-0,WIDE2-1', help: 'Shows the WIDE1 hop as already used, then allows one WIDE2 hop.' },
+  { value: 'RFONLY', label: 'RFONLY', help: 'Ask internet gateways not to forward this to APRS-IS.' },
+  { value: 'RFONLY-0', label: 'RFONLY-0', help: 'RFONLY with explicit SSID-0 for equipment that expects that form.' },
+];
+let selectedPath = localStorage.getItem('aprs-path') || 'WIDE1-1';
 
 // ---------- TNC2 / APRS parsing (browser-side) -----------------------------
 
@@ -76,18 +88,18 @@ function parsePositionInfo(info) {
   if ('!=/@'.indexOf(info[0]) >= 0) info = info.slice(1);
   // Optional 7-char timestamp on @ and /
   if (info.length > 7 && /^[0-9]{6}[zh\/]/.test(info)) info = info.slice(7);
-  if (info.length < 19) return {};
   // Compressed?  First char in [!-{] but not a digit.
   const first = info.charCodeAt(0);
-  if (info.length >= 13 && first >= 0x21 && first <= 0x7b && !/[0-9]/.test(info[0])) {
-    // Compressed: SYM_TABLE LAT(4) LON(4) SYM_CODE CS(2) T(1)
+  if (info.length >= 10 && first >= 0x21 && first <= 0x7b && !/[0-9]/.test(info[0])) {
+    // Compressed: SYM_TABLE LAT(4) LON(4) SYM_CODE [optional CS(2) T(1)] COMMENT
     const symT = info[0];
     const lat = 90  - decodeBase91(info.slice(1, 5))  / 380926;
     const lon = -180 + decodeBase91(info.slice(5, 9))  / 190463;
     const symC = info[9];
-    const comment = info.slice(13);
+    const comment = info.length > 13 ? info.slice(13) : '';
     return { lat, lon, symbol_table: symT, symbol_code: symC, comment };
   }
+  if (info.length < 19) return {};
   // Uncompressed: ddmm.hhN/dddmm.hhW>comment
   const m = info.match(/^(\d{2})(\d{2}\.\d{2})([NS])(.)(\d{3})(\d{2}\.\d{2})([EW])(.)(.*)$/);
   if (!m) return {};
@@ -203,6 +215,38 @@ function escapeHtml(s) {
   }[c]));
 }
 
+function osmTileFor(lat, lon, z = 13) {
+  const n = 2 ** z;
+  const x = (lon + 180) / 360 * n;
+  const latRad = lat * Math.PI / 180;
+  const y = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n;
+  return {
+    z,
+    x: Math.floor(x),
+    y: Math.floor(y),
+    px: Math.round((x - Math.floor(x)) * 100),
+    py: Math.round((y - Math.floor(y)) * 100),
+  };
+}
+
+function renderPositionBody(parsed) {
+  if (parsed.lat == null || parsed.lon == null) {
+    return escapeHtml(parsed.comment || parsed.info || parsed.raw || '');
+  }
+  const lat = Number(parsed.lat);
+  const lon = Number(parsed.lon);
+  const coords = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+  const comment = parsed.comment ? `<div>${escapeHtml(parsed.comment)}</div>` : '';
+  const tile = osmTileFor(lat, lon);
+  const osmUrl = `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=14/${lat}/${lon}`;
+  const tileUrl = `https://tile.openstreetmap.org/${tile.z}/${tile.x}/${tile.y}.png`;
+  return `${comment}
+    <a class="mini-map" target="_blank" rel="noopener" href="${osmUrl}" style="background-image:url('${tileUrl}')">
+      <span class="pin" style="left:${tile.px}%;top:${tile.py}%"></span>
+    </a>
+    <a class="coords" target="_blank" rel="noopener" href="${osmUrl}">${coords}</a>`;
+}
+
 // ---------- Filter (browser-side, applied to renderPacket) ---------------
 // The chat UI displays *every* packet the firmware reports.  An optional
 // filter narrows what the user sees on the screen — server-side state is
@@ -291,11 +335,7 @@ function renderPacketInternal(pkt, recordSideEffects) {
   if (isMsg) {
     body = `<span class="dim">→ ${escapeHtml(parsed.addressee)}:</span> ${escapeHtml(parsed.message || '')}`;
   } else if (parsed.type === 'position') {
-    const here = (parsed.lat != null) ? `${parsed.lat.toFixed(5)}, ${parsed.lon.toFixed(5)}` : '';
-    body = (parsed.comment || here) ? escapeHtml(parsed.comment || '') : escapeHtml(parsed.info);
-    if (parsed.lat != null) {
-      body += ` <a target="_blank" rel="noopener" href="https://www.openstreetmap.org/?mlat=${parsed.lat}&mlon=${parsed.lon}#map=14/${parsed.lat}/${parsed.lon}">map</a>`;
-    }
+    body = renderPositionBody(parsed);
   } else if (parsed.type === 'status') {
     body = escapeHtml(parsed.status);
   } else {
@@ -344,6 +384,18 @@ async function loadMe() {
   } catch (e) {
     meCall.textContent = '(offline)';
   }
+}
+
+async function syncBrowserTime() {
+  try {
+    const now = Date.now();
+    const tzHours = -new Date(now).getTimezoneOffset() / 60;
+    const res = await postForm('/api/time', {
+      epoch: Math.floor(now / 1000),
+      tz: tzHours.toFixed(2),
+    });
+    if (res.ok) setStatus('time synced', 'ok');
+  } catch (_) {}
 }
 
 let radio = {};
@@ -426,13 +478,48 @@ async function postForm(url, fields) {
   return { ok: r.ok && (j?.ok !== false), status: r.status, body: j };
 }
 
+function currentPathOption() {
+  return PATH_OPTIONS.find((p) => p.value === selectedPath) || PATH_OPTIONS[1];
+}
+
+function updatePathButton() {
+  const opt = currentPathOption();
+  selectedPath = opt.value;
+  pathBtn.textContent = opt.label;
+  pathBtn.title = `APRS path: ${opt.label}`;
+  pathBtn.setAttribute('aria-expanded', pathMenu.hidden ? 'false' : 'true');
+}
+
+function renderPathMenu() {
+  pathMenu.innerHTML = PATH_OPTIONS.map((p) => `
+    <button class="path-option ${p.value === selectedPath ? 'on' : ''}" type="button" data-path="${escapeHtml(p.value)}">
+      <b>${escapeHtml(p.label)}</b>
+      <span>${escapeHtml(p.help)}</span>
+    </button>
+  `).join('');
+}
+
+function setSelectedPath(path) {
+  selectedPath = PATH_OPTIONS.some((p) => p.value === path) ? path : 'WIDE1-1';
+  localStorage.setItem('aprs-path', selectedPath);
+  renderPathMenu();
+  updatePathButton();
+}
+
+function togglePathMenu(forceOpen) {
+  const open = forceOpen == null ? pathMenu.hidden : forceOpen;
+  pathMenu.hidden = !open;
+  pathBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) renderPathMenu();
+}
+
 async function sendCurrentMessage() {
   const to   = (toCall.value || '').trim().toUpperCase();
   const text = (msgIn.value  || '').trim();
   if (!to || !text) return;
   sendBtn.disabled = true;
   setStatus('sending…', 'warn');
-  const res = await postForm('/api/tx/message', { to, text });
+  const res = await postForm('/api/tx/message', { to, text, path: selectedPath });
   sendBtn.disabled = false;
   if (res.ok) {
     setStatus('sent', 'ok');
@@ -446,6 +533,7 @@ async function sendCurrentMessage() {
         ts: Math.floor(Date.now() / 1000),
         retries_left: null,
         retries_total: null,
+        path: selectedPath,
       });
     }
     msgIn.value = '';
@@ -510,7 +598,8 @@ function txRawFromPending(entry) {
   const src = fullCall() || me.callsign || 'NOCALL';
   const to = String(entry.to || '').toUpperCase().padEnd(9, ' ').slice(0, 9);
   const text = String(entry.text || '');
-  return `${src}>APE32L::${to}:${text}{${entry.msgID}`;
+  const path = entry.path ? `,${entry.path}` : '';
+  return `${src}>APE32L${path}::${to}:${text}{${entry.msgID}`;
 }
 
 function renderPendingMessage(entry) {
@@ -791,6 +880,7 @@ async function sendPickedLocation() {
     lat: lat.toFixed(6),
     lon: lon.toFixed(6),
     comment: ' picked from map',
+    path: selectedPath,
     symbol_table: '/', symbol_code: '>',
   });
   if (r.ok) {
@@ -805,6 +895,22 @@ async function sendPickedLocation() {
 
 // ---------- Wiring --------------------------------------------------------
 
+setSelectedPath(selectedPath);
+pathBtn.addEventListener('click', () => togglePathMenu());
+pathMenu.addEventListener('click', (e) => {
+  const opt = e.target.closest('.path-option');
+  if (!opt) return;
+  setSelectedPath(opt.dataset.path || '');
+  togglePathMenu(false);
+});
+document.addEventListener('click', (e) => {
+  if (pathMenu.hidden) return;
+  if (pathMenu.contains(e.target) || pathBtn.contains(e.target)) return;
+  togglePathMenu(false);
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') togglePathMenu(false);
+});
 sendBtn.addEventListener('click', sendCurrentMessage);
 msgIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendCurrentMessage(); });
 gpsBtn.addEventListener('click', toggleGps);
@@ -1320,6 +1426,7 @@ document.addEventListener('click', (e) => {
 
 (async () => {
   setStatus('loading…', 'dim');
+  await syncBrowserTime();
   await Promise.all([loadMe(), loadRadio()]);
   await hydrate();
   connectStream();

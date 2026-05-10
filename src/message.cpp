@@ -298,7 +298,26 @@ msgType getMsgList(int idx)
     return ret;
 }
 
-int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack, bool rxtx)
+static String messagePathFromOverride(const char *pathOverride)
+{
+    if (pathOverride)
+        return pathOverride[0] ? "," + String(pathOverride) : "";
+
+    String path = "";
+    if (config.msg_path < 5)
+    {
+        if (config.msg_path > 0)
+            path += "-" + String(config.msg_path);
+    }
+    else
+    {
+        path += ",";
+        path += getPath(config.msg_path);
+    }
+    return path;
+}
+
+int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack, bool rxtx, const char *path)
 {
     size_t len;
     if (*call == 0)
@@ -337,6 +356,9 @@ int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack,
     msgQueue[i].msgID = msg_id;
     msgQueue[i].ack = ack;
     msgQueue[i].rxtx = rxtx;
+    memset(msgQueue[i].path, 0, sizeof(msgQueue[i].path));
+    if (path && path[0])
+        strlcpy(msgQueue[i].path, path, sizeof(msgQueue[i].path));
 
     // strcpy(pkgList[i].calsign, callsign);
     memset(msgQueue[i].callsign, 0, sizeof(msgQueue[i].callsign));
@@ -366,7 +388,7 @@ int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack,
 }
 
 // ===== ส่งข้อความ APRS =====
-void sendAPRSMessage(const String &toCall, const String &message, bool encrypt)
+void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, const char *pathOverride)
 {
     ++msgID;
     if (toCall == "")
@@ -407,17 +429,7 @@ void sendAPRSMessage(const String &toCall, const String &message, bool encrypt)
     {
         encrypted = message;
     }
-    String path = "";
-    if (config.msg_path < 5)
-    {
-        if (config.msg_path > 0)
-            path += "-" + String(config.msg_path);
-    }
-    else
-    {
-        path += ",";
-        path += getPath(config.msg_path);
-    }
+    String path = messagePathFromOverride(pathOverride);
 
     String packet = myCallUP + ">APE32L" + path + "::" + String(toCallFixed) + ":" + encrypted + "{" + String(msgID);
 
@@ -429,9 +441,9 @@ void sendAPRSMessage(const String &toCall, const String &message, bool encrypt)
     pkgTxPush(packet.c_str(), packet.length(), 0, SendMode);
     log_d("Send APRS Message to %s msgID %d TNC2: %s", toCall.c_str(), msgID, packet.c_str());
     if (config.msg_retry == 0)
-        pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, -2, false); // -2=No retry
+        pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, -2, false, pathOverride); // -2=No retry
     else
-        pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, config.msg_retry, false);
+        pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, config.msg_retry, false, pathOverride);
     event_chatMessage(false);
     // log_d(">> " + packet);
 }
@@ -463,17 +475,7 @@ void sendAPRSMessageRetry()
             {
                 encrypted = String(msgQueue[i].text);
             }
-            String path = "";
-            if (config.msg_path < 5)
-            {
-                if (config.msg_path > 0)
-                    path += "-" + String(config.msg_path);
-            }
-            else
-            {
-                path += ",";
-                path += getPath(config.msg_path);
-            }
+            String path = messagePathFromOverride(msgQueue[i].path);
             String packet = String(config.msg_mycall) + ">APE32L" + path + "::" + String(toCallFixed) + ":" + encrypted + "{" + String(msgQueue[i].msgID);
             uint8_t SendMode = 0;
             if (config.msg_rf)
