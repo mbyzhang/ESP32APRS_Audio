@@ -90,6 +90,9 @@ a{color:#58a6ff;text-decoration:none}
 .msg .head .src{font-weight:600;color:#79c0ff}
 .msg.me .head .src{color:#7ee787}
 .msg .head .ts{color:#7d8590;font-variant-numeric:tabular-nums}
+.msg .head .status.ok{color:#2ea043}
+.msg .head .status.warn{color:#f0883e}
+.msg .head .status.err{color:#f85149}
 .msg .body{margin-top:2px;white-space:pre-wrap;word-break:break-word}
 .msg .meta{margin-top:4px;font-size:11px;color:#6e7681;display:flex;gap:10px;flex-wrap:wrap}
 .msg .meta .pill{background:#161b22;border:1px solid #30363d;border-radius:999px;padding:1px 8px}
@@ -131,6 +134,21 @@ a{color:#58a6ff;text-decoration:none}
   position:absolute;left:0;right:0;bottom:0;text-align:center;
   padding:6px;background:#0d1117c0;font-size:12px
 }
+#mapPickBtn{
+  position:absolute;top:calc(8px + env(safe-area-inset-top));left:8px;z-index:12;
+  background:#0d1117e0;border:1px solid #30363d;border-radius:999px;
+  padding:6px 10px;font-size:12px
+}
+#mapPickBtn.on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+#mapPickBar{
+  position:absolute;left:0;right:0;bottom:0;z-index:12;
+  display:flex;gap:8px;align-items:center;justify-content:space-between;
+  padding:8px 10px;background:#0d1117;border-top:1px solid #30363d
+}
+#mapPickBar[hidden]{display:none}
+#mapPickBar #mapPickCoords{font-variant-numeric:tabular-nums;font-size:12px;flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mapPickBar #mapPickSend{background:#1f6feb;border-color:#1f6feb;color:#fff}
+#mapPickBar #mapPickSend[disabled]{opacity:.5}
 .leaflet-popup-content{color:#222;font-size:13px}
 
 /* Webhooks slide-out sheet */

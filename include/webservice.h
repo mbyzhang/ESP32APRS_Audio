@@ -160,6 +160,7 @@ void api_me(AsyncWebServerRequest *request);
 void api_packets_recent(AsyncWebServerRequest *request);
 void api_tx_message(AsyncWebServerRequest *request);
 void api_tx_position(AsyncWebServerRequest *request);
+void api_messages_pending(AsyncWebServerRequest *request);
 void api_webhooks_list(AsyncWebServerRequest *request);
 void api_webhooks_save(AsyncWebServerRequest *request);
 void api_webhooks_test(AsyncWebServerRequest *request);

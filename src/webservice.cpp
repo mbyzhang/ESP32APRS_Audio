@@ -841,7 +841,9 @@ void api_tx_message(AsyncWebServerRequest *request)
 	// Pad addressee to 9 chars (APRS message format wants exactly 9 in <toCall  >).
 	String dest = String(to);
 	dest.toUpperCase();
+	extern uint16_t msgID;   // from src/message.cpp; incremented inside sendAPRSMessage
 	sendAPRSMessage(dest, String(text), config.msg_encrypt);
+	uint16_t assignedMsgID = msgID;
 	g_txPacketCount++;
 
 	// Echo our own TX into the chat feed so the user sees what they sent.
@@ -860,7 +862,56 @@ void api_tx_message(AsyncWebServerRequest *request)
 		publishRawPacket(tnc2, 0, 0, /*tx=*/true);
 	}
 
-	request->send(200, "application/json", "{\"ok\":true}");
+	char ok[80];
+	snprintf(ok, sizeof(ok), "{\"ok\":true,\"msgID\":%u}", (unsigned)assignedMsgID);
+	request->send(200, "application/json", ok);
+}
+
+// GET /api/messages/pending — list outbound APRS messages that the firmware
+// is still trying to deliver, so the chat UI can show retry / ack state on
+// each "me" bubble.  ack semantics from msgQueue:
+//   ack > 0   → retries remaining; firmware will retransmit
+//   ack == -2 → ACK'd by recipient (delivered)
+//   ack == 0  → retries exhausted (delivery failed)
+void api_messages_pending(AsyncWebServerRequest *request)
+{
+	extern msgType *msgQueue;   // from src/message.cpp; PKGLISTSIZE entries
+	AsyncResponseStream *s = request->beginResponseStream("application/json");
+	if (!s) { request->send(500, "text/plain", "alloc failed"); return; }
+	s->addHeader("Cache-Control", "no-cache");
+	s->print('[');
+	bool first = true;
+	time_t now = time(NULL);
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		// rxtx is true for inbound, false for outbound TX (what we want here).
+		if (msgQueue[i].time == 0 || msgQueue[i].rxtx) continue;
+		if (!first) s->print(',');
+		first = false;
+		const char *status =
+			(msgQueue[i].ack == -2) ? "acked" :
+			(msgQueue[i].ack == 0)  ? "failed" :
+			                          "pending";
+		// JSON-escape the message body.
+		char esc[260];
+		json_escape_into(esc, sizeof(esc),
+						  msgQueue[i].text ? msgQueue[i].text : "");
+		s->printf("{\"msgID\":%u,\"to\":\"%s\",\"text\":\"%s\","
+				  "\"ack\":%d,\"status\":\"%s\","
+				  "\"ts\":%lld,\"age_s\":%lld,"
+				  "\"retries_left\":%d,\"retries_total\":%u}",
+				  (unsigned)msgQueue[i].msgID,
+				  msgQueue[i].callsign,
+				  esc,
+				  (int)msgQueue[i].ack,
+				  status,
+				  (long long)msgQueue[i].time,
+				  (long long)(now - msgQueue[i].time),
+				  (msgQueue[i].ack > 0) ? (int)msgQueue[i].ack : 0,
+				  (unsigned)config.msg_retry);
+	}
+	s->print(']');
+	request->send(s);
 }
 
 // Build an APRS uncompressed lat/lon string: ddmm.hhN/dddmm.hhW
@@ -13407,6 +13458,8 @@ void webService()
 					{ api_tx_message(request); });
 	async_server.on("/api/tx/position", HTTP_POST, [](AsyncWebServerRequest *request)
 					{ api_tx_position(request); });
+	async_server.on("/api/messages/pending", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_messages_pending(request); });
 	async_server.on("/api/identity", HTTP_POST, [](AsyncWebServerRequest *request)
 					{ api_identity_set(request); });
 	async_server.on("/api/radio", HTTP_GET, [](AsyncWebServerRequest *request)

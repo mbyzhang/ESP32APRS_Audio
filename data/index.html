@@ -120,8 +120,14 @@
 
 <div id="mapOverlay" hidden>
   <button id="mapClose" class="ghost" type="button">✕</button>
+  <button id="mapPickBtn" class="ghost" type="button" title="Pick a location to send">📍 send from map</button>
   <div id="map"></div>
   <div id="mapStatus" class="dim">loading map…</div>
+  <div id="mapPickBar" hidden>
+    <span id="mapPickCoords" class="dim">tap the map to place a marker</span>
+    <button id="mapPickSend" type="button" disabled>Send this location</button>
+    <button id="mapPickCancel" class="ghost" type="button">cancel</button>
+  </div>
 </div>
 
 <div id="voicePanel" hidden>

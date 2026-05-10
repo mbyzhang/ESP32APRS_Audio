@@ -105,15 +105,70 @@ function decodeBase91(s) {
 function openTrackDb() {
   return new Promise((resolve) => {
     if (!('indexedDB' in window)) return resolve(null);
-    const r = indexedDB.open('aprs-tracks', 1);
-    r.onupgradeneeded = () => {
+    // bumped to v2 to add the "packets" store — keeps the chat timeline
+    // across page refreshes (incl. our own self-TX which the device never
+    // re-broadcasts to /api/packets/recent).
+    const r = indexedDB.open('aprs-tracks', 2);
+    r.onupgradeneeded = (ev) => {
       const db = r.result;
       if (!db.objectStoreNames.contains('points'))
         db.createObjectStore('points', { keyPath: 'id', autoIncrement: true })
           .createIndex('byCall', 'src');
+      if (!db.objectStoreNames.contains('packets'))
+        db.createObjectStore('packets', { keyPath: 'id', autoIncrement: true })
+          .createIndex('byTs', 'ts');
     };
     r.onsuccess = () => resolve(r.result);
     r.onerror   = () => resolve(null);
+  });
+}
+
+const PACKETS_KEEP = 500;   // upper bound on persisted packet history
+
+async function persistPacket(pkt) {
+  const db = await trackDb;
+  if (!db) return;
+  try {
+    const tx = db.transaction('packets', 'readwrite');
+    const store = tx.objectStore('packets');
+    store.add({ ts: pkt.ts, ch: pkt.ch, audio: pkt.audio, dir: pkt.dir || 'rx', raw: pkt.raw });
+    // Trim oldest entries — count first, then delete from the front of the
+    // byTs index until we're below the cap.
+    const countReq = store.count();
+    countReq.onsuccess = () => {
+      const overflow = countReq.result - PACKETS_KEEP;
+      if (overflow <= 0) return;
+      const idx = store.index('byTs');
+      const cur = idx.openCursor();
+      let removed = 0;
+      cur.onsuccess = (ev) => {
+        const c = ev.target.result;
+        if (!c || removed >= overflow) return;
+        c.delete();
+        removed++;
+        c.continue();
+      };
+    };
+  } catch (_) {}
+}
+
+async function loadPersistedPackets(limit = PACKETS_KEEP) {
+  const db = await trackDb;
+  if (!db) return [];
+  return new Promise((resolve) => {
+    const out = [];
+    try {
+      const tx = db.transaction('packets', 'readonly');
+      const idx = tx.objectStore('packets').index('byTs');
+      idx.openCursor().onsuccess = (ev) => {
+        const c = ev.target.result;
+        if (!c) return resolve(out);
+        out.push(c.value);
+        if (out.length >= limit) return resolve(out);
+        c.continue();
+      };
+      tx.onerror = () => resolve(out);
+    } catch (_) { resolve(out); }
   });
 }
 async function recordTrackPoint(pkt) {
@@ -182,7 +237,7 @@ function applyFilterToFeed() {
   if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
 }
 
-function renderPacket(pkt) {
+function renderPacket(pkt, opts = {}) {
   const key = pkt.ts + '|' + pkt.raw;
   if (seen.has(key)) return;
   seen.add(key);
@@ -193,6 +248,9 @@ function renderPacket(pkt) {
   allPackets.push(pkt);
   if (allPackets.length > ALL_MAX) allPackets.shift();
   renderPacketInternal(pkt, true);
+  // Persist for the next page load.  We skip when re-rendering historical
+  // entries (opts.skipPersist) so we don't double-write on hydration.
+  if (!opts.skipPersist) persistPacket(pkt);
 }
 
 function renderPacketInternal(pkt, recordSideEffects) {
@@ -237,10 +295,19 @@ function renderPacketInternal(pkt, recordSideEffects) {
     body = escapeHtml(parsed.info || pkt.raw);
   }
 
+  // Mark TX message bubbles with their APRS msgID so the pending-status
+  // poller can later flip the badge from "sent" → "✓✓ ack'd" / "retry 2/3"
+  // / "failed".  The msgID comes out of parseTnc2's parsing of the {NNN
+  // trailer on the message line.
+  if (parsed.dir === 'tx' && isMsg && parsed.msgid) {
+    el.dataset.msgid = String(parsed.msgid);
+    el.dataset.status = 'sent';
+  }
+
   el.innerHTML =
     `<div class="head">
        <span class="src">${escapeHtml(parsed.src)}</span>
-       <span class="ts">${fmtTime(pkt.ts)} · ${escapeHtml(headRight)}</span>
+       <span class="ts">${fmtTime(pkt.ts)} · <span class="status">${escapeHtml(headRight)}</span></span>
      </div>
      <div class="body">${body}</div>
      <div class="meta">
@@ -306,14 +373,25 @@ function fullCall() {
 }
 
 async function hydrate() {
+  // 1. Replay persisted packets first (includes our self-TX, which the
+  //    device never re-broadcasts).
+  try {
+    const persisted = await loadPersistedPackets();
+    // already in chronological order from byTs index
+    for (const pkt of persisted) renderPacket(pkt, { skipPersist: true });
+  } catch (_) {}
+
+  // 2. Then ask the device for its in-RAM RX ring; dedupe is handled by the
+  //    `seen` Set inside renderPacket().
   try {
     const r = await fetch('/api/packets/recent');
-    if (!r.ok) return;
-    const arr = await r.json();
-    // Render oldest first so the live tail appears at the bottom
-    arr.reverse().forEach(renderPacket);
-    feed.scrollTop = feed.scrollHeight;
+    if (r.ok) {
+      const arr = await r.json();
+      arr.reverse().forEach((pkt) => renderPacket(pkt));
+    }
   } catch (_) {}
+
+  feed.scrollTop = feed.scrollHeight;
 }
 
 let es;
@@ -352,10 +430,63 @@ async function sendCurrentMessage() {
   if (res.ok) {
     setStatus('sent', 'ok');
     msgIn.value = '';
+    // Kick the pending-status poller so the just-sent bubble gets its
+    // retry/ack badge populated quickly instead of waiting for the next
+    // periodic tick.
+    setTimeout(pollPendingMessages, 400);
   } else {
     setStatus('send failed (' + res.status + ')', 'err');
   }
 }
+
+// ---------- Outgoing-message retry / ack status -------------------------
+// The firmware keeps a queue of unACK'd outbound messages.  Every few
+// seconds we ask /api/messages/pending what state they're in and patch
+// the corresponding TX bubbles in the feed.
+
+async function pollPendingMessages() {
+  let list;
+  try {
+    const r = await fetch('/api/messages/pending');
+    if (!r.ok) return;
+    list = await r.json();
+  } catch (_) { return; }
+
+  // Index by msgID so we can find the matching bubble quickly.
+  const byId = new Map();
+  for (const m of list) byId.set(String(m.msgID), m);
+
+  // Walk every TX bubble that's still pending.
+  for (const el of feed.querySelectorAll('.msg.me[data-msgid]')) {
+    const id = el.dataset.msgid;
+    const entry = byId.get(id);
+    const statusEl = el.querySelector('.status');
+    if (!statusEl) continue;
+    if (!entry) {
+      // Server forgot about it — likely fell out of the small ring.  Leave
+      // whatever we last showed.
+      continue;
+    }
+    let label, cls;
+    if (entry.status === 'acked') {
+      label = '✓✓ ack';
+      cls   = 'ok';
+    } else if (entry.status === 'failed') {
+      label = '✗ failed';
+      cls   = 'err';
+    } else {
+      const used = entry.retries_total - entry.retries_left + 1;
+      label = `retry ${used}/${entry.retries_total}`;
+      cls   = 'warn';
+    }
+    statusEl.textContent = label;
+    statusEl.className = 'status ' + cls;
+    el.dataset.status = entry.status;
+  }
+}
+
+// Poll while page is open.  Cheap: a single small GET on a 3-second cadence.
+setInterval(pollPendingMessages, 3000);
 
 // ---------- GPS beacon ----------------------------------------------------
 
@@ -526,6 +657,82 @@ async function openMapOverlay() {
 function closeMapOverlay() {
   $('#mapOverlay').hidden = true;
   mapVisible = false;
+  exitPickMode();
+}
+
+// ---------- Pick-on-map → send position ---------------------------------
+// Tap the "send from map" button on the map overlay → tap anywhere on the
+// map → confirm bar at the bottom shows the lat/lon and a Send button which
+// POSTs to /api/tx/position.  Useful for relaying someone else's location
+// or for setting a static beacon site without GPS.
+let mapPickMarker = null;
+let mapPickLatLng = null;
+let mapPickClickHandler = null;
+
+function enterPickMode() {
+  if (!mapInstance) return;
+  $('#mapPickBtn').classList.add('on');
+  $('#mapPickBar').hidden = false;
+  $('#mapPickCoords').textContent = 'tap the map to place a marker';
+  $('#mapPickSend').disabled = true;
+  mapPickClickHandler = (e) => {
+    mapPickLatLng = e.latlng;
+    const L = window.L;
+    if (mapPickMarker) {
+      mapPickMarker.setLatLng(e.latlng);
+    } else {
+      mapPickMarker = L.marker(e.latlng, { draggable: true }).addTo(mapInstance);
+      mapPickMarker.on('dragend', (ev) => {
+        mapPickLatLng = ev.target.getLatLng();
+        updatePickCoords();
+      });
+    }
+    updatePickCoords();
+  };
+  mapInstance.on('click', mapPickClickHandler);
+}
+
+function updatePickCoords() {
+  if (!mapPickLatLng) return;
+  $('#mapPickCoords').textContent =
+    `${mapPickLatLng.lat.toFixed(5)}, ${mapPickLatLng.lng.toFixed(5)}`;
+  $('#mapPickSend').disabled = false;
+}
+
+function exitPickMode() {
+  $('#mapPickBtn').classList.remove('on');
+  $('#mapPickBar').hidden = true;
+  if (mapInstance && mapPickClickHandler) {
+    mapInstance.off('click', mapPickClickHandler);
+    mapPickClickHandler = null;
+  }
+  if (mapPickMarker) {
+    mapPickMarker.remove();
+    mapPickMarker = null;
+  }
+  mapPickLatLng = null;
+}
+
+async function sendPickedLocation() {
+  if (!mapPickLatLng) return;
+  const lat = mapPickLatLng.lat;
+  const lon = mapPickLatLng.lng;
+  $('#mapPickSend').disabled = true;
+  $('#mapPickCoords').textContent = 'sending…';
+  const r = await postForm('/api/tx/position', {
+    lat: lat.toFixed(6),
+    lon: lon.toFixed(6),
+    comment: ' picked from map',
+    symbol_table: '/', symbol_code: '>',
+  });
+  if (r.ok) {
+    $('#mapPickCoords').textContent =
+      `✓ sent ${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+    setTimeout(exitPickMode, 1500);
+  } else {
+    $('#mapPickCoords').textContent = 'send failed';
+    $('#mapPickSend').disabled = false;
+  }
 }
 
 // ---------- Wiring --------------------------------------------------------
@@ -535,6 +742,12 @@ msgIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendCurrentMes
 gpsBtn.addEventListener('click', toggleGps);
 $('#mapBtn').addEventListener('click', openMapOverlay);
 $('#mapClose').addEventListener('click', closeMapOverlay);
+$('#mapPickBtn').addEventListener('click', () => {
+  if ($('#mapPickBtn').classList.contains('on')) exitPickMode();
+  else enterPickMode();
+});
+$('#mapPickSend').addEventListener('click', sendPickedLocation);
+$('#mapPickCancel').addEventListener('click', exitPickMode);
 
 // ---------- Webhooks panel -----------------------------------------------
 
