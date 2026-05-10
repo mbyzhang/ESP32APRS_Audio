@@ -1486,11 +1486,8 @@ void defaultConfig()
     config.rf_power = LOW;
     config.volume = 6;
     config.mic = 8;
-    // 0 = MODEM_1200 (Bell 202: 1200/2200 Hz tones — the standard for APRS).
-    // The previous default of 1 was MODEM_1200_V23 (CCITT V.23: 1300/2100 Hz)
-    // which silently fails to decode any APRS traffic on RX even though the
-    // radio is otherwise healthy.
-    config.modem_type = 0;
+    // Firmware enum: 0 = AFSK_300, 1 = AFSK_1200 Bell 202, 2 = AFSK_1200 V.23.
+    config.modem_type = 1;
 
 #if defined(ESP32C3_MINI)
     // config.wifi_power = 74;
@@ -3418,6 +3415,7 @@ void setup()
     if (config.rf_ptt_gpio != 18) { config.rf_ptt_gpio = 18; kv4pPinFixApplied = true; }
     if (config.adc_gpio != 34) { config.adc_gpio = 34; kv4pPinFixApplied = true; }
     if (config.dac_gpio != 25) { config.dac_gpio = 25; kv4pPinFixApplied = true; }
+    if (config.modem_type == 0) { config.modem_type = 1; kv4pPinFixApplied = true; }
     if (config.rf_sql_active != 0) { config.rf_sql_active = 0; kv4pPinFixApplied = true; }
     if (config.rf_pd_active != 1) { config.rf_pd_active = 1; kv4pPinFixApplied = true; }
     if (config.rf_ptt_active != 0) { config.rf_ptt_active = 0; kv4pPinFixApplied = true; }

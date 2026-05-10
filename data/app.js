@@ -354,12 +354,12 @@ async function loadRadio() {
     //           jumps to several hundred on real signal.
     //   dcd   : demodulator carrier-detect counter (0..100).  Must rise
     //           above 3 for the AFSK decoder to even attempt to decode.
-    //   modem : 0 = Bell 202 (APRS).  Anything else means RX is silently
+    //   modem : 1 = Bell 202 (APRS).  Anything else means RX is silently
     //           broken until you change it from the Station sheet.
     const mv = radio.mvrms ?? 0;
     const dcd = radio.dcd ?? 0;
     const sq = radio.sql_pin === 0 ? ' · sq' : '';
-    const modemBad = (radio.modem ?? 0) !== 0;
+    const modemBad = (radio.modem ?? 1) !== 1;
     let label;
     if (!radio.rf_en) label = `${f} MHz · RF off`;
     else if (modemBad) label = `${f} MHz · WRONG MODEM (${radio.modem})`;

@@ -85,7 +85,7 @@ Response fields:
 | `rf_en` | boolean | RF module enabled |
 | `volume` | number | configured volume |
 | `rf_type` | number | configured RF module type |
-| `modem` | number | `0` Bell 202 APRS, `1` V.23, `2` 300 baud, `3` 9600 baud |
+| `modem` | number | `0` 300 baud, `1` Bell 202 APRS, `2` V.23, `3` 9600 baud |
 | `adc_en` | number | ADC task state, `1` sampling, `-1` halted |
 | `sql_active` | number | squelch active level config |
 | `mvrms` | number | current demod input RMS in mV |

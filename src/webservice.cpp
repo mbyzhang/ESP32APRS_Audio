@@ -1213,7 +1213,7 @@ void api_radio_set(AsyncWebServerRequest *request)
 	bool modemChanged = false;
 	if (form_field(request, "modem_type", tmp, sizeof(tmp)))
 	{
-		// 0 = MODEM_1200 (Bell 202, APRS), 1 = MODEM_1200_V23, 2 = MODEM_300, 3 = MODEM_9600
+		// Firmware enum: 0 = AFSK_300, 1 = AFSK_1200 Bell 202, 2 = AFSK_1200 V.23, 3 = GFSK 9600.
 		uint8_t m = (uint8_t)atoi(tmp);
 		if (m <= 3 && m != config.modem_type) {
 			config.modem_type = m;
