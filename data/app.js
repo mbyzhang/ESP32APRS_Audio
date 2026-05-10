@@ -1126,8 +1126,12 @@ function openStation() {
   $('#stToneRx').value = radio.tone_rx ?? 0;
   $('#stToneTx').value = radio.tone_tx ?? 0;
   $('#stPwr').value    = radio.rf_power ? '1' : '0';
-  $('#stRfEn').checked = !!radio.rf_en;
-  $('#stModem').value  = String(radio.modem ?? 0);
+  $('#stRfEn').checked    = !!radio.rf_en;
+  $('#stModem').value     = String(radio.modem ?? 0);
+  $('#stFx25').value      = String(radio.fx25_mode ?? 0);
+  $('#stPreamble').value  = radio.preamble ?? 3;
+  $('#stTxSlot').value    = radio.tx_timeslot ?? 2000;
+  $('#stAudioLpf').checked= !!radio.audio_lpf;
   $('#stIdRes').textContent = '';
   $('#stRadioRes').textContent = '';
 }
@@ -1154,12 +1158,16 @@ async function saveRadio() {
   res.textContent = 'applying…'; res.className = 'res';
   // Prefer the simplex single-freq field when filled; otherwise send split.
   const fields = {
-    sql_level:  $('#stSql').value,
-    rf_power:   $('#stPwr').value,
-    tone_rx:    $('#stToneRx').value,
-    tone_tx:    $('#stToneTx').value,
-    rf_en:      $('#stRfEn').checked ? '1' : '0',
-    modem_type: $('#stModem').value,
+    sql_level:   $('#stSql').value,
+    rf_power:    $('#stPwr').value,
+    tone_rx:     $('#stToneRx').value,
+    tone_tx:     $('#stToneTx').value,
+    rf_en:       $('#stRfEn').checked ? '1' : '0',
+    modem_type:  $('#stModem').value,
+    fx25_mode:   $('#stFx25').value,
+    preamble:    $('#stPreamble').value,
+    tx_timeslot: $('#stTxSlot').value,
+    audio_lpf:   $('#stAudioLpf').checked ? '1' : '0',
   };
   if ($('#stFreq').value) {
     fields.freq = $('#stFreq').value;

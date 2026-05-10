@@ -96,6 +96,20 @@ static const char *EMBEDDED_INDEX_HTML = R"EMBED(<!DOCTYPE html>
           <label class="grow">CTCSS RX (Hz×10)<input id="stToneRx" type="number" min="0"></label>
           <label class="grow">CTCSS TX (Hz×10)<input id="stToneTx" type="number" min="0"></label>
         </div>
+        <div class="row">
+          <label style="flex:0 0 auto">FX.25 (Reed-Solomon)
+            <select id="stFx25" title="Plain AX.25 = compatible with vanilla TNCs / scanners. FX.25 RX+TX adds RS parity that needs an FX.25-aware peer.">
+              <option value="0">off (plain AX.25)</option>
+              <option value="1">RX only</option>
+              <option value="2">RX + TX</option>
+            </select>
+          </label>
+          <label style="flex:0 0 110px">preamble (×100 ms)<input id="stPreamble" type="number" min="1" max="20"></label>
+          <label style="flex:0 0 130px">tx slot (ms)<input id="stTxSlot" type="number" min="0" max="60000" step="100"></label>
+          <label style="flex:0 0 auto;flex-direction:row;align-items:center;gap:6px">
+            <input id="stAudioLpf" type="checkbox"> audio LPF
+          </label>
+        </div>
       </details>
       <div class="row">
         <button type="button" id="stSaveRadio">Apply frequency</button>
@@ -1521,8 +1535,12 @@ function openStation() {
   $('#stToneRx').value = radio.tone_rx ?? 0;
   $('#stToneTx').value = radio.tone_tx ?? 0;
   $('#stPwr').value    = radio.rf_power ? '1' : '0';
-  $('#stRfEn').checked = !!radio.rf_en;
-  $('#stModem').value  = String(radio.modem ?? 0);
+  $('#stRfEn').checked    = !!radio.rf_en;
+  $('#stModem').value     = String(radio.modem ?? 0);
+  $('#stFx25').value      = String(radio.fx25_mode ?? 0);
+  $('#stPreamble').value  = radio.preamble ?? 3;
+  $('#stTxSlot').value    = radio.tx_timeslot ?? 2000;
+  $('#stAudioLpf').checked= !!radio.audio_lpf;
   $('#stIdRes').textContent = '';
   $('#stRadioRes').textContent = '';
 }
@@ -1549,12 +1567,16 @@ async function saveRadio() {
   res.textContent = 'applying…'; res.className = 'res';
   // Prefer the simplex single-freq field when filled; otherwise send split.
   const fields = {
-    sql_level:  $('#stSql').value,
-    rf_power:   $('#stPwr').value,
-    tone_rx:    $('#stToneRx').value,
-    tone_tx:    $('#stToneTx').value,
-    rf_en:      $('#stRfEn').checked ? '1' : '0',
-    modem_type: $('#stModem').value,
+    sql_level:   $('#stSql').value,
+    rf_power:    $('#stPwr').value,
+    tone_rx:     $('#stToneRx').value,
+    tone_tx:     $('#stToneTx').value,
+    rf_en:       $('#stRfEn').checked ? '1' : '0',
+    modem_type:  $('#stModem').value,
+    fx25_mode:   $('#stFx25').value,
+    preamble:    $('#stPreamble').value,
+    tx_timeslot: $('#stTxSlot').value,
+    audio_lpf:   $('#stAudioLpf').checked ? '1' : '0',
   };
   if ($('#stFreq').value) {
     fields.freq = $('#stFreq').value;

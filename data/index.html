@@ -91,6 +91,20 @@
           <label class="grow">CTCSS RX (Hz×10)<input id="stToneRx" type="number" min="0"></label>
           <label class="grow">CTCSS TX (Hz×10)<input id="stToneTx" type="number" min="0"></label>
         </div>
+        <div class="row">
+          <label style="flex:0 0 auto">FX.25 (Reed-Solomon)
+            <select id="stFx25" title="Plain AX.25 = compatible with vanilla TNCs / scanners. FX.25 RX+TX adds RS parity that needs an FX.25-aware peer.">
+              <option value="0">off (plain AX.25)</option>
+              <option value="1">RX only</option>
+              <option value="2">RX + TX</option>
+            </select>
+          </label>
+          <label style="flex:0 0 110px">preamble (×100 ms)<input id="stPreamble" type="number" min="1" max="20"></label>
+          <label style="flex:0 0 130px">tx slot (ms)<input id="stTxSlot" type="number" min="0" max="60000" step="100"></label>
+          <label style="flex:0 0 auto;flex-direction:row;align-items:center;gap:6px">
+            <input id="stAudioLpf" type="checkbox"> audio LPF
+          </label>
+        </div>
       </details>
       <div class="row">
         <button type="button" id="stSaveRadio">Apply frequency</button>

@@ -1141,7 +1141,7 @@ void api_radio_get(AsyncWebServerRequest *request)
 	int sqlPin = -1;
 	if (config.rf_sql_gpio >= 0)
 		sqlPin = digitalRead(config.rf_sql_gpio);
-	char buf[488];
+	char buf[600];
 	snprintf(buf, sizeof(buf),
 			 "{\"freq_rx\":%.4f,\"freq_tx\":%.4f,"
 			 "\"tone_rx\":%d,\"tone_tx\":%d,"
@@ -1149,7 +1149,8 @@ void api_radio_get(AsyncWebServerRequest *request)
 			 "\"band\":%u,\"rf_en\":%s,\"volume\":%u,"
 			 "\"rf_type\":%u,\"modem\":%u,\"adc_en\":%d,"
 			 "\"sql_active\":%u,\"mvrms\":%d,\"sql_pin\":%d,"
-			 "\"dcd\":%u}",
+			 "\"dcd\":%u,\"fx25_mode\":%u,\"audio_lpf\":%s,"
+			 "\"preamble\":%u,\"tx_timeslot\":%u}",
 			 (double)config.freq_rx, (double)config.freq_tx,
 			 config.tone_rx, config.tone_tx,
 			 (unsigned)config.sql_level, config.rf_power ? "true" : "false",
@@ -1157,7 +1158,11 @@ void api_radio_get(AsyncWebServerRequest *request)
 			 (unsigned)config.volume,
 			 (unsigned)config.rf_type, (unsigned)config.modem_type,
 			 (int)adcEn, (unsigned)config.rf_sql_active,
-			 mVrms, sqlPin, (unsigned)dcd_cnt);
+			 mVrms, sqlPin, (unsigned)dcd_cnt,
+			 (unsigned)config.fx25_mode,
+			 config.audio_lpf ? "true" : "false",
+			 (unsigned)config.preamble,
+			 (unsigned)config.tx_timeslot);
 	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
 	r->addHeader("Cache-Control", "no-cache");
 	request->send(r);
@@ -1212,6 +1217,41 @@ void api_radio_set(AsyncWebServerRequest *request)
 		uint8_t m = (uint8_t)atoi(tmp);
 		if (m <= 3 && m != config.modem_type) {
 			config.modem_type = m;
+			changed = true;
+			modemChanged = true;
+		}
+	}
+	if (form_field(request, "fx25_mode", tmp, sizeof(tmp)))
+	{
+		// 0 = off (plain AX.25 — what most TNCs / scanners expect)
+		// 1 = RX only (decode FX.25 if heard, still TX plain AX.25)
+		// 2 = RX+TX (Reed-Solomon on both directions; needs FX.25-aware peer)
+		uint8_t m = (uint8_t)atoi(tmp);
+		if (m <= 2 && m != config.fx25_mode) {
+			config.fx25_mode = m;
+			changed = true;
+			modemChanged = true;
+		}
+	}
+	if (form_field(request, "preamble", tmp, sizeof(tmp)))
+	{
+		uint8_t p = (uint8_t)atoi(tmp);
+		if (p >= 1 && p <= 20 && p != config.preamble) {
+			config.preamble = p;
+			changed = true;
+			modemChanged = true;
+		}
+	}
+	if (form_field(request, "audio_lpf", tmp, sizeof(tmp)))
+	{
+		bool v = (tmp[0] == '1' || tmp[0] == 't' || tmp[0] == 'y');
+		if (v != config.audio_lpf) { config.audio_lpf = v; changed = true; modemChanged = true; }
+	}
+	if (form_field(request, "tx_timeslot", tmp, sizeof(tmp)))
+	{
+		uint16_t t = (uint16_t)atoi(tmp);
+		if (t <= 60000 && t != config.tx_timeslot) {
+			config.tx_timeslot = t;
 			changed = true;
 			modemChanged = true;
 		}
