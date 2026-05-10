@@ -683,6 +683,23 @@ void handle_css(AsyncWebServerRequest *request)
 // Serve a static asset for the new chat-style mobile UI from LittleFS.
 // Transparently prefers a "<path>.gz" sibling and sets Content-Encoding: gzip
 // so we can ship pre-compressed JS/CSS without spending RAM on runtime gzip.
+// Tiny self-contained fallback page served when LittleFS is empty / wasn't
+// uploaded.  Better than a 404 — at least the user can tell the firmware is
+// alive and gets a one-click hint to upload the data partition.
+static const char *FALLBACK_INDEX_HTML =
+	"<!doctype html><meta charset=utf-8>"
+	"<meta name=viewport content='width=device-width,initial-scale=1'>"
+	"<title>ESP32APRS</title>"
+	"<style>body{font:16px/1.4 system-ui;background:#0e1116;color:#e6edf3;padding:24px;max-width:560px;margin:auto}"
+	"a{color:#58a6ff} code{background:#161b22;padding:1px 6px;border-radius:4px}"
+	"h1{font-size:22px} .err{color:#f0883e}</style>"
+	"<h1>ESP32APRS firmware up — UI assets missing</h1>"
+	"<p class=err>The chat UI HTML/CSS/JS isn't on the device's LittleFS partition.</p>"
+	"<p>To fix, on your dev machine run:</p>"
+	"<p><code>pio run -e kv4p-ht -t uploadfs</code></p>"
+	"<p>Or open the legacy admin page: <a href='/settings'>/settings</a> "
+	"(default user/pass admin/admin).</p>";
+
 void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime)
 {
 	String gz = String(path) + ".gz";
@@ -694,14 +711,25 @@ void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const c
 		request->send(r);
 		return;
 	}
-	if (!LITTLEFS.exists(path))
+	if (LITTLEFS.exists(path))
 	{
-		request->send(404, "text/plain", path);
+		AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, path, mime, false);
+		r->addHeader("Cache-Control", "public, max-age=600");
+		request->send(r);
 		return;
 	}
-	AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, path, mime, false);
-	r->addHeader("Cache-Control", "public, max-age=600");
-	request->send(r);
+	// LittleFS missing the asset — for "/" specifically, send a small inline
+	// HTML so the user knows the firmware is alive and what to do.  Other
+	// assets (app.js / app.css) get a proper 404 so the browser shows a
+	// failed network request rather than a broken page.
+	if (strcmp(path, "/index.html") == 0)
+	{
+		AsyncWebServerResponse *r = request->beginResponse(200, "text/html", FALLBACK_INDEX_HTML);
+		r->addHeader("Cache-Control", "no-cache");
+		request->send(r);
+		return;
+	}
+	request->send(404, "text/plain", path);
 }
 
 // Append a JSON-escaped copy of `src` into `dst` (bounded by `cap`, leaving room
