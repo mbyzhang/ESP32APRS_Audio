@@ -685,30 +685,52 @@ void handle_css(AsyncWebServerRequest *request)
 // so we can ship pre-compressed JS/CSS without spending RAM on runtime gzip.
 #include "embedded_ui.h"
 
-// Serve the chat UI from in-firmware blobs via the one-shot
-// request->send(int, type, body) path.  The other ESPAsyncWebServer
-// response builders — AsyncFileResponse (LittleFS) and AsyncProgmemResponse
-// (beginResponse_P) — have been observed on this device emitting bodies
-// without an HTTP/1.1 status line, which makes Safari abort with
-// "cannot parse response" and curl reject with "HTTP/0.9 when not allowed".
-// /api/me, /api/radio etc. all use the working one-shot pattern; mirror it
-// here so the chat UI loads under the same code path.
+// Serve the chat UI from in-firmware blobs.
+//
+// Using request->send(int, type, body) stuffs the whole body into a
+// String inside AsyncBasicResponse, which then chops itself up via
+// _content.substring(...) on every TCP ACK.  On a fragmented heap
+// (largest contiguous block ~16 KB) those repeated substring() calls
+// fail mid-send for the 38 KB app.js, leaving the client with a
+// partial body and no HTTP status line.  Browsers then report
+// "cannot parse response".
+//
+// Instead we use the chunked-callback flavor of beginResponse: the
+// firmware never holds more than a small TCP-packet-sized window at
+// once, so heap fragmentation is irrelevant.
 //
 // Regenerate include/embedded_ui.h from data/* via
-// `python3 scripts/embed_ui.py` whenever you edit the UI.
+// `python3 scripts/embed_ui.py` whenever you edit the UI source.
+static void sendEmbeddedAsset(AsyncWebServerRequest *request,
+                               const char *body, size_t bodyLen,
+                               const char *contentType)
+{
+	AsyncWebServerResponse *response = request->beginResponse(
+		contentType, bodyLen,
+		[body, bodyLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+			if (index >= bodyLen) return 0;
+			size_t toCopy = bodyLen - index;
+			if (toCopy > maxLen) toCopy = maxLen;
+			memcpy(buffer, body + index, toCopy);
+			return toCopy;
+		});
+	response->addHeader("Cache-Control", "public, max-age=600");
+	request->send(response);
+}
+
 void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime)
 {
 	(void)mime;
 	if (strcmp(path, "/index.html") == 0) {
-		request->send(200, "text/html", EMBEDDED_INDEX_HTML);
+		sendEmbeddedAsset(request, EMBEDDED_INDEX_HTML, strlen(EMBEDDED_INDEX_HTML), "text/html");
 		return;
 	}
 	if (strcmp(path, "/app.js") == 0) {
-		request->send(200, "application/javascript", EMBEDDED_APP_JS);
+		sendEmbeddedAsset(request, EMBEDDED_APP_JS, strlen(EMBEDDED_APP_JS), "application/javascript");
 		return;
 	}
 	if (strcmp(path, "/app.css") == 0) {
-		request->send(200, "text/css", EMBEDDED_APP_CSS);
+		sendEmbeddedAsset(request, EMBEDDED_APP_CSS, strlen(EMBEDDED_APP_CSS), "text/css");
 		return;
 	}
 	request->send(404, "text/plain", path);
