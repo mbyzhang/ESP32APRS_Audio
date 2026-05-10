@@ -683,53 +683,32 @@ void handle_css(AsyncWebServerRequest *request)
 // Serve a static asset for the new chat-style mobile UI from LittleFS.
 // Transparently prefers a "<path>.gz" sibling and sets Content-Encoding: gzip
 // so we can ship pre-compressed JS/CSS without spending RAM on runtime gzip.
-// Tiny self-contained fallback page served when LittleFS is empty / wasn't
-// uploaded.  Better than a 404 — at least the user can tell the firmware is
-// alive and gets a one-click hint to upload the data partition.
-static const char *FALLBACK_INDEX_HTML =
-	"<!doctype html><meta charset=utf-8>"
-	"<meta name=viewport content='width=device-width,initial-scale=1'>"
-	"<title>ESP32APRS</title>"
-	"<style>body{font:16px/1.4 system-ui;background:#0e1116;color:#e6edf3;padding:24px;max-width:560px;margin:auto}"
-	"a{color:#58a6ff} code{background:#161b22;padding:1px 6px;border-radius:4px}"
-	"h1{font-size:22px} .err{color:#f0883e}</style>"
-	"<h1>ESP32APRS firmware up — UI assets missing</h1>"
-	"<p class=err>The chat UI HTML/CSS/JS isn't on the device's LittleFS partition.</p>"
-	"<p>To fix, on your dev machine run:</p>"
-	"<p><code>pio run -e kv4p-ht -t uploadfs</code></p>"
-	"<p>Or open the legacy admin page: <a href='/settings'>/settings</a> "
-	"(default user/pass admin/admin).</p>";
+#include "embedded_ui.h"
 
+// Serve the chat UI from in-firmware blobs via the one-shot
+// request->send(int, type, body) path.  The other ESPAsyncWebServer
+// response builders — AsyncFileResponse (LittleFS) and AsyncProgmemResponse
+// (beginResponse_P) — have been observed on this device emitting bodies
+// without an HTTP/1.1 status line, which makes Safari abort with
+// "cannot parse response" and curl reject with "HTTP/0.9 when not allowed".
+// /api/me, /api/radio etc. all use the working one-shot pattern; mirror it
+// here so the chat UI loads under the same code path.
+//
+// Regenerate include/embedded_ui.h from data/* via
+// `python3 scripts/embed_ui.py` whenever you edit the UI.
 void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime)
 {
-	// Use the one-shot request->send(...) for static-string responses rather
-	// than beginResponse() + send() — the two-step path was observed hanging
-	// indefinitely on the kv4p-ht (clients see "cannot parse response" in
-	// Safari).  The one-shot path is what /api/me uses and reliably flushes
-	// even when the heap is fragmented.
-	String gz = String(path) + ".gz";
-	if (LITTLEFS.exists(gz))
-	{
-		AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, gz, mime, false);
-		r->addHeader("Content-Encoding", "gzip");
-		r->addHeader("Cache-Control", "public, max-age=600");
-		request->send(r);
+	(void)mime;
+	if (strcmp(path, "/index.html") == 0) {
+		request->send(200, "text/html", EMBEDDED_INDEX_HTML);
 		return;
 	}
-	if (LITTLEFS.exists(path))
-	{
-		AsyncWebServerResponse *r = request->beginResponse(LITTLEFS, path, mime, false);
-		r->addHeader("Cache-Control", "public, max-age=600");
-		request->send(r);
+	if (strcmp(path, "/app.js") == 0) {
+		request->send(200, "application/javascript", EMBEDDED_APP_JS);
 		return;
 	}
-	// LittleFS missing the asset — for "/" specifically, send a small inline
-	// HTML so the user knows the firmware is alive and what to do.  Other
-	// assets (app.js / app.css) get a proper 404 so the browser shows a
-	// failed network request rather than a broken page.
-	if (strcmp(path, "/index.html") == 0)
-	{
-		request->send(200, "text/html", FALLBACK_INDEX_HTML);
+	if (strcmp(path, "/app.css") == 0) {
+		request->send(200, "text/css", EMBEDDED_APP_CSS);
 		return;
 	}
 	request->send(404, "text/plain", path);

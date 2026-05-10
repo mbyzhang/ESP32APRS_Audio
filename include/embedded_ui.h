@@ -1,0 +1,1419 @@
+// Auto-generated from data/* by scripts/embed_ui.py — do not edit by hand.
+// We embed the chat UI assets directly into firmware because the 
+// AsyncFileResponse / beginResponse_P streaming paths have been observed
+// emitting bodies without HTTP/1.1 status lines on this device, breaking
+// browsers (Safari -> "cannot parse response"). request->send(int,type,body)
+// using a const char* in flash works reliably.
+
+#pragma once
+
+static const char *EMBEDDED_INDEX_HTML = R"EMBED(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>APRS Chat</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header id="topbar">
+  <button id="stationBtn" class="who" title="Edit callsign / frequency">
+    <span id="meCall">…</span>
+    <span id="meFreq" class="dim"></span>
+  </button>
+  <div class="actions">
+    <button id="voiceBtn" class="ghost" title="FM voice (monitor / PTT)">🎙</button>
+    <button id="mapBtn" class="ghost" title="Map of stations">🗺</button>
+    <button id="gpsBtn" class="ghost" title="Toggle GPS beacon">📍</button>
+    <button id="hookBtn" class="ghost" title="Webhooks">🔔</button>
+    <a id="settingsLink" class="ghost" href="/settings" title="Settings">⚙️</a>
+  </div>
+</header>
+
+<div id="filterBar">
+  <input id="filterInput" type="text" autocomplete="off" spellcheck="false"
+         placeholder="filter (callsign prefix, e.g. M0XYZ)">
+  <select id="filterMode" title="What the filter applies to">
+    <option value="any">any field</option>
+    <option value="src">src callsign</option>
+    <option value="dst">addressee</option>
+    <option value="text">message text</option>
+    <option value="me">to or from me</option>
+  </select>
+  <button id="filterClear" class="ghost" type="button" title="Clear filter">✕</button>
+</div>
+
+<div id="stationOverlay" hidden>
+  <div class="sheet">
+    <header>
+      <h2>Station</h2>
+      <button id="stationClose" class="ghost" type="button">✕</button>
+    </header>
+
+    <div class="grp">
+      <h3>Identity</h3>
+      <div class="row">
+        <label class="grow">callsign<input id="stCall" type="text" autocomplete="off" spellcheck="false" placeholder="M0XYZ"></label>
+        <label style="flex:0 0 80px">SSID<input id="stSsid" type="number" min="0" max="15" step="1"></label>
+      </div>
+      <div class="row">
+        <button type="button" id="stSaveId">Save callsign</button>
+        <span class="res" id="stIdRes"></span>
+      </div>
+      <p class="dim">Applied to APRS / messages / tracker / digi at once.</p>
+    </div>
+
+    <div class="grp">
+      <h3>Frequency</h3>
+      <div class="row">
+        <button type="button" data-freq="144.8000" class="preset">EU 144.8000</button>
+        <button type="button" data-freq="144.3900" class="preset">US 144.39</button>
+        <button type="button" data-freq="144.6400" class="preset">JP 144.64</button>
+        <button type="button" data-freq="439.1000" class="preset">UHF 439.1</button>
+      </div>
+      <div class="row">
+        <label class="grow">freq (MHz, simplex)<input id="stFreq" type="number" step="0.0001" min="100" max="530"></label>
+      </div>
+      <div class="row">
+        <label style="flex:0 0 auto;flex-direction:row;align-items:center;gap:6px">
+          <input id="stRfEn" type="checkbox"> RF module enabled (RX/TX)
+        </label>
+        <label style="flex:0 0 auto">modem
+          <select id="stModem" title="AFSK demodulator tone set">
+            <option value="0">Bell 202 1200 (APRS)</option>
+            <option value="1">CCITT V.23 1200</option>
+            <option value="2">300 baud</option>
+            <option value="3">9600 baud G3RUH</option>
+          </select>
+        </label>
+      </div>
+      <details>
+        <summary class="dim">advanced (split / squelch / power)</summary>
+        <div class="row">
+          <label class="grow">RX freq<input id="stFreqRx" type="number" step="0.0001"></label>
+          <label class="grow">TX freq<input id="stFreqTx" type="number" step="0.0001"></label>
+        </div>
+        <div class="row">
+          <label style="flex:0 0 100px">squelch (0-9)<input id="stSql" type="number" min="0" max="9"></label>
+          <label style="flex:0 0 100px">TX power<select id="stPwr"><option value="0">low</option><option value="1">high</option></select></label>
+          <label class="grow">CTCSS RX (Hz×10)<input id="stToneRx" type="number" min="0"></label>
+          <label class="grow">CTCSS TX (Hz×10)<input id="stToneTx" type="number" min="0"></label>
+        </div>
+      </details>
+      <div class="row">
+        <button type="button" id="stSaveRadio">Apply frequency</button>
+        <span class="res" id="stRadioRes"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="hookOverlay" hidden>
+  <div class="sheet">
+    <header>
+      <h2>Webhooks</h2>
+      <button id="hookClose" class="ghost" type="button">✕</button>
+    </header>
+    <p class="dim">
+      Forward received APRS packets to any HTTP endpoint. Variables:
+      <code>{src}</code> <code>{addressee}</code> <code>{message}</code>
+      <code>{raw}</code> <code>{ts}</code> <code>{channel}</code>.
+      Telegram preset: URL
+      <code>https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage</code>,
+      body <code>{"chat_id":"&lt;ID&gt;","text":"{src}: {message}"}</code>.
+    </p>
+    <div id="hookSlots"></div>
+  </div>
+</div>
+
+<div id="mapOverlay" hidden>
+  <button id="mapClose" class="ghost" type="button">✕</button>
+  <div id="map"></div>
+  <div id="mapStatus" class="dim">loading map…</div>
+</div>
+
+<div id="voicePanel" hidden>
+  <div class="vp-row">
+    <button id="vpToggle" type="button">Listen</button>
+    <span id="vpStatus" class="dim">idle</span>
+  </div>
+  <div class="vp-row">
+    <span class="dim">vol</span>
+    <input id="vpVol" type="range" min="0" max="100" value="80">
+    <button id="vpMute" type="button" class="ghost" title="Mute">🔇</button>
+  </div>
+  <div class="vp-row">
+    <span class="dim" style="width:30px">RX</span>
+    <div class="vp-meter"><div id="vpRxBar"></div></div>
+    <span id="vpQueue" class="dim" style="font-variant-numeric:tabular-nums">0 ms</span>
+  </div>
+  <div class="vp-row">
+    <span class="dim" style="width:30px">TX</span>
+    <div class="vp-meter"><div id="vpTxBar"></div></div>
+  </div>
+  <button id="vpPtt" type="button" class="ptt">
+    <span>HOLD&nbsp;TO&nbsp;TALK</span>
+  </button>
+</div>
+
+<main id="feed" aria-live="polite"></main>
+
+<footer id="composer">
+  <input id="toCall" type="text" placeholder="To (callsign or *)" autocomplete="off" spellcheck="false">
+  <input id="msgInput" type="text" placeholder="Type a message…" autocomplete="off">
+  <button id="sendBtn" type="button">Send</button>
+</footer>
+
+<div id="status" class="dim"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>
+)EMBED";
+
+static const char *EMBEDDED_APP_CSS = R"EMBED(/* APRS Chat — smartphone-first dark UI */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%}
+body{
+  font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:#0e1116;color:#e6edf3;
+  display:flex;flex-direction:column;
+  padding-top:env(safe-area-inset-top);
+  padding-bottom:env(safe-area-inset-bottom);
+}
+.dim{color:#7d8590}
+button,input{font:inherit;color:inherit}
+button{background:#21262d;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:8px 12px;cursor:pointer}
+button:active{transform:translateY(1px)}
+button.ghost{background:transparent}
+button.on{background:#238636;border-color:#2ea043}
+input[type=text]{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 12px;color:#e6edf3;min-width:0}
+a{color:#58a6ff;text-decoration:none}
+
+#topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:10px 12px;border-bottom:1px solid #21262d;background:#0d1117;
+  position:sticky;top:0;z-index:5
+}
+#topbar .who{
+  display:flex;flex-direction:column;line-height:1.15;
+  background:transparent;border:0;padding:4px 6px;color:inherit;text-align:left;
+  border-radius:6px;cursor:pointer
+}
+#topbar .who:active{background:#161b22}
+#topbar #meFreq.warn{color:#f0883e}
+#topbar #meCall{font-weight:600}
+#topbar .actions{display:flex;gap:8px}
+#topbar .actions a,#topbar .actions button{padding:6px 10px;font-size:13px}
+#topbar .actions button.on{background:#238636;border-color:#2ea043}
+
+/* Filter bar — sticky just below the topbar */
+#filterBar{
+  display:flex;gap:6px;align-items:center;
+  padding:6px 8px;border-bottom:1px solid #21262d;background:#0d1117;
+  position:sticky;top:51px;z-index:4
+}
+#filterBar input[type=text]{flex:1 1 auto;padding:6px 10px;font-size:13px;text-transform:uppercase}
+#filterBar select{
+  background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;
+  padding:6px 8px;font-size:12px;flex:0 0 auto
+}
+#filterBar button{padding:4px 8px;font-size:14px}
+#filterBar.active{background:#1b2433;border-bottom-color:#58a6ff}
+
+/* Voice panel — slides above feed, persistent while monitoring */
+#voicePanel{
+  display:flex;flex-direction:column;gap:6px;
+  padding:8px 10px;border-bottom:1px solid #21262d;background:#11161d
+}
+#voicePanel[hidden]{display:none}
+#voicePanel .vp-row{display:flex;align-items:center;gap:8px}
+#voicePanel #vpToggle{padding:6px 12px}
+#voicePanel #vpToggle.on{background:#238636;border-color:#2ea043}
+#voicePanel #vpVol{flex:1 1 auto}
+#voicePanel .vp-meter{
+  flex:1 1 auto;height:8px;background:#0d1117;border:1px solid #30363d;border-radius:4px;overflow:hidden
+}
+#voicePanel #vpRxBar,#voicePanel #vpTxBar{
+  height:100%;width:0%;background:linear-gradient(90deg,#2ea043,#f0883e,#f85149);
+  transition:width 60ms linear
+}
+#voicePanel .ptt{
+  margin-top:6px;padding:18px;border-radius:14px;
+  background:#1f6feb;border:1px solid #1f6feb;color:#fff;
+  font-weight:700;letter-spacing:.05em;font-size:14px;
+  user-select:none;-webkit-user-select:none;touch-action:manipulation
+}
+#voicePanel .ptt.live{background:#da3633;border-color:#da3633;animation:pttPulse 700ms infinite}
+@keyframes pttPulse{0%{filter:brightness(1)}50%{filter:brightness(1.25)}100%{filter:brightness(1)}}
+
+#feed{
+  flex:1 1 auto;overflow-y:auto;
+  padding:8px 8px 4px;display:flex;flex-direction:column;gap:6px;
+  scroll-behavior:smooth
+}
+.msg{
+  display:flex;flex-direction:column;
+  background:#161b22;border:1px solid #21262d;border-radius:10px;
+  padding:8px 10px;max-width:92%;
+}
+.msg.me{align-self:flex-end;background:#1f3a2a;border-color:#2ea04344}
+.msg.dm{border-color:#3b5bdb88;background:#0f1c3a}
+.msg .head{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+.msg .head .src{font-weight:600;color:#79c0ff}
+.msg.me .head .src{color:#7ee787}
+.msg .head .ts{color:#7d8590;font-variant-numeric:tabular-nums}
+.msg .body{margin-top:2px;white-space:pre-wrap;word-break:break-word}
+.msg .meta{margin-top:4px;font-size:11px;color:#6e7681;display:flex;gap:10px;flex-wrap:wrap}
+.msg .meta .pill{background:#161b22;border:1px solid #30363d;border-radius:999px;padding:1px 8px}
+.msg .meta a{color:#58a6ff}
+
+#composer{
+  position:sticky;bottom:0;background:#0d1117;border-top:1px solid #21262d;
+  padding:8px;display:grid;grid-template-columns:120px 1fr auto;gap:6px;z-index:5
+}
+#composer #toCall{text-transform:uppercase}
+#composer #sendBtn{background:#1f6feb;border-color:#1f6feb;color:#fff;padding:10px 14px;font-weight:600}
+#composer #sendBtn[disabled]{opacity:.5;cursor:not-allowed}
+
+#status{
+  font-size:11px;padding:2px 12px 6px;background:#0d1117;color:#7d8590;
+  display:flex;justify-content:space-between
+}
+#status.warn{color:#f0883e}
+#status.ok{color:#2ea043}
+#status.err{color:#f85149}
+
+@media (max-width:380px){
+  #composer{grid-template-columns:96px 1fr auto}
+}
+
+/* Map overlay (lazy-loaded Leaflet) */
+#mapOverlay{
+  position:fixed;inset:0;background:#0e1116;z-index:10;
+  display:flex;flex-direction:column
+}
+#mapOverlay[hidden]{display:none}
+#mapClose{
+  position:absolute;top:calc(8px + env(safe-area-inset-top));right:8px;z-index:12;
+  background:#0d1117e0;border:1px solid #30363d;border-radius:999px;
+  width:36px;height:36px;padding:0;font-size:18px
+}
+#map{flex:1;background:#1a1d21}
+#mapStatus{
+  position:absolute;left:0;right:0;bottom:0;text-align:center;
+  padding:6px;background:#0d1117c0;font-size:12px
+}
+.leaflet-popup-content{color:#222;font-size:13px}
+
+/* Webhooks slide-out sheet */
+#hookOverlay{
+  position:fixed;inset:0;background:#0e1116cc;z-index:9;
+  display:flex;align-items:flex-end;justify-content:center
+}
+#hookOverlay[hidden]{display:none}
+#hookOverlay .sheet{
+  background:#0d1117;border-top:1px solid #30363d;
+  border-radius:14px 14px 0 0;width:100%;max-width:640px;max-height:85vh;
+  overflow-y:auto;padding:14px 14px calc(14px + env(safe-area-inset-bottom))
+}
+#hookOverlay .sheet header{display:flex;justify-content:space-between;align-items:center}
+#hookOverlay h2{margin:0;font-size:16px}
+#hookOverlay code{background:#161b22;border:1px solid #30363d;border-radius:4px;padding:1px 4px;font-size:12px}
+.hook-slot{
+  border:1px solid #30363d;border-radius:10px;padding:10px;margin-top:10px;
+  display:grid;gap:6px
+}
+.hook-slot label{font-size:12px;color:#7d8590;display:flex;flex-direction:column;gap:3px}
+.hook-slot input[type=text],.hook-slot textarea{
+  background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:6px;
+  padding:6px 8px;font-size:13px;width:100%;font-family:inherit
+}
+.hook-slot textarea{min-height:60px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.hook-slot .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.hook-slot .row > *{flex:1 1 auto}
+.hook-slot .row .grow{flex:99 1 auto}
+.hook-slot button{font-size:13px}
+.hook-slot .res{font-size:12px;color:#7d8590;min-height:14px}
+.hook-slot .res.ok{color:#2ea043}
+.hook-slot .res.err{color:#f85149}
+
+/* Station sheet (reuses #hookOverlay sheet visuals) */
+#stationOverlay{
+  position:fixed;inset:0;background:#0e1116cc;z-index:9;
+  display:flex;align-items:flex-end;justify-content:center
+}
+#stationOverlay[hidden]{display:none}
+#stationOverlay .sheet{
+  background:#0d1117;border-top:1px solid #30363d;
+  border-radius:14px 14px 0 0;width:100%;max-width:640px;max-height:85vh;
+  overflow-y:auto;padding:14px 14px calc(14px + env(safe-area-inset-bottom))
+}
+#stationOverlay .sheet header{display:flex;justify-content:space-between;align-items:center}
+#stationOverlay h2{margin:0;font-size:16px}
+#stationOverlay h3{margin:0 0 6px;font-size:13px;color:#7d8590;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+#stationOverlay .grp{
+  border:1px solid #30363d;border-radius:10px;padding:10px;margin-top:10px;
+  display:grid;gap:8px
+}
+#stationOverlay label{font-size:12px;color:#7d8590;display:flex;flex-direction:column;gap:3px}
+#stationOverlay input,#stationOverlay select{
+  background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:6px;
+  padding:6px 8px;font-size:13px;width:100%;font-family:inherit
+}
+#stationOverlay #stCall{text-transform:uppercase;font-weight:600}
+#stationOverlay .row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+#stationOverlay .row > *{flex:1 1 auto;min-width:0}
+#stationOverlay .row .grow{flex:99 1 auto}
+#stationOverlay .preset{font-size:12px;padding:6px 10px;flex:0 0 auto}
+#stationOverlay .res{font-size:12px;color:#7d8590;min-height:14px}
+#stationOverlay .res.ok{color:#2ea043}
+#stationOverlay .res.err{color:#f85149}
+#stationOverlay details>summary{cursor:pointer;padding:4px 0}
+)EMBED";
+
+static const char *EMBEDDED_APP_JS = R"EMBED(// APRS Chat — mobile-first UI
+// All compute that *can* live in the browser (TNC2 parsing, track DB, GPS
+// throttling, map rendering) lives here.  The firmware just streams raw
+// packets over SSE and accepts TX requests as form posts.
+//
+// Future: Phase 5 will add WebAudio AudioWorklet hooks against the
+// existing /ws_audio WebSocket on port 81 for FM voice monitor + PTT.
+// We deliberately keep that surface untouched so it can land later.
+
+(() => {
+'use strict';
+
+const $ = (s) => document.querySelector(s);
+const feed   = $('#feed');
+const status = $('#status');
+const meCall = $('#meCall');
+const meIp   = $('#meIp');
+const toCall = $('#toCall');
+const msgIn  = $('#msgInput');
+const sendBtn= $('#sendBtn');
+const gpsBtn = $('#gpsBtn');
+
+let me = { callsign: '', ssid: 0 };
+const seen = new Set();          // dedupe by raw+ts
+const trackDb = openTrackDb();   // opened lazily, IndexedDB; future Phase 3
+
+// ---------- TNC2 / APRS parsing (browser-side) -----------------------------
+
+// Parse a TNC2 packet line "SRC>DST,PATH:INFO" into structured form.
+// Returns at least {src, dst, path, info, type, raw} on success, plus
+// position/message fields when applicable. type ∈ {position,message,status,object,unknown}.
+function parseTnc2(raw) {
+  if (!raw) return null;
+  const colon = raw.indexOf(':');
+  const gt    = raw.indexOf('>');
+  if (gt < 0 || colon < gt) return null;
+  const src    = raw.slice(0, gt);
+  const header = raw.slice(gt + 1, colon);
+  const info   = raw.slice(colon + 1);
+  const parts  = header.split(',');
+  const dst    = parts[0];
+  const path   = parts.slice(1).join(',');
+  const out = { raw, src, dst, path, info, type: 'unknown' };
+  if (!info.length) return out;
+  const t = info[0];
+  if (t === '!' || t === '=' || t === '/' || t === '@') {
+    Object.assign(out, parsePositionInfo(info));
+    out.type = 'position';
+  } else if (t === ':' && info.length >= 11) {
+    // Message: ":<addressee:9chars>:<text>{<msgid>}"
+    // Some senders use spaces to pad addressee.
+    const addressee = info.slice(1, 10).trim().toUpperCase();
+    const rest = info.slice(11);
+    let text = rest, msgid = null;
+    const lc = rest.lastIndexOf('{');
+    if (lc >= 0) { text = rest.slice(0, lc); msgid = rest.slice(lc + 1); }
+    out.type = 'message';
+    out.addressee = addressee;
+    out.message = text;
+    out.msgid = msgid;
+  } else if (t === '>') {
+    out.type = 'status';
+    out.status = info.slice(1);
+  } else if (t === ';') {
+    out.type = 'object';
+    out.object = info.slice(1, 10).trim();
+    Object.assign(out, parsePositionInfo(info.slice(17))); // approx — best-effort
+  }
+  return out;
+}
+
+// Decode the lat/lon body of a position packet.  Handles both the
+// uncompressed ddmm.hhN/dddmm.hhW format and the 13-char compressed form.
+function parsePositionInfo(info) {
+  // Strip leading type char if it is one of !=/@
+  if ('!=/@'.indexOf(info[0]) >= 0) info = info.slice(1);
+  // Optional 7-char timestamp on @ and /
+  if (info.length > 7 && /^[0-9]{6}[zh\/]/.test(info)) info = info.slice(7);
+  if (info.length < 19) return {};
+  // Compressed?  First char in [!-{] but not a digit.
+  const first = info.charCodeAt(0);
+  if (info.length >= 13 && first >= 0x21 && first <= 0x7b && !/[0-9]/.test(info[0])) {
+    // Compressed: SYM_TABLE LAT(4) LON(4) SYM_CODE CS(2) T(1)
+    const symT = info[0];
+    const lat = 90  - decodeBase91(info.slice(1, 5))  / 380926;
+    const lon = -180 + decodeBase91(info.slice(5, 9))  / 190463;
+    const symC = info[9];
+    const comment = info.slice(13);
+    return { lat, lon, symbol_table: symT, symbol_code: symC, comment };
+  }
+  // Uncompressed: ddmm.hhN/dddmm.hhW>comment
+  const m = info.match(/^(\d{2})(\d{2}\.\d{2})([NS])(.)(\d{3})(\d{2}\.\d{2})([EW])(.)(.*)$/);
+  if (!m) return {};
+  const lat = (parseInt(m[1],10) + parseFloat(m[2])/60) * (m[3]==='S'?-1:1);
+  const lon = (parseInt(m[5],10) + parseFloat(m[6])/60) * (m[7]==='W'?-1:1);
+  return { lat, lon, symbol_table: m[4], symbol_code: m[8], comment: m[9] };
+}
+function decodeBase91(s) {
+  let v = 0;
+  for (let i = 0; i < s.length; i++) v = v * 91 + (s.charCodeAt(i) - 33);
+  return v;
+}
+
+// ---------- IndexedDB track store (Phase 3 stub, write-only for now) -------
+function openTrackDb() {
+  return new Promise((resolve) => {
+    if (!('indexedDB' in window)) return resolve(null);
+    const r = indexedDB.open('aprs-tracks', 1);
+    r.onupgradeneeded = () => {
+      const db = r.result;
+      if (!db.objectStoreNames.contains('points'))
+        db.createObjectStore('points', { keyPath: 'id', autoIncrement: true })
+          .createIndex('byCall', 'src');
+    };
+    r.onsuccess = () => resolve(r.result);
+    r.onerror   = () => resolve(null);
+  });
+}
+async function recordTrackPoint(pkt) {
+  if (!pkt || pkt.lat == null || pkt.lon == null) return;
+  // If the map is open, mirror this point onto it immediately so users
+  // see live movement without reopening the overlay.
+  pushPointToMap(pkt);
+  const db = await trackDb;
+  if (!db) return;
+  try {
+    db.transaction('points', 'readwrite').objectStore('points').add({
+      src: pkt.src, ts: pkt.ts, lat: pkt.lat, lon: pkt.lon,
+      symbol: (pkt.symbol_table || '') + (pkt.symbol_code || ''),
+      comment: pkt.comment || ''
+    });
+  } catch (_) {}
+}
+
+// ---------- Rendering -----------------------------------------------------
+
+function setStatus(text, cls) {
+  status.textContent = text;
+  status.className = cls || 'dim';
+}
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+// ---------- Filter (browser-side, applied to renderPacket) ---------------
+// The chat UI displays *every* packet the firmware reports.  An optional
+// filter narrows what the user sees on the screen — server-side state is
+// untouched, so toggling the filter never loses traffic from the SSE.
+const filterState = { text: '', mode: 'any' };
+const allPackets  = [];      // ring of every packet we've seen, for re-filter
+const ALL_MAX     = 600;
+
+function packetMatchesFilter(parsed) {
+  const q = filterState.text;
+  if (!q) return true;
+  const me = (fullCall() || '').toUpperCase();
+  const src = (parsed.src || '').toUpperCase();
+  const dst = (parsed.addressee || parsed.dst || '').toUpperCase();
+  const txt = (parsed.message || parsed.comment || parsed.info || '').toUpperCase();
+  switch (filterState.mode) {
+    case 'src':  return src.startsWith(q) || src.includes(q);
+    case 'dst':  return dst.startsWith(q) || dst.includes(q);
+    case 'text': return txt.includes(q);
+    case 'me':   return src === me || dst === me ||
+                        src.startsWith(me) || dst.startsWith(me);
+    case 'any':
+    default:     return src.includes(q) || dst.includes(q) || txt.includes(q);
+  }
+}
+
+function applyFilterToFeed() {
+  // Cheap full re-render from the in-memory ring; preserves scroll position.
+  const wasAtBottom = isAtBottom();
+  feed.innerHTML = '';
+  for (const pkt of allPackets) renderPacketInternal(pkt, /*recordOnly*/false);
+  if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+function renderPacket(pkt) {
+  const key = pkt.ts + '|' + pkt.raw;
+  if (seen.has(key)) return;
+  seen.add(key);
+  if (seen.size > 2000) {
+    const drop = seen.values().next().value;
+    seen.delete(drop);
+  }
+  allPackets.push(pkt);
+  if (allPackets.length > ALL_MAX) allPackets.shift();
+  renderPacketInternal(pkt, true);
+}
+
+function renderPacketInternal(pkt, recordSideEffects) {
+  const parsed = parseTnc2(pkt.raw) || { src:'?', type:'unknown' };
+  parsed.ts = pkt.ts;
+  parsed.audio = pkt.audio;
+  parsed.ch = pkt.ch;
+  parsed.dir = pkt.dir || 'rx';
+
+  // Side effects (track DB, map plot) happen on first render only — we don't
+  // want to re-record points every time the filter is toggled.
+  if (recordSideEffects) recordTrackPoint(parsed);
+
+  if (!packetMatchesFilter(parsed)) return;
+
+  const wasAtBottom = isAtBottom();
+
+  const el = document.createElement('div');
+  el.className = 'msg';
+  // Treat anything tagged dir=tx OR matching our own callsign as "me".
+  const isMine = parsed.dir === 'tx' || parsed.src === fullCall();
+  if (isMine) el.classList.add('me');
+  if (parsed.type === 'message' && parsed.addressee === fullCall()) el.classList.add('dm');
+
+  const isMsg = parsed.type === 'message';
+  const headRight = parsed.dir === 'tx'
+    ? '✓ sent'
+    : (pkt.ch === 1 ? 'IS' : (pkt.audio ? `${pkt.audio} dBV` : 'RF'));
+
+  let body = '';
+  if (isMsg) {
+    body = `<span class="dim">→ ${escapeHtml(parsed.addressee)}:</span> ${escapeHtml(parsed.message || '')}`;
+  } else if (parsed.type === 'position') {
+    const here = (parsed.lat != null) ? `${parsed.lat.toFixed(5)}, ${parsed.lon.toFixed(5)}` : '';
+    body = (parsed.comment || here) ? escapeHtml(parsed.comment || '') : escapeHtml(parsed.info);
+    if (parsed.lat != null) {
+      body += ` <a target="_blank" rel="noopener" href="https://www.openstreetmap.org/?mlat=${parsed.lat}&mlon=${parsed.lon}#map=14/${parsed.lat}/${parsed.lon}">map</a>`;
+    }
+  } else if (parsed.type === 'status') {
+    body = escapeHtml(parsed.status);
+  } else {
+    body = escapeHtml(parsed.info || pkt.raw);
+  }
+
+  el.innerHTML =
+    `<div class="head">
+       <span class="src">${escapeHtml(parsed.src)}</span>
+       <span class="ts">${fmtTime(pkt.ts)} · ${escapeHtml(headRight)}</span>
+     </div>
+     <div class="body">${body}</div>
+     <div class="meta">
+       <span class="pill">${escapeHtml(parsed.type)}</span>
+       <span class="pill">${escapeHtml(parsed.path || parsed.dst || '')}</span>
+     </div>`;
+  feed.appendChild(el);
+
+  // Trim DOM to keep mobile snappy
+  while (feed.children.length > 400) feed.removeChild(feed.firstChild);
+
+  if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+function isAtBottom() {
+  return feed.scrollHeight - feed.scrollTop - feed.clientHeight < 120;
+}
+
+// ---------- Network: hydrate + SSE ----------------------------------------
+
+async function loadMe() {
+  try {
+    const r = await fetch('/api/me');
+    if (!r.ok) throw new Error(r.status);
+    me = await r.json();
+    meCall.textContent = me.ssid ? `${me.callsign}-${me.ssid}` : me.callsign || '(tap to set callsign)';
+  } catch (e) {
+    meCall.textContent = '(offline)';
+  }
+}
+
+let radio = {};
+async function loadRadio() {
+  try {
+    const r = await fetch('/api/radio');
+    if (!r.ok) return;
+    radio = await r.json();
+    const f = (radio.freq_rx ?? 0).toFixed(4);
+    // Make it obvious when RF is disabled — a chat app silently ignoring all
+    // radio traffic because rf_en=false is a frustrating debug session.
+    // Show freq + audio level + modem state so the user can debug "no RX"
+    // at a glance.
+    //   mvrms : running RMS of demod input (mV).  Stays low (~8) in silence,
+    //           jumps to several hundred on real signal.
+    //   dcd   : demodulator carrier-detect counter (0..100).  Must rise
+    //           above 3 for the AFSK decoder to even attempt to decode.
+    //   modem : 0 = Bell 202 (APRS).  Anything else means RX is silently
+    //           broken until you change it from the Station sheet.
+    const mv = radio.mvrms ?? 0;
+    const dcd = radio.dcd ?? 0;
+    const sq = radio.sql_pin === 0 ? ' · sq' : '';
+    const modemBad = (radio.modem ?? 0) !== 0;
+    let label;
+    if (!radio.rf_en) label = `${f} MHz · RF off`;
+    else if (modemBad) label = `${f} MHz · WRONG MODEM (${radio.modem})`;
+    else                label = `${f} MHz · ${mv} mV · dcd ${dcd}${sq}`;
+    $('#meFreq').textContent = label;
+    $('#meFreq').classList.toggle('warn', !radio.rf_en || modemBad);
+  } catch (_) {}
+}
+function fullCall() {
+  return me.ssid ? `${me.callsign}-${me.ssid}` : me.callsign;
+}
+
+async function hydrate() {
+  try {
+    const r = await fetch('/api/packets/recent');
+    if (!r.ok) return;
+    const arr = await r.json();
+    // Render oldest first so the live tail appears at the bottom
+    arr.reverse().forEach(renderPacket);
+    feed.scrollTop = feed.scrollHeight;
+  } catch (_) {}
+}
+
+let es;
+function connectStream() {
+  if (es) try { es.close(); } catch (_) {}
+  es = new EventSource('/api/packets/stream');
+  es.addEventListener('open',  () => setStatus('● live', 'ok'));
+  es.addEventListener('error', () => setStatus('reconnecting…', 'warn'));
+  es.addEventListener('packet', (ev) => {
+    try {
+      const pkt = JSON.parse(ev.data);
+      renderPacket(pkt);
+    } catch (_) {}
+  });
+}
+
+// ---------- TX -------------------------------------------------------------
+
+async function postForm(url, fields) {
+  const body = new URLSearchParams();
+  for (const k in fields) if (fields[k] != null) body.set(k, fields[k]);
+  const r = await fetch(url, { method:'POST', body });
+  let j = null;
+  try { j = await r.json(); } catch (_) {}
+  return { ok: r.ok && (j?.ok !== false), status: r.status, body: j };
+}
+
+async function sendCurrentMessage() {
+  const to   = (toCall.value || '').trim().toUpperCase();
+  const text = (msgIn.value  || '').trim();
+  if (!to || !text) return;
+  sendBtn.disabled = true;
+  setStatus('sending…', 'warn');
+  const res = await postForm('/api/tx/message', { to, text });
+  sendBtn.disabled = false;
+  if (res.ok) {
+    setStatus('sent', 'ok');
+    msgIn.value = '';
+  } else {
+    setStatus('send failed (' + res.status + ')', 'err');
+  }
+}
+
+// ---------- GPS beacon ----------------------------------------------------
+
+let gpsWatchId = null;
+let lastBeacon = { lat:0, lon:0, ts:0 };
+const BEACON_MIN_INTERVAL_MS = 60_000;
+const BEACON_MIN_MOVE_M = 50;
+
+function haversine(a, b, c, d) {
+  const R = 6371000, t = (x) => x * Math.PI / 180;
+  const x = Math.sin((c-a)/2 * Math.PI/180);
+  const y = Math.sin((d-b)/2 * Math.PI/180);
+  const h = x*x + Math.cos(t(a))*Math.cos(t(c))*y*y;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function toggleGps() {
+  if (gpsWatchId != null) {
+    navigator.geolocation.clearWatch(gpsWatchId);
+    gpsWatchId = null;
+    gpsBtn.classList.remove('on');
+    setStatus('GPS off', 'dim');
+    return;
+  }
+  if (!('geolocation' in navigator)) {
+    setStatus('no geolocation', 'err'); return;
+  }
+  gpsWatchId = navigator.geolocation.watchPosition((pos) => {
+    const { latitude:lat, longitude:lon } = pos.coords;
+    const now = Date.now();
+    const moved = haversine(lastBeacon.lat, lastBeacon.lon, lat, lon);
+    if (now - lastBeacon.ts < BEACON_MIN_INTERVAL_MS && moved < BEACON_MIN_MOVE_M) return;
+    lastBeacon = { lat, lon, ts: now };
+    postForm('/api/tx/position', {
+      lat: lat.toFixed(6), lon: lon.toFixed(6),
+      comment: ' via browser', symbol_table: '/', symbol_code: '>',
+    }).then((r) => setStatus(r.ok ? `beacon ${lat.toFixed(3)},${lon.toFixed(3)}` : 'beacon failed',
+                              r.ok ? 'ok' : 'err'));
+  }, (err) => {
+    setStatus('GPS error: ' + err.message, 'err');
+  }, { enableHighAccuracy:true, maximumAge:5000, timeout:30_000 });
+  gpsBtn.classList.add('on');
+  setStatus('GPS on (opt-in)', 'ok');
+}
+
+// ---------- Map view (lazy-loaded Leaflet) -------------------------------
+// We deliberately load Leaflet from a CDN at first use rather than bake it
+// into LittleFS — flash on the kv4p-ht board is at 95% already.  If the
+// device is on a fully air-gapped network the user can host Leaflet on
+// the same LAN and update LEAFLET_BASE below.
+
+const LEAFLET_BASE = 'https://unpkg.com/leaflet@1.9.4/dist';
+let leafletReady = null;
+let mapInstance = null;
+let mapMarkers = {};      // src -> Leaflet marker
+let mapTracks  = {};      // src -> Leaflet polyline
+let mapVisible = false;
+
+function ensureLeaflet() {
+  if (leafletReady) return leafletReady;
+  return leafletReady = new Promise((resolve, reject) => {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = `${LEAFLET_BASE}/leaflet.css`;
+    document.head.appendChild(link);
+    const s = document.createElement('script');
+    s.src = `${LEAFLET_BASE}/leaflet.js`;
+    s.onload  = () => resolve(window.L);
+    s.onerror = () => reject(new Error('Leaflet CDN unreachable'));
+    document.head.appendChild(s);
+  });
+}
+
+async function readAllPoints() {
+  const db = await trackDb;
+  if (!db) return [];
+  return new Promise((resolve) => {
+    const out = [];
+    const tx = db.transaction('points', 'readonly');
+    tx.objectStore('points').openCursor().onsuccess = (e) => {
+      const c = e.target.result;
+      if (!c) return resolve(out);
+      out.push(c.value);
+      c.continue();
+    };
+    tx.onerror = () => resolve(out);
+  });
+}
+
+function colourFor(callsign) {
+  // Cheap hash → hue, so each callsign gets a stable colour.
+  let h = 0;
+  for (let i = 0; i < callsign.length; i++) h = (h * 31 + callsign.charCodeAt(i)) | 0;
+  return `hsl(${Math.abs(h) % 360}, 70%, 60%)`;
+}
+
+async function populateMap() {
+  const L = window.L;
+  if (!L || !mapInstance) return;
+  const points = await readAllPoints();
+  const byCall = {};
+  for (const p of points) (byCall[p.src] = byCall[p.src] || []).push(p);
+  const all = [];
+  for (const call in byCall) {
+    const pts = byCall[call].sort((a, b) => a.ts - b.ts);
+    const last = pts[pts.length - 1];
+    if (last.lat == null || last.lon == null) continue;
+    all.push([last.lat, last.lon]);
+    if (mapMarkers[call]) {
+      mapMarkers[call].setLatLng([last.lat, last.lon]);
+    } else {
+      mapMarkers[call] = L.circleMarker([last.lat, last.lon], {
+        radius: 6, color: colourFor(call), weight: 2,
+        fillColor: colourFor(call), fillOpacity: 0.9
+      }).addTo(mapInstance).bindPopup(`<b>${call}</b><br>${last.comment || ''}`);
+    }
+    if (pts.length > 1) {
+      const line = pts.map(p => [p.lat, p.lon]);
+      if (mapTracks[call]) mapTracks[call].setLatLngs(line);
+      else mapTracks[call] = L.polyline(line, {
+        color: colourFor(call), weight: 2, opacity: 0.6
+      }).addTo(mapInstance);
+    }
+  }
+  const mapStatus = $('#mapStatus');
+  mapStatus.textContent = all.length
+    ? `${Object.keys(byCall).length} stations · ${points.length} points`
+    : 'no positions yet — wait for an APRS position packet';
+  if (all.length) mapInstance.fitBounds(all, { padding: [30, 30], maxZoom: 13 });
+}
+
+function pushPointToMap(parsed) {
+  if (!mapVisible || !window.L || !mapInstance) return;
+  if (parsed.lat == null || parsed.lon == null) return;
+  const L = window.L;
+  const call = parsed.src;
+  const ll = [parsed.lat, parsed.lon];
+  if (mapMarkers[call]) mapMarkers[call].setLatLng(ll);
+  else mapMarkers[call] = L.circleMarker(ll, {
+    radius: 6, color: colourFor(call), weight: 2,
+    fillColor: colourFor(call), fillOpacity: 0.9
+  }).addTo(mapInstance).bindPopup(`<b>${call}</b><br>${parsed.comment || ''}`);
+  if (!mapTracks[call]) mapTracks[call] = L.polyline([ll], {
+    color: colourFor(call), weight: 2, opacity: 0.6
+  }).addTo(mapInstance);
+  else mapTracks[call].addLatLng(ll);
+}
+
+async function openMapOverlay() {
+  $('#mapOverlay').hidden = false;
+  mapVisible = true;
+  let L;
+  try { L = await ensureLeaflet(); }
+  catch (e) {
+    $('#mapStatus').textContent = 'leaflet load failed (offline?)';
+    return;
+  }
+  if (!mapInstance) {
+    mapInstance = L.map('map', { zoomControl: true }).setView([20, 0], 2);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap', maxZoom: 19
+    }).addTo(mapInstance);
+  }
+  setTimeout(() => mapInstance.invalidateSize(), 50);
+  await populateMap();
+}
+
+function closeMapOverlay() {
+  $('#mapOverlay').hidden = true;
+  mapVisible = false;
+}
+
+// ---------- Wiring --------------------------------------------------------
+
+sendBtn.addEventListener('click', sendCurrentMessage);
+msgIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendCurrentMessage(); });
+gpsBtn.addEventListener('click', toggleGps);
+$('#mapBtn').addEventListener('click', openMapOverlay);
+$('#mapClose').addEventListener('click', closeMapOverlay);
+
+// ---------- Webhooks panel -----------------------------------------------
+
+async function openHooks() {
+  $('#hookOverlay').hidden = false;
+  const r = await fetch('/api/webhooks');
+  const slots = r.ok ? await r.json() : [];
+  const host = $('#hookSlots');
+  host.innerHTML = '';
+  slots.forEach(renderHookSlot);
+}
+function closeHooks() { $('#hookOverlay').hidden = true; }
+
+function renderHookSlot(s) {
+  const host = $('#hookSlots');
+  const wrap = document.createElement('div');
+  wrap.className = 'hook-slot';
+  const id = (k) => `h${s.slot}_${k}`;
+  wrap.innerHTML = `
+    <div class="row">
+      <label style="flex:0 0 auto"><input type="checkbox" id="${id('en')}" ${s.enabled?'checked':''}> enabled</label>
+      <label class="grow">name<input type="text" id="${id('name')}" value="${escapeAttr(s.name)}" placeholder="Slot ${s.slot+1}"></label>
+    </div>
+    <label>URL <input type="text" id="${id('url')}" value="${escapeAttr(s.url)}" placeholder="https://api.telegram.org/bot…/sendMessage"></label>
+    <label>JSON body template (empty = default) <textarea id="${id('body')}" placeholder='{"chat_id":"123","text":"{src}: {message}"}'>${escapeText(s.body_template)}</textarea></label>
+    <div class="row">
+      <label class="grow">filter callsign (prefix, blank = all) <input type="text" id="${id('flt')}" value="${escapeAttr(s.filter_callsign)}" placeholder="e.g. M0XYZ"></label>
+      <label style="flex:0 0 auto">events<select id="${id('evt')}">
+        <option value="1" ${s.event_mask===1?'selected':''}>any RX</option>
+        <option value="2" ${s.event_mask===2?'selected':''}>messages to me</option>
+        <option value="4" ${s.event_mask===4?'selected':''}>positions only</option>
+        <option value="8" ${s.event_mask===8?'selected':''}>status only</option>
+        <option value="3" ${s.event_mask===3?'selected':''}>any + msgs to me</option>
+      </select></label>
+    </div>
+    <div class="row">
+      <button type="button" data-act="save" data-slot="${s.slot}">Save</button>
+      <button type="button" data-act="test" data-slot="${s.slot}">Send test</button>
+      <span class="res" id="${id('res')}"></span>
+    </div>`;
+  host.appendChild(wrap);
+}
+
+function escapeAttr(s) { return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function escapeText(s) { return escapeAttr(s); }
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const slot = +btn.dataset.slot;
+  const id = (k) => `h${slot}_${k}`;
+  const res = document.getElementById(id('res'));
+  if (btn.dataset.act === 'save') {
+    res.textContent = 'saving…'; res.className='res';
+    const r = await postForm('/api/webhooks', {
+      slot,
+      enabled:    document.getElementById(id('en')).checked ? '1' : '0',
+      event_mask: document.getElementById(id('evt')).value,
+      name:       document.getElementById(id('name')).value,
+      url:        document.getElementById(id('url')).value,
+      body_template: document.getElementById(id('body')).value,
+      filter_callsign: document.getElementById(id('flt')).value,
+    });
+    res.textContent = r.ok ? 'saved' : 'save failed';
+    res.className = 'res ' + (r.ok ? 'ok' : 'err');
+  } else if (btn.dataset.act === 'test') {
+    res.textContent = 'queueing…'; res.className='res';
+    const r = await postForm('/api/webhooks/test', { slot });
+    const j = r.body || {};
+    if (j.queued) {
+      res.textContent = 'queued — check destination';
+      res.className = 'res ok';
+    } else {
+      res.textContent = j.err || 'failed';
+      res.className = 'res err';
+    }
+  }
+});
+
+$('#hookBtn').addEventListener('click', openHooks);
+$('#hookClose').addEventListener('click', closeHooks);
+
+// ---------- FM voice — RX monitor + TX PTT --------------------------------
+// Talks to /ws_audio on port 81 (see src/webservice.cpp:onWsEvent).
+// Wire format:
+//   server → browser (binary): μ-law @ 8 kHz mono, 320-byte chunks
+//   server → browser (text):   JSON {type:"cfg"|"tx"|...}
+//   browser → server (text):   "tx_start" | "tx_stop" | "ping" | "set_freq:tx,rx"
+//   browser → server (binary): μ-law @ 8 kHz mono mic capture
+//
+// All resampling and μ-law conversion runs in the browser via a plain
+// ScriptProcessorNode.  AudioWorklet would be cleaner but ScriptProcessor
+// works on every browser/OS combo without an extra worklet file in
+// LittleFS — important when flash is the scarce resource.
+
+const VoiceFM = (() => {
+  const state = {
+    ws: null,
+    monitoring: false,
+    txActive: false,
+    muted: false,
+    sampleRate: 8000,        // server-pushed; usually 8000
+    audioCtx: null,
+    gainNode: null,
+    procNode: null,
+    queue: [],               // Float32Array chunks awaiting playback
+    queueOffset: 0,
+    queuedSamples: 0,
+    lastSample: 0,
+    resampleAcc: 0,
+    rxLevel: 0,
+    txLevel: 0,
+    micStream: null,
+    micCtx: null,
+    micProc: null,
+  };
+
+  // ---------- μ-law (G.711) <-> linear int16 ------------------------------
+  function mulawToLinear(u) {
+    u = (~u) & 0xFF;
+    const sign = u & 0x80;
+    const exponent = (u >> 4) & 0x07;
+    const mantissa = u & 0x0F;
+    let s = ((mantissa << 3) + 0x84) << exponent;
+    s -= 0x84;
+    return sign ? -s : s;
+  }
+  function linearToMulaw(v) {
+    let pcm = Math.max(-1, Math.min(1, v));
+    pcm = (pcm * 32767) | 0;
+    const sign = (pcm < 0) ? 0x80 : 0;
+    if (pcm < 0) pcm = -pcm;
+    if (pcm > 32635) pcm = 32635;
+    pcm += 0x84;
+    let exp = 7;
+    for (let m = 0x4000; (pcm & m) === 0 && exp > 0; m >>= 1) exp--;
+    const mant = (pcm >> (exp + 3)) & 0x0F;
+    return (~(sign | (exp << 4) | mant)) & 0xFF;
+  }
+
+  function clearQueue() {
+    state.queue = [];
+    state.queueOffset = 0;
+    state.queuedSamples = 0;
+    state.lastSample = 0;
+    state.resampleAcc = 0;
+  }
+
+  function popSample() {
+    if (state.queue.length === 0) return 0;
+    const c = state.queue[0];
+    const v = c[state.queueOffset++];
+    state.queuedSamples--;
+    if (state.queueOffset >= c.length) {
+      state.queue.shift();
+      state.queueOffset = 0;
+    }
+    return v;
+  }
+
+  function ensureAudioPath() {
+    if (state.audioCtx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    state.audioCtx = new Ctx();
+    state.gainNode = state.audioCtx.createGain();
+    state.procNode = state.audioCtx.createScriptProcessor(1024, 1, 1);
+    state.procNode.onaudioprocess = (e) => {
+      const out = e.outputBuffer.getChannelData(0);
+      const outRate = state.audioCtx.sampleRate;
+      let peak = 0;
+      for (let i = 0; i < out.length; i++) {
+        state.resampleAcc += state.sampleRate;
+        while (state.resampleAcc >= outRate) {
+          state.lastSample = popSample();
+          state.resampleAcc -= outRate;
+        }
+        const s = state.lastSample;
+        out[i] = s;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+      }
+      // Decay-tracked peak for VU-style meter
+      state.rxLevel = Math.max(state.rxLevel * 0.85, peak);
+    };
+    state.procNode.connect(state.gainNode);
+    state.gainNode.connect(state.audioCtx.destination);
+    setVolumePercent(parseInt($('#vpVol').value, 10) || 80);
+  }
+
+  function setVolumePercent(p) {
+    const g = Math.max(0, Math.min(1, p / 100));
+    if (state.gainNode) state.gainNode.gain.value = state.muted ? 0 : g;
+  }
+
+  function setStatus(txt, cls) {
+    const el = $('#vpStatus');
+    if (!el) return;
+    el.textContent = txt;
+    el.className = cls || 'dim';
+  }
+
+  function wsUrl() {
+    const proto = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+    // The audio WS lives on port 81 (async_websocket).  Use explicit port
+    // so the chat UI (port 80) can reach it from the same origin.
+    return `${proto}${location.hostname}:81/ws_audio`;
+  }
+
+  async function startMonitor() {
+    if (state.monitoring) return;
+    ensureAudioPath();
+    try { await state.audioCtx.resume(); } catch (_) {}
+    clearQueue();
+    state.ws = new WebSocket(wsUrl());
+    state.ws.binaryType = 'arraybuffer';
+    state.ws.onopen = () => {
+      state.monitoring = true;
+      $('#vpToggle').classList.add('on');
+      $('#vpToggle').textContent = 'Stop';
+      setStatus('● live', 'ok');
+    };
+    state.ws.onclose = () => {
+      const wasOn = state.monitoring;
+      cleanupWs();
+      if (wasOn) setStatus('disconnected', 'warn');
+    };
+    state.ws.onerror = () => setStatus('socket error', 'err');
+    state.ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'cfg' && msg.rate) {
+            state.sampleRate = parseInt(msg.rate, 10);
+          } else if (msg.type === 'tx' && msg.state === 'off') {
+            // Server forced TX off (e.g. another client took it)
+            stopTx(/*localOnly*/true);
+          }
+        } catch (_) {}
+        return;
+      }
+      const ulaw = new Uint8Array(ev.data);
+      const pcm = new Float32Array(ulaw.length);
+      for (let i = 0; i < ulaw.length; i++) pcm[i] = mulawToLinear(ulaw[i]) / 32768;
+      state.queue.push(pcm);
+      state.queuedSamples += pcm.length;
+      // Cap latency at ~2 s so we don't drift forever on a slow link
+      const max = state.sampleRate * 2;
+      while (state.queuedSamples > max && state.queue.length) {
+        state.queuedSamples -= state.queue[0].length;
+        state.queue.shift();
+        state.queueOffset = 0;
+      }
+    };
+  }
+
+  function cleanupWs() {
+    if (state.ws) {
+      try { state.ws.onopen = state.ws.onclose = state.ws.onmessage = state.ws.onerror = null; } catch (_) {}
+      try { state.ws.close(); } catch (_) {}
+      state.ws = null;
+    }
+    state.monitoring = false;
+    state.txActive = false;
+    $('#vpToggle').classList.remove('on');
+    $('#vpToggle').textContent = 'Listen';
+    $('#vpPtt').classList.remove('live');
+  }
+
+  function stopMonitor() {
+    if (!state.monitoring && !state.ws) return;
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      try { state.ws.send('tx_stop'); } catch (_) {}
+    }
+    cleanupWs();
+    clearQueue();
+    if (state.audioCtx && state.audioCtx.state !== 'closed') {
+      state.audioCtx.suspend().catch(() => {});
+    }
+    setStatus('idle');
+  }
+
+  async function ensureMicPath() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('mic API missing');
+    }
+    if (state.micStream) return;
+    state.micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    state.micCtx = new Ctx();
+    const src = state.micCtx.createMediaStreamSource(state.micStream);
+    state.micProc = state.micCtx.createScriptProcessor(1024, 1, 1);
+    const muteSink = state.micCtx.createGain(); muteSink.gain.value = 0;
+    state.micProc.onaudioprocess = (e) => {
+      if (!state.txActive || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+      const inp = e.inputBuffer.getChannelData(0);
+      const inRate = state.micCtx.sampleRate || 48000;
+      const step = inRate / state.sampleRate;
+      const outLen = Math.max(1, Math.floor(inp.length / step));
+      const out = new Uint8Array(outLen);
+      let s = 0, peak = 0;
+      for (let i = 0; i < outLen; i++) {
+        const idx = Math.min(inp.length - 1, Math.floor(s));
+        const v = inp[idx] || 0;
+        out[i] = linearToMulaw(v);
+        const a = Math.abs(v); if (a > peak) peak = a;
+        s += step;
+      }
+      state.txLevel = Math.max(state.txLevel * 0.85, peak);
+      state.ws.send(out.buffer);
+    };
+    src.connect(state.micProc);
+    state.micProc.connect(muteSink);
+    muteSink.connect(state.micCtx.destination);
+    if (state.micCtx.state === 'suspended') await state.micCtx.resume();
+  }
+
+  async function startTx() {
+    if (!state.monitoring) await startMonitor();
+    try { await ensureMicPath(); }
+    catch (e) { setStatus('mic denied', 'err'); return; }
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send('tx_start');
+      state.txActive = true;
+      $('#vpPtt').classList.add('live');
+      setStatus('TX', 'err'); // red looks right for "live mic on air"
+    }
+  }
+
+  function stopTx(localOnly = false) {
+    if (!localOnly && state.ws && state.ws.readyState === WebSocket.OPEN) {
+      try { state.ws.send('tx_stop'); } catch (_) {}
+    }
+    state.txActive = false;
+    $('#vpPtt').classList.remove('live');
+    if (state.monitoring) setStatus('● live', 'ok');
+  }
+
+  function toggleMute() {
+    state.muted = !state.muted;
+    $('#vpMute').textContent = state.muted ? '🔈' : '🔇';
+    setVolumePercent(parseInt($('#vpVol').value, 10) || 80);
+  }
+
+  // 10 Hz UI tick: meters + queue depth
+  setInterval(() => {
+    const rxBar = $('#vpRxBar'), txBar = $('#vpTxBar'), q = $('#vpQueue');
+    if (rxBar) rxBar.style.width = Math.min(100, Math.round(state.rxLevel * 100)) + '%';
+    if (txBar) txBar.style.width = Math.min(100, Math.round(state.txLevel * 100)) + '%';
+    if (q) {
+      const ms = state.sampleRate ? Math.round((state.queuedSamples * 1000) / state.sampleRate) : 0;
+      q.textContent = ms + ' ms';
+    }
+    state.rxLevel *= 0.85;
+    state.txLevel *= 0.85;
+  }, 100);
+
+  return {
+    startMonitor, stopMonitor, startTx, stopTx, toggleMute, setVolumePercent,
+    state,
+  };
+})();
+window.VoiceFM = VoiceFM;
+
+// ---------- Station sheet (callsign + frequency) -------------------------
+
+function openStation() {
+  $('#stationOverlay').hidden = false;
+  $('#stCall').value   = me.callsign || '';
+  $('#stSsid').value   = me.ssid     || 0;
+  $('#stFreq').value   = (radio.freq_rx ?? '').toString();
+  $('#stFreqRx').value = (radio.freq_rx ?? '').toString();
+  $('#stFreqTx').value = (radio.freq_tx ?? '').toString();
+  $('#stSql').value    = radio.sql_level ?? 0;
+  $('#stToneRx').value = radio.tone_rx ?? 0;
+  $('#stToneTx').value = radio.tone_tx ?? 0;
+  $('#stPwr').value    = radio.rf_power ? '1' : '0';
+  $('#stRfEn').checked = !!radio.rf_en;
+  $('#stModem').value  = String(radio.modem ?? 0);
+  $('#stIdRes').textContent = '';
+  $('#stRadioRes').textContent = '';
+}
+function closeStation() { $('#stationOverlay').hidden = true; }
+
+async function saveIdentity() {
+  const res = $('#stIdRes');
+  res.textContent = 'saving…'; res.className = 'res';
+  const r = await postForm('/api/identity', {
+    callsign: $('#stCall').value,
+    ssid:     $('#stSsid').value || '0',
+  });
+  if (r.ok) {
+    res.textContent = 'saved'; res.className = 'res ok';
+    await loadMe();
+  } else {
+    res.textContent = (r.body && r.body.err) || 'failed';
+    res.className = 'res err';
+  }
+}
+
+async function saveRadio() {
+  const res = $('#stRadioRes');
+  res.textContent = 'applying…'; res.className = 'res';
+  // Prefer the simplex single-freq field when filled; otherwise send split.
+  const fields = {
+    sql_level:  $('#stSql').value,
+    rf_power:   $('#stPwr').value,
+    tone_rx:    $('#stToneRx').value,
+    tone_tx:    $('#stToneTx').value,
+    rf_en:      $('#stRfEn').checked ? '1' : '0',
+    modem_type: $('#stModem').value,
+  };
+  if ($('#stFreq').value) {
+    fields.freq = $('#stFreq').value;
+  } else {
+    fields.freq_rx = $('#stFreqRx').value;
+    fields.freq_tx = $('#stFreqTx').value;
+  }
+  const r = await postForm('/api/radio', fields);
+  if (r.ok) {
+    res.textContent = 'applied (radio re-init queued)';
+    res.className = 'res ok';
+    await loadRadio();
+  } else {
+    res.textContent = (r.body && r.body.err) || 'failed';
+    res.className = 'res err';
+  }
+}
+
+$('#stationBtn').addEventListener('click', openStation);
+$('#stationClose').addEventListener('click', closeStation);
+$('#stSaveId').addEventListener('click', saveIdentity);
+$('#stSaveRadio').addEventListener('click', saveRadio);
+
+// ---------- Filter wiring -------------------------------------------------
+const filterIn   = $('#filterInput');
+const filterMode = $('#filterMode');
+const filterBar  = $('#filterBar');
+const filterClr  = $('#filterClear');
+function applyFilter() {
+  filterState.text = (filterIn.value || '').trim().toUpperCase();
+  filterState.mode = filterMode.value;
+  filterBar.classList.toggle('active', !!filterState.text);
+  applyFilterToFeed();
+}
+filterIn.addEventListener('input', applyFilter);
+filterMode.addEventListener('change', applyFilter);
+filterClr.addEventListener('click', () => { filterIn.value = ''; applyFilter(); filterIn.focus(); });
+
+// ---------- Voice panel wiring -------------------------------------------
+const voicePanel = $('#voicePanel');
+$('#voiceBtn').addEventListener('click', () => {
+  const wasHidden = voicePanel.hidden;
+  voicePanel.hidden = !wasHidden;
+  $('#voiceBtn').classList.toggle('on', !voicePanel.hidden);
+});
+$('#vpToggle').addEventListener('click', () => {
+  if (VoiceFM.state.monitoring) VoiceFM.stopMonitor();
+  else VoiceFM.startMonitor();
+});
+$('#vpVol').addEventListener('input', (e) => VoiceFM.setVolumePercent(+e.target.value));
+$('#vpMute').addEventListener('click', () => VoiceFM.toggleMute());
+
+// Hold-to-talk PTT (touch + mouse + keyboard space)
+const ptt = $('#vpPtt');
+const pttDown = (e) => { e.preventDefault(); VoiceFM.startTx(); };
+const pttUp   = (e) => { e.preventDefault(); VoiceFM.stopTx();  };
+['mousedown', 'touchstart'].forEach(ev => ptt.addEventListener(ev, pttDown, { passive: false }));
+['mouseup', 'mouseleave', 'touchend', 'touchcancel'].forEach(ev => ptt.addEventListener(ev, pttUp, { passive: false }));
+window.addEventListener('keydown', (e) => {
+  // Space-to-talk only when the voice panel is visible AND no text input is focused.
+  if (e.code !== 'Space' || voicePanel.hidden || e.repeat) return;
+  const tag = (document.activeElement?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  e.preventDefault();
+  VoiceFM.startTx();
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code !== 'Space' || voicePanel.hidden) return;
+  const tag = (document.activeElement?.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
+  e.preventDefault();
+  VoiceFM.stopTx();
+});
+// Frequency presets
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('#stationOverlay .preset');
+  if (!b) return;
+  $('#stFreq').value   = b.dataset.freq;
+  $('#stFreqRx').value = '';
+  $('#stFreqTx').value = '';
+});
+
+(async () => {
+  setStatus('loading…', 'dim');
+  await Promise.all([loadMe(), loadRadio()]);
+  await hydrate();
+  connectStream();
+  // /api/me changes slowly, /api/radio carries the live audio-level meter so
+  // refresh it more often.
+  setInterval(loadMe,    30_000);
+  setInterval(loadRadio,  3_000);
+})();
+
+})();
+)EMBED";
