@@ -1314,6 +1314,11 @@ static const char *FALLBACK_INDEX_HTML =
 
 void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime)
 {
+	// Use the one-shot request->send(...) for static-string responses rather
+	// than beginResponse() + send() — the two-step path was observed hanging
+	// indefinitely on the kv4p-ht (clients see "cannot parse response" in
+	// Safari).  The one-shot path is what /api/me uses and reliably flushes
+	// even when the heap is fragmented.
 	String gz = String(path) + ".gz";
 	if (LITTLEFS.exists(gz))
 	{
@@ -1336,12 +1341,26 @@ void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const c
 	// failed network request rather than a broken page.
 	if (strcmp(path, "/index.html") == 0)
 	{
-		AsyncWebServerResponse *r = request->beginResponse(200, "text/html", FALLBACK_INDEX_HTML);
-		r->addHeader("Cache-Control", "no-cache");
-		request->send(r);
+		request->send(200, "text/html", FALLBACK_INDEX_HTML);
 		return;
 	}
 	request->send(404, "text/plain", path);
+}
+
+// GET /healthz — tiny diagnostic endpoint independent of the LittleFS layer
+// or the heavy setMainPage path. If "/" hangs but /healthz responds, the
+// problem is in the file-serving / streaming response path, not the network
+// stack.
+static void api_healthz(AsyncWebServerRequest *request)
+{
+	char buf[160];
+	snprintf(buf, sizeof(buf),
+			 "{\"ok\":true,\"uptime\":%lu,\"free_heap\":%u,\"min_free_heap\":%u,\"largest_free_block\":%u}",
+			 (unsigned long)(millis() / 1000),
+			 (unsigned)ESP.getFreeHeap(),
+			 (unsigned)ESP.getMinFreeHeap(),
+			 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+	request->send(200, "application/json", buf);
 }
 
 // Append a JSON-escaped copy of `src` into `dst` (bounded by `cap`, leaving room
@@ -14018,6 +14037,8 @@ void webService()
 	// JSON API for the new mobile UI
 	async_server.on("/api/me", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ api_me(request); });
+	async_server.on("/healthz", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_healthz(request); });
 	async_server.on("/api/packets/recent", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ api_packets_recent(request); });
 	async_server.on("/api/tx/message", HTTP_POST, [](AsyncWebServerRequest *request)
