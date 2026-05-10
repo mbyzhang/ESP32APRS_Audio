@@ -43,10 +43,6 @@ ESP32APRS Audio is a Internet Gateway(IGate)/Digital Repeater(DiGi)/Tracker/Weat
 * AX.25 coder/decoder
 * FX.25 (AX.25 with error correction) coder/decoder, fully compatible with [Direwolf](https://github.com/wb2osz/direwolf) and [UZ7HO Soundmodem](http://uz7.ho.ua/packetradio.htm)
 
-## API Documentation
-
-The current HTTP, SSE, WebSocket, and outbound webhook API surface is documented in [docs/api.md](docs/api.md).
-
 ## Hardware screen short
 ![esp32c3aprs_radio](image/ESP32C3APRS_Radio.jpg) ![esp32c3aprs_oled](image/ESP32C3APRS_OLED.jpg)
 ![esp32dr_simple](image/ESP32DR_Simple_Test.png) ![esp32dr_sa868](image/ESP32DR_SA868_2.png)

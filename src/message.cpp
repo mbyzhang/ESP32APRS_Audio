@@ -365,18 +365,6 @@ int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack,
     return i;
 }
 
-static uint16_t messageIdFromText(const String &fromCall, const String &toCall, const String &message)
-{
-    uint16_t hash = 21661;
-    String key = fromCall + "|" + toCall + "|" + message;
-    for (size_t i = 0; i < key.length(); ++i)
-    {
-        hash ^= (uint8_t)key.charAt(i);
-        hash *= 16719;
-    }
-    return hash == 0 ? 1 : hash;
-}
-
 // ===== ส่งข้อความ APRS =====
 void sendAPRSMessage(const String &toCall, const String &message, bool encrypt)
 {
@@ -579,45 +567,35 @@ void handleIncomingAPRS(const String &line)
             log_d("📩 Message from %s to %s : %s", fromCall.c_str(), toCall.c_str(), message.c_str());
 
             // ถ้าเป็นข้อความถึงเราเอง ให้ตอบกลับ ack
-            if (toCall.equalsIgnoreCase(config.msg_mycall) && message.startsWith("ack") && msgNo.length() > 0)
+            if (toCall.equalsIgnoreCase(config.msg_mycall) && msgNo.length() > 0)
             {
-                msgNo = message.substring(3);
-                int i = pkgMsg_Find(fromCall.c_str(), msgNo.toInt(), false);
-                log_d("Message ACk from %s msgNo %d msgQueue %i", fromCall.c_str(), msgNo.toInt(), i);
-                if (i > -1)
+                if (message.startsWith("ack"))
                 {
-                    msgQueue[i].ack = -2; // ตอบรับแล้ว
-                }
-                event_chatMessage(false);
-            }
-            else
-            {
-                String decrypted = "";
-                const bool directToMe = toCall.equalsIgnoreCase(config.msg_mycall);
-                const uint16_t rxMsgId = msgNo.length() > 0 ? msgNo.toInt() : messageIdFromText(fromCall, toCall, message);
-
-                if (directToMe && config.msg_encrypt)
-                {
-                    uint8_t aes_key[16];
-                    hexStringToBytes(config.msg_key, aes_key, sizeof(aes_key));
-                    decrypted = aesDecryptBase64WithIV(message, aes_key, fromCall.c_str(), rxMsgId);
+                    msgNo = message.substring(3);
+                    int i = pkgMsg_Find(fromCall.c_str(), msgNo.toInt(), false);
+                    log_d("Message ACk from %s msgNo %d msgQueue %i", fromCall.c_str(), msgNo.toInt(), i);
+                    if (i > -1)
+                    {
+                        msgQueue[i].ack = -2; // ตอบรับแล้ว
+                    }
                 }
                 else
                 {
-                    decrypted = message;
-                }
-
-                decrypted.trim();
-                if (decrypted == "")
-                    return;
-
-                if (!directToMe)
-                    decrypted = "[" + toCall + "] " + decrypted;
-
-                pkgMsgUpdate(fromCall.c_str(), decrypted.c_str(), rxMsgId, -1, true); // RX Message
-
-                if (directToMe && msgNo.length() > 0)
-                {
+                    String decrypted = "";
+                    if (config.msg_encrypt)
+                    {
+                        uint8_t aes_key[16];
+                        hexStringToBytes(config.msg_key, aes_key, sizeof(aes_key));
+                        decrypted = aesDecryptBase64WithIV(message, aes_key, fromCall.c_str(), msgNo.toInt());
+                    }
+                    else
+                    {
+                        decrypted = message;
+                    }
+                    decrypted.trim();
+                    if (decrypted == "")
+                        return;
+                    pkgMsgUpdate(fromCall.c_str(), decrypted.c_str(), msgNo.toInt(), -1, true); // RX Message
                     sendAPRSAck(fromCall, msgNo);
                     if (config.at_cmd_msg)
                     {

@@ -33,19 +33,16 @@ if os.path.isfile(dotenv_path):
     sta_pass = data.get("WIFI_STA_PASS") or data.get("WIFIPWD") or data.get("WIFI_PASSWORD")
     ap_ssid = data.get("WIFI_AP_SSID") or data.get("APSSID")
     ap_pass = data.get("WIFI_AP_PASS") or data.get("APPWD")
-    host_name = data.get("WIFI_HOSTNAME") or data.get("DEVICE_HOSTNAME") or data.get("HOST_NAME")
 
     defines = []
     if sta_ssid:
         defines.append(_cpp_define_string("DEFAULT_WIFI_STA_SSID", sta_ssid))
-        defines.append(_cpp_define_string("DEFAULT_WIFI_STA_PASS", sta_pass or ""))
-        defines.append("DOTENV_WIFI_DEFAULTS")
+    if sta_pass:
+        defines.append(_cpp_define_string("DEFAULT_WIFI_STA_PASS", sta_pass))
     if ap_ssid:
         defines.append(_cpp_define_string("DEFAULT_WIFI_AP_SSID", ap_ssid))
     if ap_pass:
         defines.append(_cpp_define_string("DEFAULT_WIFI_AP_PASS", ap_pass))
-    if host_name:
-        defines.append(_cpp_define_string("DEFAULT_HOST_NAME", host_name))
 
     if defines:
         env.Append(CPPDEFINES=defines)
