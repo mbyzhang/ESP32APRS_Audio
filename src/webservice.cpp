@@ -701,96 +701,27 @@ void handle_css(AsyncWebServerRequest *request)
 //
 // Regenerate include/embedded_ui.h from data/* via
 // `python3 scripts/embed_ui.py` whenever you edit the UI source.
-class EmbeddedAssetResponse : public AsyncWebServerResponse
-{
-public:
-	EmbeddedAssetResponse(const char *body, size_t bodyLen, const char *contentType)
-		: _body(body), _bodyLen(bodyLen), _head()
-	{
-		_code = 200;
-		_contentType = contentType;
-		_contentLength = bodyLen;
-		_sendContentLength = true;
-		_chunked = false;
-		addHeader("Connection", "close");
-	}
-
-	bool _sourceValid() const override { return _body != nullptr; }
-
-	void _respond(AsyncWebServerRequest *request) override
-	{
-		_head = _assembleHead(request->version());
-		_state = RESPONSE_HEADERS;
-		_ack(request, 0, 0);
-	}
-
-	size_t _ack(AsyncWebServerRequest *request, size_t len, uint32_t time) override
-	{
-		(void)time;
-		_ackedLength += len;
-
-		size_t wrote = 0;
-		size_t space = request->client()->space();
-		if (space == 0)
-			return 0;
-
-		if (_state == RESPONSE_HEADERS && _head.length() > 0)
-		{
-			size_t n = _head.length();
-			if (n > space) n = space;
-			size_t actual = request->client()->write(_head.c_str(), n);
-			wrote += actual;
-			_writtenLength += actual;
-			space -= actual;
-			if (actual < _head.length())
-			{
-				_head = _head.substring(actual);
-				return wrote;
-			}
-			_head = String();
-			_state = RESPONSE_CONTENT;
-		}
-
-		if (_state == RESPONSE_CONTENT && space > 0)
-		{
-			size_t remaining = _contentLength - _sentLength;
-			size_t n = remaining;
-			if (n > space) n = space;
-			if (n > 1024) n = 1024;
-			if (n > 0)
-			{
-				size_t actual = request->client()->write(_body + _sentLength, n);
-				wrote += actual;
-				_writtenLength += actual;
-				_sentLength += actual;
-			}
-			if (_sentLength >= _contentLength)
-				_state = RESPONSE_WAIT_ACK;
-		}
-		else if (_state == RESPONSE_WAIT_ACK)
-		{
-			if (_ackedLength >= _writtenLength)
-			{
-				_state = RESPONSE_END;
-				request->client()->close(true);
-			}
-		}
-
-		return wrote;
-	}
-
-private:
-	const char *_body;
-	size_t _bodyLen;
-	String _head;
-};
-
+// Use the library's built-in callback-based response — it handles the TCP
+// state machine (ACK accounting, partial writes, retransmits, close) for
+// us.  A previous custom EmbeddedAssetResponse subclass tried to drive
+// _respond / _ack itself and got the WAIT_ACK transition wrong, which
+// truncated /app.js at 12288 bytes and silently hung / and /app.css.
 static void sendEmbeddedAsset(AsyncWebServerRequest *request,
                                const char *body, size_t bodyLen,
                                const char *contentType)
 {
-	AsyncWebServerResponse *response = new EmbeddedAssetResponse(body, bodyLen, contentType);
-	response->addHeader("Cache-Control", "public, max-age=600");
+	AsyncWebServerResponse *response = request->beginResponse(
+		contentType, bodyLen,
+		[body, bodyLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+			if (index >= bodyLen) return 0;
+			size_t toCopy = bodyLen - index;
+			if (toCopy > maxLen) toCopy = maxLen;
+			memcpy(buffer, body + index, toCopy);
+			return toCopy;
+		});
+	// no-cache so the browser revalidates after every firmware reflash —
+	// avoids the "flashed new JS but browser still runs the old one" trap.
+	response->addHeader("Cache-Control", "no-cache, must-revalidate");
 	request->send(response);
 }
 
