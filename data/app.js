@@ -723,8 +723,19 @@ function updatePendingMessageStatus(entry) {
   el.dataset.status = entry.status || 'pending';
 }
 
-// Poll while page is open.  Cheap: a single small GET on a 3-second cadence.
-setInterval(pollPendingMessages, 3000);
+// Adaptive pending-poll: only burn requests when there's actually an
+// outbound message in flight.  When the feed is idle (no .me bubbles
+// pending) we slow to one check per minute, just to catch acks that
+// might arrive during a long quiet window.  This was a constant
+// 3-second poll before — combined with /api/radio every 3 s it
+// fragmented the device heap (largest_free_block dropped to ~3 kB)
+// and the chunked response path for / and /app.js then stalled forever.
+function schedulePendingPoll() {
+  const anyPending = !!feed.querySelector('.msg.me[data-msgid][data-status="pending"], .msg.me[data-msgid][data-status="sent"]');
+  pollPendingMessages();
+  setTimeout(schedulePendingPoll, anyPending ? 5000 : 60000);
+}
+setTimeout(schedulePendingPoll, 5000);
 
 // ---------- GPS beacon ----------------------------------------------------
 
@@ -1512,10 +1523,27 @@ document.addEventListener('click', (e) => {
   await Promise.all([loadMe(), loadRadio()]);
   await hydrate();
   connectStream();
-  // /api/me changes slowly, /api/radio carries the live audio-level meter so
-  // refresh it more often.
-  setInterval(loadMe,    30_000);
-  setInterval(loadRadio,  3_000);
+  // Polling cadence:
+  //   /api/me     — slow (heap/RX counter only changes meaningfully over
+  //                  minutes).
+  //   /api/radio  — fast while the Station sheet is open (live mvrms / dcd
+  //                  meter), slow otherwise so we don't fragment the device
+  //                  heap with 1200 requests/hour.
+  setInterval(loadMe,   60_000);
+  setInterval(loadRadio, 15_000);
+  // Fast tick only while Station sheet is open — observe via the open/close
+  // events on #stationBtn so we don't have to monkey-patch openStation().
+  let fastRadioTimer = null;
+  $('#stationBtn').addEventListener('click', () => {
+    if (fastRadioTimer) return;
+    fastRadioTimer = setInterval(() => {
+      if ($('#stationOverlay').hidden) {
+        clearInterval(fastRadioTimer); fastRadioTimer = null;
+        return;
+      }
+      loadRadio();
+    }, 1500);
+  });
 })();
 
 })();

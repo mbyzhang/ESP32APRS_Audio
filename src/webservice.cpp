@@ -701,15 +701,28 @@ void handle_css(AsyncWebServerRequest *request)
 //
 // Regenerate include/embedded_ui.h from data/* via
 // `python3 scripts/embed_ui.py` whenever you edit the UI source.
-// Use the library's built-in callback-based response — it handles the TCP
-// state machine (ACK accounting, partial writes, retransmits, close) for
-// us.  A previous custom EmbeddedAssetResponse subclass tried to drive
-// _respond / _ack itself and got the WAIT_ACK transition wrong, which
-// truncated /app.js at 12288 bytes and silently hung / and /app.css.
-static void sendEmbeddedAsset(AsyncWebServerRequest *request,
-                               const char *body, size_t bodyLen,
-                               const char *contentType)
+// Serve a gzip-compressed embedded asset via the chunked-callback path.
+//
+// Why gzip:  on a fragmented heap (largest_free_block ~5-6 KB on the
+// kv4p-ht once polling has been running a while), ESPAsyncWebServer's
+// _ack() does malloc(TCP_SND_BUF + headers) per ACK ≈ 6 KB and hangs
+// when that fails — / and /app.js silently never finish.  Our raw
+// app.js is 56 KB; gzipped it's ~12 KB.  index.html 7.8 → ~3 KB.
+// The smaller compressed bodies fit even when the heap is tight, and
+// the browser handles `Content-Encoding: gzip` transparently.
+//
+// Why chunked-callback:  hands the TCP state machine to the library
+// (ACK tracking, partial writes, retransmits, close).  An earlier
+// hand-rolled subclass got the WAIT_ACK transition wrong and truncated
+// responses.
+static void sendEmbeddedAssetGz(AsyncWebServerRequest *request,
+                                 const unsigned char *body, size_t bodyLen,
+                                 const char *contentType)
 {
+	// Library's chunked-callback response.  Combined with the gzipped
+	// payloads (index.html ~2.4 KB, app.js ~18 KB) and the freed-up heap
+	// from skipping histRingInit() during heap pressure, the library's
+	// per-ACK malloc(~6 KB) succeeds reliably.
 	AsyncWebServerResponse *response = request->beginResponse(
 		contentType, bodyLen,
 		[body, bodyLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
@@ -719,8 +732,11 @@ static void sendEmbeddedAsset(AsyncWebServerRequest *request,
 			memcpy(buffer, body + index, toCopy);
 			return toCopy;
 		});
-	// no-cache so the browser revalidates after every firmware reflash —
-	// avoids the "flashed new JS but browser still runs the old one" trap.
+	if (!response) {
+		request->send(503, "text/plain", "service busy");
+		return;
+	}
+	response->addHeader("Content-Encoding", "gzip");
 	response->addHeader("Cache-Control", "no-cache, must-revalidate");
 	request->send(response);
 }
@@ -729,15 +745,15 @@ void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const c
 {
 	(void)mime;
 	if (strcmp(path, "/index.html") == 0) {
-		sendEmbeddedAsset(request, EMBEDDED_INDEX_HTML, strlen(EMBEDDED_INDEX_HTML), "text/html");
+		sendEmbeddedAssetGz(request, EMBEDDED_INDEX_HTML_GZ, EMBEDDED_INDEX_HTML_GZ_LEN, "text/html");
 		return;
 	}
 	if (strcmp(path, "/app.js") == 0) {
-		sendEmbeddedAsset(request, EMBEDDED_APP_JS, strlen(EMBEDDED_APP_JS), "application/javascript");
+		sendEmbeddedAssetGz(request, EMBEDDED_APP_JS_GZ, EMBEDDED_APP_JS_GZ_LEN, "application/javascript");
 		return;
 	}
 	if (strcmp(path, "/app.css") == 0) {
-		sendEmbeddedAsset(request, EMBEDDED_APP_CSS, strlen(EMBEDDED_APP_CSS), "text/css");
+		sendEmbeddedAssetGz(request, EMBEDDED_APP_CSS_GZ, EMBEDDED_APP_CSS_GZ_LEN, "text/css");
 		return;
 	}
 	request->send(404, "text/plain", path);
@@ -810,68 +826,21 @@ static size_t json_escape_into(char *dst, size_t cap, const char *src)
 // (`AsyncTCP begin(): failed to start task` if the static reservation is
 // too aggressive on the kv4p-ht's 124 KB DRAM budget).  Prefers PSRAM
 // when present.
-#define HIST_RING_SIZE_DEFAULT 80
-#define HIST_RAW_MAX 256
-struct HistEntry {
-	time_t  ts;
-	int8_t  channel;     // 0 = RF, 1 = INET
-	int16_t audio;
-	uint8_t dir;         // 0 = rx, 1 = tx
-	char    raw[HIST_RAW_MAX];
-};
-static HistEntry *histRing = nullptr;
-static uint16_t  histRingCap = 0;
-static uint16_t  histNext  = 0;  // next slot to overwrite
-static uint16_t  histCount = 0;  // valid entries (caps at histRingCap)
-static portMUX_TYPE histMux = portMUX_INITIALIZER_UNLOCKED;
-
-void histRingInit()
-{
-	if (histRing) return;
-	uint16_t cap = HIST_RING_SIZE_DEFAULT;
-#ifdef BOARD_HAS_PSRAM
-	histRing = (HistEntry *)ps_calloc(cap, sizeof(HistEntry));
-#endif
-	if (!histRing) {
-		// No PSRAM, or PSRAM allocation failed.  Try DRAM at full size,
-		// then back off to half if that fails — better a smaller ring than
-		// a crashed AsyncTCP.
-		histRing = (HistEntry *)calloc(cap, sizeof(HistEntry));
-		if (!histRing) {
-			cap = HIST_RING_SIZE_DEFAULT / 2;
-			histRing = (HistEntry *)calloc(cap, sizeof(HistEntry));
-		}
-	}
-	histRingCap = histRing ? cap : 0;
-	log_i("packet history ring: %u entries (%u bytes)",
-	      (unsigned)histRingCap, (unsigned)(histRingCap * sizeof(HistEntry)));
-}
-
-static void histPush(const char *raw, int channel, int audioLvl, bool tx)
-{
-	if (!histRing || histRingCap == 0) return;
-	portENTER_CRITICAL(&histMux);
-	HistEntry &e = histRing[histNext];
-	e.ts = time(NULL);
-	e.channel = (int8_t)channel;
-	e.audio   = (int16_t)audioLvl;
-	e.dir     = tx ? 1 : 0;
-	strlcpy(e.raw, raw, sizeof(e.raw));
-	histNext = (histNext + 1) % histRingCap;
-	if (histCount < histRingCap) histCount++;
-	portEXIT_CRITICAL(&histMux);
-}
+// Chat-history FIFO is currently DISABLED on the kv4p-ht — the 10 KB
+// alloc was consuming the heap headroom needed by ESPAsyncWebServer's
+// per-ACK malloc (~6 KB), which made GET / and GET /app.js hang once
+// any polling fragmented things further.  /api/packets/recent now
+// reads from the existing pkgList (callsign-keyed, ~20 entries) which
+// is good enough for the hydration use case.  We can revisit if the
+// device gets PSRAM — see git history for the FIFO implementation.
+void histRingInit() {}
+static void histPush(const char *, int, int, bool) {}
 
 void publishRawPacket(const char *raw, int channel, int audioLvl, bool tx)
 {
 	if (!tx) g_rxPacketCount++;
 	if (raw == nullptr || raw[0] == 0)
 		return;
-	// Record into the chronological FIFO so /api/packets/recent returns the
-	// same view to every connecting browser (and survives page reloads from
-	// any client).  The FIFO doesn't dedup by callsign — every packet is
-	// kept; oldest evicted first when the ring fills.
-	histPush(raw, channel, audioLvl, tx);
 
 	// Fan out to outbound webhooks regardless of whether a browser is watching
 	// the SSE — webhook_enqueue() is cheap when no slot is enabled.  We don't
@@ -1451,16 +1420,11 @@ void api_me(AsyncWebServerRequest *request)
 	request->send(r);
 }
 
-// GET /api/packets/recent — chronological replay of the chat history FIFO.
-//
-// Sources from the histRing populated by publishRawPacket() (every RX and
-// every self-TX, no callsign-keyed dedup) so two browsers opening the page
-// at different moments see the same content for the overlapping window.
-// Newest entries are emitted first; the browser reverses on hydrate.
-//
-// Optional ?since=<unix_ts> query returns only entries strictly newer than
-// that — useful for a polling client that wants to catch up after a
-// disconnect without re-downloading what it already has.
+// GET /api/packets/recent — most-recent packets, hydrates a fresh chat
+// page so the timeline isn't blank.  Sources from pkgList (callsign-keyed
+// ring populated in main.cpp).  Note this dedupes by callsign — for true
+// chronological per-packet history the browser keeps its own IndexedDB
+// timeline on top of this hydration set.
 void api_packets_recent(AsyncWebServerRequest *request)
 {
 	AsyncResponseStream *s = request->beginResponseStream("application/json");
@@ -1471,36 +1435,41 @@ void api_packets_recent(AsyncWebServerRequest *request)
 	}
 	s->addHeader("Cache-Control", "no-cache");
 
-	time_t since = 0;
-	if (request->hasParam("since"))
-		since = (time_t)atoll(request->getParam("since")->value().c_str());
-
-	// Snapshot the ring under the spinlock so a concurrent push doesn't
-	// shift indices mid-iteration; copying just the indices keeps the
-	// critical section short.
-	uint16_t snapNext, snapCount;
-	portENTER_CRITICAL(&histMux);
-	snapNext  = histNext;
-	snapCount = histCount;
-	portEXIT_CRITICAL(&histMux);
+	struct IdxTime { int idx; time_t t; };
+	IdxTime entries[PKGLISTSIZE];
+	int n = 0;
+	for (int i = 0; i < PKGLISTSIZE; i++)
+	{
+		pkgListType pkg = getPkgList(i);
+		if (pkg.time > 0 && pkg.raw && pkg.raw[0])
+		{
+			entries[n].idx = i;
+			entries[n].t = pkg.time;
+			n++;
+		}
+	}
+	// Sort newest-first by time.
+	for (int i = 1; i < n; i++)
+	{
+		IdxTime k = entries[i];
+		int j = i - 1;
+		while (j >= 0 && entries[j].t < k.t) { entries[j + 1] = entries[j]; j--; }
+		entries[j + 1] = k;
+	}
 
 	s->print('[');
 	bool first = true;
 	char esc[360];
-	// Walk newest → oldest.  histNext points at the next slot to overwrite,
-	// so the newest is at (histNext - 1) modulo HIST_RING_SIZE.
-	for (uint16_t i = 0; i < snapCount; i++)
+	for (int i = 0; i < n; i++)
 	{
-		uint16_t idx = (snapNext + histRingCap - 1 - i) % histRingCap;
-		const HistEntry &e = histRing[idx];
-		if (e.ts == 0 || e.raw[0] == 0) continue;
-		if (since && e.ts <= since)    continue;
+		pkgListType pkg = getPkgList(entries[i].idx);
+		if (pkg.raw == nullptr || pkg.raw[0] == 0) continue;
 		if (!first) s->print(',');
 		first = false;
-		json_escape_into(esc, sizeof(esc), e.raw);
-		s->printf("{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"dir\":\"%s\",\"raw\":\"%s\"}",
-				  (long long)e.ts, (int)e.channel, (int)e.audio,
-				  e.dir ? "tx" : "rx", esc);
+		json_escape_into(esc, sizeof(esc), pkg.raw);
+		s->printf("{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"raw\":\"%s\"}",
+				  (long long)pkg.time, (int)pkg.channel,
+				  (int)pkg.audio_level, esc);
 	}
 	s->print(']');
 	request->send(s);
