@@ -521,6 +521,38 @@ void sendAPRSAck(const String &toCall, const String &msgNo)
     log_d("Send APRS ACK to %s msgNo %s TNC2: %s", toCall.c_str(), msgNo.c_str(), packet.c_str());
 }
 
+static bool isOurMessageAddress(const String &toCall)
+{
+    String target = toCall;
+    target.trim();
+    target.toUpperCase();
+
+    String msgCall = String(config.msg_mycall);
+    msgCall.trim();
+    msgCall.toUpperCase();
+    if (target == msgCall)
+        return true;
+
+    String aprsCall = String(config.aprs_mycall);
+    aprsCall.trim();
+    aprsCall.toUpperCase();
+    if (target == aprsCall)
+        return true;
+
+    if (config.aprs_ssid > 0)
+    {
+        String full = aprsCall + "-" + String(config.aprs_ssid);
+        if (target == full)
+            return true;
+    }
+
+    int dash = target.indexOf('-');
+    if (dash > 0)
+        return target.substring(0, dash) == msgCall || target.substring(0, dash) == aprsCall;
+
+    return false;
+}
+
 // ===== จัดการข้อความขาเข้า =====
 void handleIncomingAPRS(const String &line)
 {
@@ -568,8 +600,9 @@ void handleIncomingAPRS(const String &line)
 
             log_d("📩 Message from %s to %s : %s", fromCall.c_str(), toCall.c_str(), message.c_str());
 
-            // ถ้าเป็นข้อความถึงเราเอง ให้ตอบกลับ ack
-            if (toCall.equalsIgnoreCase(config.msg_mycall) && msgNo.length() > 0)
+            // If this message is addressed to us, process ACKs or ACK normal
+            // message-numbered APRS messages as required by the protocol.
+            if (isOurMessageAddress(toCall) && msgNo.length() > 0)
             {
                 if (message.startsWith("ack"))
                 {

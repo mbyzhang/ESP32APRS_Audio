@@ -8447,6 +8447,10 @@ void taskNetwork(void *pvParameters)
                                                 tnc2Raw.clear();
                                             }
                                         }
+                                        if (config.msg_enable && (type & FILTER_MESSAGE))
+                                        {
+                                            handleIncomingAPRS(line);
+                                        }
                                     }
                                     free(raw);
                                 }

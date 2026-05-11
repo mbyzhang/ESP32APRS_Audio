@@ -765,13 +765,31 @@ function renderPacketInternal(pkt, recordSideEffects) {
   if (parsed.type === 'message' && parsed.addressee === fullCall()) el.classList.add('dm');
 
   const isMsg = parsed.type === 'message';
+  if (parsed.dir !== 'tx' && isMsg) {
+    const repeatKey = [
+      parsed.src || '',
+      parsed.addressee || '',
+      parsed.msgid || parsed.message || '',
+    ].join('|');
+    const existing = feed.querySelector(`.msg[data-rxmsgkey="${CSS.escape(repeatKey)}"]`);
+    if (existing) {
+      const count = (parseInt(existing.dataset.repeat || '1', 10) || 1) + 1;
+      existing.dataset.repeat = String(count);
+      const statusEl = existing.querySelector('.status');
+      if (statusEl) statusEl.textContent = `${headLabelForPacket(pkt)} · x${count}`;
+      const tsEl = existing.querySelector('.ts');
+      if (tsEl) tsEl.firstChild.textContent = fmtTime(pkt.ts) + ' · ';
+      if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+      return;
+    }
+    el.dataset.rxmsgkey = repeatKey;
+    el.dataset.repeat = '1';
+  }
   if (parsed.dir === 'tx' && isMsg && parsed.msgid) {
     const existing = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(String(parsed.msgid))}"]`);
     if (existing) return;
   }
-  const headRight = parsed.dir === 'tx'
-    ? '✓ sent'
-    : (pkt.ch === 1 ? 'IS' : (pkt.audio ? `${pkt.audio} dBV` : 'RF'));
+  const headRight = headLabelForPacket(pkt);
 
   let body = '';
   if (isMsg) {
@@ -809,6 +827,12 @@ function renderPacketInternal(pkt, recordSideEffects) {
   while (feed.children.length > 400) feed.removeChild(feed.firstChild);
 
   if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
+}
+
+function headLabelForPacket(pkt) {
+  return pkt.dir === 'tx'
+    ? '✓ sent'
+    : (pkt.ch === 1 ? 'IS' : (pkt.audio ? `${pkt.audio} dBV` : 'RF'));
 }
 
 function isAtBottom() {
