@@ -716,36 +716,106 @@ void handle_css(AsyncWebServerRequest *request)
 // (ACK tracking, partial writes, retransmits, close).  An earlier
 // hand-rolled subclass got the WAIT_ACK transition wrong and truncated
 // responses.
+class EmbeddedGzipResponse : public AsyncWebServerResponse
+{
+public:
+	EmbeddedGzipResponse(const unsigned char *body, size_t bodyLen, const char *contentType)
+		: _body(body), _bodyLen(bodyLen)
+	{
+		_code = 200;
+		_contentType = contentType;
+		_contentLength = bodyLen;
+		_sendContentLength = true;
+		_chunked = false;
+	}
+
+	bool _sourceValid() const override { return _body != nullptr; }
+
+	void _respond(AsyncWebServerRequest *request) override
+	{
+		addHeader("Content-Encoding", "gzip");
+		addHeader("Cache-Control", "no-cache, must-revalidate");
+		addHeader("Connection", "close");
+		_head = _assembleHead(request->version());
+		_state = RESPONSE_HEADERS;
+		_ack(request, 0, 0);
+	}
+
+	size_t _ack(AsyncWebServerRequest *request, size_t len, uint32_t time) override
+	{
+		(void)time;
+		_ackedLength += len;
+		AsyncClient *client = request->client();
+		if (!client || !client->connected())
+			return 0;
+
+		size_t space = client->space();
+		if (space == 0)
+			return 0;
+
+		if (_state == RESPONSE_HEADERS)
+		{
+			size_t left = _head.length() - _headSent;
+			if (left == 0)
+			{
+				_state = RESPONSE_CONTENT;
+				return 0;
+			}
+			size_t n = left;
+			if (n > space) n = space;
+			if (n > 512) n = 512;
+			size_t written = client->write(_head.c_str() + _headSent, n);
+			_headSent += written;
+			_writtenLength += written;
+			return written;
+		}
+
+		if (_state == RESPONSE_CONTENT)
+		{
+			size_t left = _bodyLen - _bodySent;
+			if (left == 0)
+			{
+				_state = RESPONSE_WAIT_ACK;
+				return 0;
+			}
+			size_t n = left;
+			if (n > space) n = space;
+			if (n > 1024) n = 1024;
+			size_t written = client->write((const char *)_body + _bodySent, n);
+			_bodySent += written;
+			_sentLength += written;
+			_writtenLength += written;
+			return written;
+		}
+
+		if (_state == RESPONSE_WAIT_ACK)
+		{
+			if (_ackedLength >= _writtenLength)
+			{
+				_state = RESPONSE_END;
+				client->close(true);
+			}
+		}
+		return 0;
+	}
+
+private:
+	const unsigned char *_body;
+	size_t _bodyLen;
+	String _head;
+	size_t _headSent = 0;
+	size_t _bodySent = 0;
+};
+
 static void sendEmbeddedAssetGz(AsyncWebServerRequest *request,
                                  const unsigned char *body, size_t bodyLen,
                                  const char *contentType)
 {
-	// Library's chunked-callback response.  Combined with the gzipped
-	// payloads (index.html ~2.4 KB, app.js ~18 KB) and the freed-up heap
-	// from skipping histRingInit() during heap pressure, the library's
-	// per-ACK malloc(~6 KB) succeeds reliably.
-	AsyncWebServerResponse *response = request->beginResponse(
-		contentType, bodyLen,
-		[body, bodyLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-			if (index >= bodyLen) return 0;
-			size_t toCopy = bodyLen - index;
-			if (toCopy > maxLen) toCopy = maxLen;
-			memcpy(buffer, body + index, toCopy);
-			return toCopy;
-		});
+	AsyncWebServerResponse *response = new EmbeddedGzipResponse(body, bodyLen, contentType);
 	if (!response) {
 		request->send(503, "text/plain", "service busy");
 		return;
 	}
-	response->addHeader("Content-Encoding", "gzip");
-	response->addHeader("Cache-Control", "no-cache, must-revalidate");
-	// Force the connection to close after each chat-UI asset.  Earlier
-	// debug runs showed bytes from a previous response leaking into the
-	// next one on a kept-alive socket (client gets HTTP/0.9 because the
-	// status line is mid-body of the previous response).  Closing per
-	// request side-steps that and keeps the AsyncTCP slot table healthier
-	// — chat-UI assets are tiny so keep-alive isn't a meaningful win here.
-	response->addHeader("Connection", "close");
 	request->send(response);
 }
 
@@ -13612,14 +13682,14 @@ void webService()
 	// web client handlers
 	// New chat-style mobile UI lives at "/" as static files in LittleFS (data/index.html etc.).
 	// The legacy multi-tab configuration UI is now reachable at "/settings".
-	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-					{ serveStaticChatUI(request, "/index.html", "text/html"); });
 	async_server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ serveStaticChatUI(request, "/app.js", "application/javascript"); });
 	async_server.on("/app.css", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ serveStaticChatUI(request, "/app.css", "text/css"); });
 	async_server.on("/manifest.webmanifest", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ serveStaticChatUI(request, "/manifest.webmanifest", "application/manifest+json"); });
+	async_server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ serveStaticChatUI(request, "/index.html", "text/html"); });
 	async_server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ setMainPage(request); });
 

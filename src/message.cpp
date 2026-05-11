@@ -405,6 +405,24 @@ static bool isAckCapableAddressee(const String &toCall)
     return true;
 }
 
+static String outboundMessageSourceCall()
+{
+    String call = String(config.msg_mycall);
+    call.trim();
+    call.toUpperCase();
+    if (call.length() == 0)
+    {
+        call = String(config.aprs_mycall);
+        call.trim();
+        call.toUpperCase();
+    }
+    if (call.indexOf('-') >= 0)
+        return call;
+    if (config.aprs_ssid > 0)
+        call += "-" + String((unsigned)config.aprs_ssid);
+    return call;
+}
+
 // ===== ส่งข้อความ APRS =====
 void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, const char *pathOverride)
 {
@@ -414,16 +432,7 @@ void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, 
     if (message == "")
         return;
 
-    // Normalize FROM callsign (mycall) and append the configured SSID so
-    // messages go out as e.g. M7JVI-1, not the legacy bare M7JVI.  The
-    // chat UI's identity setter mirrors aprs_ssid across all roles.
-    String myCallUP = String(config.msg_mycall);
-    myCallUP.trim();
-    myCallUP.toUpperCase();
-    if (config.aprs_ssid > 0) {
-        myCallUP += "-";
-        myCallUP += String((unsigned)config.aprs_ssid);
-    }
+    String myCallUP = outboundMessageSourceCall();
 
     // Normalize TO callsign
     String toCallUP = toCall;
@@ -505,7 +514,7 @@ void sendAPRSMessageRetry()
                 encrypted = String(msgQueue[i].text);
             }
             String path = messagePathFromOverride(msgQueue[i].path);
-            String packet = String(config.msg_mycall) + ">APE32L" + path + "::" + String(toCallFixed) + ":" + encrypted + "{" + String(msgQueue[i].msgID);
+            String packet = outboundMessageSourceCall() + ">APE32L" + path + "::" + String(toCallFixed) + ":" + encrypted + "{" + String(msgQueue[i].msgID);
             uint8_t SendMode = 0;
             if (config.msg_rf)
                 SendMode |= RF_CHANNEL;
@@ -540,7 +549,7 @@ void sendAPRSAck(const String &toCall, const String &msgNo)
         path += getPath(config.msg_path);
     }
 
-    String packet = String(config.msg_mycall) + ">APE32L" + path + "::" + String(toCallFixed) + ":ack" + msgNo;
+    String packet = outboundMessageSourceCall() + ">APE32L" + path + "::" + String(toCallFixed) + ":ack" + msgNo;
     uint8_t SendMode = 0;
     if (config.msg_rf)
         SendMode |= RF_CHANNEL;
