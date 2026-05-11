@@ -738,6 +738,13 @@ static void sendEmbeddedAssetGz(AsyncWebServerRequest *request,
 	}
 	response->addHeader("Content-Encoding", "gzip");
 	response->addHeader("Cache-Control", "no-cache, must-revalidate");
+	// Force the connection to close after each chat-UI asset.  Earlier
+	// debug runs showed bytes from a previous response leaking into the
+	// next one on a kept-alive socket (client gets HTTP/0.9 because the
+	// status line is mid-body of the previous response).  Closing per
+	// request side-steps that and keeps the AsyncTCP slot table healthier
+	// — chat-UI assets are tiny so keep-alive isn't a meaningful win here.
+	response->addHeader("Connection", "close");
 	request->send(response);
 }
 
