@@ -862,11 +862,86 @@ static size_t json_escape_into(char *dst, size_t cap, const char *src)
 // Called from main.cpp:pkgListUpdate() once per received packet (RF or INET).
 // Increments the RX counter and, when at least one EventSource client is
 // listening, pushes a compact JSON event so the chat UI can show it instantly.
+// ---- Per-packet FIFO history shared across all browser sessions ----------
+//
+// pkgList is a callsign-keyed ring (one slot per src callsign) — useful for
+// the "last heard" view but lossy as a chat timeline: 50 messages from the
+// same station collapse into a single slot with an incremented packet
+// counter.  And it never holds our own self-TX.
+//
+// To give every browser the same picture of recent traffic, keep a separate
+// chronological FIFO that records every packet (RX and self-TX) verbatim.
+// Bigger ring + no dedup means a fresh page load sees the same history that
+// already-open sessions saw — modulo entries that have aged out of the FIFO.
+//
+// Allocated lazily after webService() / AsyncTCP have started so the ring
+// doesn't compete with AsyncTCP's task stack for DRAM at boot
+// (`AsyncTCP begin(): failed to start task` if the static reservation is
+// too aggressive on the kv4p-ht's 124 KB DRAM budget).  Prefers PSRAM
+// when present.
+#define HIST_RING_SIZE_DEFAULT 80
+#define HIST_RAW_MAX 256
+struct HistEntry {
+	time_t  ts;
+	int8_t  channel;     // 0 = RF, 1 = INET
+	int16_t audio;
+	uint8_t dir;         // 0 = rx, 1 = tx
+	char    raw[HIST_RAW_MAX];
+};
+static HistEntry *histRing = nullptr;
+static uint16_t  histRingCap = 0;
+static uint16_t  histNext  = 0;  // next slot to overwrite
+static uint16_t  histCount = 0;  // valid entries (caps at histRingCap)
+static portMUX_TYPE histMux = portMUX_INITIALIZER_UNLOCKED;
+
+void histRingInit()
+{
+	if (histRing) return;
+	uint16_t cap = HIST_RING_SIZE_DEFAULT;
+#ifdef BOARD_HAS_PSRAM
+	histRing = (HistEntry *)ps_calloc(cap, sizeof(HistEntry));
+#endif
+	if (!histRing) {
+		// No PSRAM, or PSRAM allocation failed.  Try DRAM at full size,
+		// then back off to half if that fails — better a smaller ring than
+		// a crashed AsyncTCP.
+		histRing = (HistEntry *)calloc(cap, sizeof(HistEntry));
+		if (!histRing) {
+			cap = HIST_RING_SIZE_DEFAULT / 2;
+			histRing = (HistEntry *)calloc(cap, sizeof(HistEntry));
+		}
+	}
+	histRingCap = histRing ? cap : 0;
+	log_i("packet history ring: %u entries (%u bytes)",
+	      (unsigned)histRingCap, (unsigned)(histRingCap * sizeof(HistEntry)));
+}
+
+static void histPush(const char *raw, int channel, int audioLvl, bool tx)
+{
+	if (!histRing || histRingCap == 0) return;
+	portENTER_CRITICAL(&histMux);
+	HistEntry &e = histRing[histNext];
+	e.ts = time(NULL);
+	e.channel = (int8_t)channel;
+	e.audio   = (int16_t)audioLvl;
+	e.dir     = tx ? 1 : 0;
+	strlcpy(e.raw, raw, sizeof(e.raw));
+	histNext = (histNext + 1) % histRingCap;
+	if (histCount < histRingCap) histCount++;
+	portEXIT_CRITICAL(&histMux);
+}
+
 void publishRawPacket(const char *raw, int channel, int audioLvl, bool tx)
 {
 	if (!tx) g_rxPacketCount++;
 	if (raw == nullptr || raw[0] == 0)
 		return;
+	// Record into the chronological FIFO so /api/packets/recent returns the
+	// same view to every connecting browser (and survives page reloads from
+	// any client).  The FIFO doesn't dedup by callsign — every packet is
+	// kept; oldest evicted first when the ring fills.
+	histPush(raw, channel, audioLvl, tx);
+
 	// Fan out to outbound webhooks regardless of whether a browser is watching
 	// the SSE — webhook_enqueue() is cheap when no slot is enabled.  We don't
 	// fan out our own self-TX (you don't want a Telegram bot echoing your own
@@ -1445,8 +1520,16 @@ void api_me(AsyncWebServerRequest *request)
 	request->send(r);
 }
 
-// GET /api/packets/recent — last N stored packets (most recent first), used
-// to hydrate the chat list when the page loads / reconnects.
+// GET /api/packets/recent — chronological replay of the chat history FIFO.
+//
+// Sources from the histRing populated by publishRawPacket() (every RX and
+// every self-TX, no callsign-keyed dedup) so two browsers opening the page
+// at different moments see the same content for the overlapping window.
+// Newest entries are emitted first; the browser reverses on hydrate.
+//
+// Optional ?since=<unix_ts> query returns only entries strictly newer than
+// that — useful for a polling client that wants to catch up after a
+// disconnect without re-downloading what it already has.
 void api_packets_recent(AsyncWebServerRequest *request)
 {
 	AsyncResponseStream *s = request->beginResponseStream("application/json");
@@ -1457,49 +1540,36 @@ void api_packets_recent(AsyncWebServerRequest *request)
 	}
 	s->addHeader("Cache-Control", "no-cache");
 
-	// Collect non-empty entries with their times so we can sort newest-first
-	// without copying the raw payloads (just indices).
-	struct IdxTime { int idx; time_t t; };
-	IdxTime entries[PKGLISTSIZE];
-	int n = 0;
-	for (int i = 0; i < PKGLISTSIZE; i++)
-	{
-		pkgListType pkg = getPkgList(i);
-		if (pkg.time > 0 && pkg.raw && pkg.raw[0])
-		{
-			entries[n].idx = i;
-			entries[n].t = pkg.time;
-			n++;
-		}
-	}
-	// Simple insertion sort — PKGLISTSIZE is small (20-30).
-	for (int i = 1; i < n; i++)
-	{
-		IdxTime k = entries[i];
-		int j = i - 1;
-		while (j >= 0 && entries[j].t < k.t)
-		{
-			entries[j + 1] = entries[j];
-			j--;
-		}
-		entries[j + 1] = k;
-	}
+	time_t since = 0;
+	if (request->hasParam("since"))
+		since = (time_t)atoll(request->getParam("since")->value().c_str());
+
+	// Snapshot the ring under the spinlock so a concurrent push doesn't
+	// shift indices mid-iteration; copying just the indices keeps the
+	// critical section short.
+	uint16_t snapNext, snapCount;
+	portENTER_CRITICAL(&histMux);
+	snapNext  = histNext;
+	snapCount = histCount;
+	portEXIT_CRITICAL(&histMux);
 
 	s->print('[');
 	bool first = true;
 	char esc[360];
-	for (int i = 0; i < n; i++)
+	// Walk newest → oldest.  histNext points at the next slot to overwrite,
+	// so the newest is at (histNext - 1) modulo HIST_RING_SIZE.
+	for (uint16_t i = 0; i < snapCount; i++)
 	{
-		pkgListType pkg = getPkgList(entries[i].idx);
-		if (pkg.raw == nullptr || pkg.raw[0] == 0)
-			continue;
-		if (!first)
-			s->print(',');
+		uint16_t idx = (snapNext + histRingCap - 1 - i) % histRingCap;
+		const HistEntry &e = histRing[idx];
+		if (e.ts == 0 || e.raw[0] == 0) continue;
+		if (since && e.ts <= since)    continue;
+		if (!first) s->print(',');
 		first = false;
-		json_escape_into(esc, sizeof(esc), pkg.raw);
-		s->printf("{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"raw\":\"%s\"}",
-				  (long long)pkg.time, (int)pkg.channel,
-				  (int)pkg.audio_level, esc);
+		json_escape_into(esc, sizeof(esc), e.raw);
+		s->printf("{\"ts\":%lld,\"ch\":%d,\"audio\":%d,\"dir\":\"%s\",\"raw\":\"%s\"}",
+				  (long long)e.ts, (int)e.channel, (int)e.audio,
+				  e.dir ? "tx" : "rx", esc);
 	}
 	s->print(']');
 	request->send(s);
@@ -13813,4 +13883,8 @@ void webService()
 	async_websocket.addHandler(&ws_gnss);
 	async_server.addHandler(&ws_audio);
 	async_websocket.begin();
+	// Allocate the chat-history FIFO ring after the AsyncTCP tasks are up,
+	// so AsyncTCP gets first dibs on the limited DRAM the kv4p-ht has
+	// (otherwise the static reservation can starve AsyncTCP at boot).
+	histRingInit();
 }
