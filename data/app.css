@@ -93,6 +93,8 @@ a{color:#58a6ff;text-decoration:none}
 .msg .head .status.ok{color:#2ea043}
 .msg .head .status.warn{color:#f0883e}
 .msg .head .status.err{color:#f85149}
+/* Inbound bubble we've already ACK'd back to the sender — left border accent. */
+.msg.acked{border-left:3px solid #2ea043}
 .msg .body{margin-top:2px;white-space:pre-wrap;word-break:break-word}
 .msg .body .coords{display:inline-block;margin-top:6px;color:#58a6ff;font-variant-numeric:tabular-nums}
 .mini-map{

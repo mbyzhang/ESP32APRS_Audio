@@ -255,6 +255,55 @@ const filterState = { text: '', mode: 'any' };
 const allPackets  = [];      // ring of every packet we've seen, for re-filter
 const ALL_MAX     = 600;
 
+// Flip a TX/RX bubble's badge in response to an ack packet.
+//
+//   Inbound  ack:  someone is acknowledging our outbound message.  The body
+//                  is "ack<msgID>" addressed to us.  We mark the matching
+//                  outbound bubble (data-msgid==msgID) as "✓✓ ack".
+//   Outbound ack:  we just acknowledged someone else's message (firmware
+//                  does this automatically).  Body is "ack<msgID>" to
+//                  the other station.  We tag their original incoming bubble
+//                  with a small "✓ ack'd" marker so the user can tell.
+function handleAckPacket(parsed) {
+  const m = (parsed.message || '').match(/^ack(\d+)/i);
+  if (!m) return;
+  const ackId = m[1];
+  const me = (fullCall() || '').toUpperCase();
+  if (parsed.dir === 'tx') {
+    // We sent this ack — find the inbound bubble we're acking.
+    const peer = (parsed.addressee || '').toUpperCase();
+    for (const el of feed.querySelectorAll('.msg:not(.me)[data-msgid]')) {
+      if (el.dataset.msgid !== ackId) continue;
+      const head = el.querySelector('.head .src');
+      // Match against the source callsign on the bubble (case-insensitive,
+      // tolerate SSID variations like FOO and FOO-1).
+      const src = (head?.textContent || '').toUpperCase();
+      if (!src.startsWith(peer.split('-')[0])) continue;
+      el.classList.add('acked');
+      const status = el.querySelector('.head .status');
+      if (status && !status.dataset.ackOurs) {
+        status.textContent += ' · ✓ ack\'d';
+        status.dataset.ackOurs = '1';
+      }
+      break;
+    }
+    return;
+  }
+  // Inbound ack addressed to us — mark our matching TX bubble.
+  if ((parsed.addressee || '').toUpperCase() !== me) return;
+  for (const el of feed.querySelectorAll('.msg.me[data-msgid]')) {
+    if (el.dataset.msgid !== ackId) continue;
+    const status = el.querySelector('.status');
+    if (statusEl(el)) {
+      statusEl(el).textContent = '✓✓ ack';
+      statusEl(el).className = 'status ok';
+    }
+    el.dataset.status = 'acked';
+    break;
+  }
+}
+function statusEl(el) { return el.querySelector('.head .status'); }
+
 function packetMatchesFilter(parsed) {
   // Never hide our own outbound messages; delivery status has to remain
   // visible even while the user is filtering the receive feed.
@@ -311,6 +360,14 @@ function renderPacketInternal(pkt, recordSideEffects) {
   // want to re-record points every time the filter is toggled.
   if (recordSideEffects) recordTrackPoint(parsed);
 
+  // ACK folding.  An APRS message body of "ack<NNN>" is a delivery
+  // acknowledgement, not a real conversational message — render it as a
+  // status update on the original bubble instead of as its own line.
+  if (parsed.type === 'message' && /^ack\d+/i.test(parsed.message || '')) {
+    handleAckPacket(parsed);
+    return;
+  }
+
   if (!packetMatchesFilter(parsed)) return;
 
   const wasAtBottom = isAtBottom();
@@ -360,13 +417,13 @@ function renderPacketInternal(pkt, recordSideEffects) {
     body = escapeHtml(parsed.info || pkt.raw);
   }
 
-  // Mark TX message bubbles with their APRS msgID so the pending-status
-  // poller can later flip the badge from "sent" → "✓✓ ack'd" / "retry 2/3"
-  // / "failed".  The msgID comes out of parseTnc2's parsing of the {NNN
-  // trailer on the message line.
-  if (parsed.dir === 'tx' && isMsg && parsed.msgid) {
+  // Stamp the bubble with its APRS msgID so later ack handling can find it.
+  // For our own outbound messages the poller flips the badge to ack'd /
+  // retry / failed.  For inbound messages we use it to add a "✓ ack'd"
+  // marker once we've sent the ack back.
+  if (isMsg && parsed.msgid) {
     el.dataset.msgid = String(parsed.msgid);
-    el.dataset.status = 'sent';
+    if (parsed.dir === 'tx') el.dataset.status = 'sent';
   }
 
   el.innerHTML =
@@ -1149,9 +1206,10 @@ const VoiceFM = (() => {
 
   function wsUrl() {
     const proto = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
-    // The audio WS lives on port 81 (async_websocket).  Use explicit port
-    // so the chat UI (port 80) can reach it from the same origin.
-    return `${proto}${location.hostname}:81/ws_audio`;
+    // ws_audio is registered on the main async_server (port 80), not the
+    // sidecar async_websocket on 81 — the legacy /audio settings page also
+    // uses location.host (no explicit port) so we match that.
+    return `${proto}${location.host}/ws_audio`;
   }
 
   async function startMonitor() {
