@@ -387,6 +387,24 @@ int pkgMsgUpdate(const char *call, const char *raw, uint16_t msg_id, int8_t ack,
     return i;
 }
 
+// Return true only for addressees that can validly receive an APRS message
+// ACK.  Broadcast / bulletin / telemetry destinations (CQ, QST, BLN…,
+// telemetry T#…) are protocol-defined as "no ACK expected" — sending one
+// would be wasted air time, and queueing retries against them would
+// silently retransmit a CQ N times waiting for an ACK that never comes.
+static bool isAckCapableAddressee(const String &toCall)
+{
+    String t = toCall;
+    t.trim();
+    t.toUpperCase();
+    if (t.length() == 0)             return false;
+    if (t == "CQ")                   return false;
+    if (t == "QST")                  return false;
+    if (t.startsWith("BLN"))         return false;  // BLNxNNNN bulletins
+    if (t.length() >= 2 && t[0] == 'T' && t[1] == '#') return false; // telemetry
+    return true;
+}
+
 // ===== ส่งข้อความ APRS =====
 void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, const char *pathOverride)
 {
@@ -446,10 +464,15 @@ void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, 
         SendMode |= INET_CHANNEL;
     pkgTxPush(packet.c_str(), packet.length(), 0, SendMode);
     log_d("Send APRS Message to %s msgID %d TNC2: %s", toCall.c_str(), msgID, packet.c_str());
-    if (config.msg_retry == 0)
-        pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, -2, false, pathOverride); // -2=No retry
-    else
-        pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, config.msg_retry, false, pathOverride);
+    // Broadcast / bulletin / telemetry destinations don't ACK — record the
+    // message in the queue as ack=-2 (already acknowledged, no retry) so
+    // sendAPRSMessageRetry() won't retransmit it, and the chat UI's
+    // pending-status poller renders it as "✓ sent" instead of "retry 1/3".
+    bool ackable = isAckCapableAddressee(toCallUP);
+    int8_t initialAck = (!ackable || config.msg_retry == 0)
+                          ? -2
+                          : (int8_t)config.msg_retry;
+    pkgMsgUpdate(toCall.c_str(), message.c_str(), msgID, initialAck, false, pathOverride);
     event_chatMessage(false);
     // log_d(">> " + packet);
 }

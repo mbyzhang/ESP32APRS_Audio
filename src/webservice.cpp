@@ -684,6 +684,7 @@ void handle_css(AsyncWebServerRequest *request)
 // Transparently prefers a "<path>.gz" sibling and sets Content-Encoding: gzip
 // so we can ship pre-compressed JS/CSS without spending RAM on runtime gzip.
 #include "embedded_ui.h"
+#include "build_info.h"
 
 // Serve the chat UI from in-firmware blobs.
 //
@@ -1407,6 +1408,24 @@ void api_time_set(AsyncWebServerRequest *request)
 			 "{\"ok\":true,\"epoch\":%lld,\"timeZone\":%.2f}",
 			 (long long)time(NULL), (double)config.timeZone);
 	request->send(200, "application/json", buf);
+}
+
+// GET /api/version — build metadata.  Lets the chat UI display the commit
+// it's running against and detect when the browser is showing stale
+// cached HTML (the browser remembers BUILD_COMMIT across loads via
+// localStorage and warns when /api/version returns a different one).
+void api_version(AsyncWebServerRequest *request)
+{
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+			 "{\"commit\":\"%s\",\"commit_full\":\"%s\","
+			 "\"branch\":\"%s\",\"build_time\":\"%s\","
+			 "\"version\":\"%s\"}",
+			 BUILD_COMMIT, BUILD_COMMIT_FULL, BUILD_BRANCH,
+			 BUILD_TIME, VERSION);
+	AsyncWebServerResponse *r = request->beginResponse(200, "application/json", buf);
+	r->addHeader("Cache-Control", "no-cache");
+	request->send(r);
 }
 
 // GET /api/me — small JSON status doc consumed by the mobile UI on load.
@@ -13607,6 +13626,8 @@ void webService()
 	// JSON API for the new mobile UI
 	async_server.on("/api/me", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ api_me(request); });
+	async_server.on("/api/version", HTTP_GET, [](AsyncWebServerRequest *request)
+					{ api_version(request); });
 	async_server.on("/healthz", HTTP_GET, [](AsyncWebServerRequest *request)
 					{ api_healthz(request); });
 	async_server.on("/api/packets/recent", HTTP_GET, [](AsyncWebServerRequest *request)

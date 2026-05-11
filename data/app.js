@@ -423,7 +423,20 @@ function renderPacketInternal(pkt, recordSideEffects) {
   // marker once we've sent the ack back.
   if (isMsg && parsed.msgid) {
     el.dataset.msgid = String(parsed.msgid);
-    if (parsed.dir === 'tx') el.dataset.status = 'sent';
+    if (parsed.dir === 'tx') {
+      el.dataset.status   = 'sent';
+      // Cache to/text on the bubble so a later "Retry" click (after the
+      // firmware exhausts its retries and the poller flips status=failed)
+      // can resend the exact same APRS message without us having to track
+      // it elsewhere.
+      el.dataset.retryTo   = (parsed.addressee || '').trim();
+      el.dataset.retryText = parsed.message || '';
+    }
+  }
+  // Inbound message bubbles: stash sender callsign so a tap can open a
+  // reply pre-addressed to them.
+  if (isMsg && parsed.dir !== 'tx') {
+    el.dataset.replyTo = parsed.src || '';
   }
 
   el.innerHTML =
@@ -721,6 +734,57 @@ function updatePendingMessageStatus(entry) {
   statusEl.textContent = label;
   statusEl.className = 'status ' + cls;
   el.dataset.status = entry.status || 'pending';
+
+  // Attach (or remove) the Retry button on failed bubbles.  We remember
+  // the original to/text in dataset so a Retry click can resend the same
+  // message — the firmware assigns a fresh msgID, and the bubble's
+  // msgID/status get rewritten when the new TX comes back through SSE.
+  if (entry.status === 'failed') {
+    el.classList.add('failed');
+    if (!el.querySelector('.retry-btn')) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'retry-btn';
+      btn.textContent = 'Retry';
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const to   = el.dataset.retryTo   || entry.to;
+        const text = el.dataset.retryText || entry.text;
+        if (!to || !text) return;
+        btn.disabled = true; btn.textContent = 'retrying…';
+        retrySendMessage(to, text, el);
+      });
+      el.appendChild(btn);
+    }
+  } else {
+    el.classList.remove('failed');
+    const existing = el.querySelector('.retry-btn');
+    if (existing) existing.remove();
+  }
+}
+
+// Resend an outbound message that previously failed (retries exhausted).
+// The firmware allocates a new msgID, so the bubble we're retrying gets
+// its data-msgid updated when the new TX echo comes back via SSE.
+async function retrySendMessage(to, text, bubble) {
+  const r = await postForm('/api/tx/message', { to, text });
+  const newId = r.body && r.body.msgID != null ? String(r.body.msgID) : null;
+  if (newId) {
+    bubble.dataset.msgid  = newId;
+    bubble.dataset.status = 'pending';
+    bubble.classList.remove('failed');
+    const statusEl = bubble.querySelector('.status');
+    if (statusEl) {
+      statusEl.textContent = 'retry → sent';
+      statusEl.className   = 'status warn';
+    }
+    const btn = bubble.querySelector('.retry-btn');
+    if (btn) btn.remove();
+    setTimeout(pollPendingMessages, 400);
+  } else {
+    const btn = bubble.querySelector('.retry-btn');
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+  }
 }
 
 // Adaptive pending-poll: only burn requests when there's actually an
@@ -1473,6 +1537,54 @@ filterIn.addEventListener('input', applyFilter);
 filterMode.addEventListener('change', applyFilter);
 filterClr.addEventListener('click', () => { filterIn.value = ''; applyFilter(); filterIn.focus(); });
 
+// ---------- Click an inbound message → start a reply ----------------------
+// Tap any received bubble to address a fresh outbound message back to the
+// sender.  We deliberately do NOT auto-ACK on click — the firmware sends
+// the protocol-level ACK on RX automatically, the user tap is just for
+// composing a reply.
+feed.addEventListener('click', (ev) => {
+  const bubble = ev.target.closest('.msg:not(.me)');
+  if (!bubble) return;
+  // Ignore clicks on links / interactive children inside the bubble.
+  if (ev.target.closest('a, button, input, select, textarea')) return;
+  const to = bubble.dataset.replyTo;
+  if (!to) return;
+  toCall.value = to.toUpperCase();
+  msgIn.focus();
+});
+
+// ---------- Version / stale-build footer -----------------------------------
+// Show the deployed firmware's commit + build time at the bottom of the page,
+// and detect when the browser is running stale cached HTML against a newer
+// firmware (commit fetched from /api/version != commit we remember from
+// last successful load).
+async function checkBuildVersion() {
+  const el = $('#buildInfo');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/version', { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    const v = await r.json();
+    const ts = (v.build_time || '').replace('T', ' ').replace('Z', ' UTC');
+    el.textContent = `build ${v.commit || '?'} · ${v.branch || ''} · ${ts}`;
+
+    const known = localStorage.getItem('aprs-known-commit') || '';
+    if (known && v.commit && known !== v.commit) {
+      el.classList.add('stale');
+    } else {
+      el.classList.remove('stale');
+    }
+    if (v.commit) localStorage.setItem('aprs-known-commit', v.commit);
+  } catch (e) {
+    el.textContent = 'build ? (offline)';
+  }
+}
+$('#buildInfo').addEventListener('click', () => {
+  // Click the footer to re-check and force a hard reload if the build differs.
+  localStorage.removeItem('aprs-known-commit');
+  location.reload();
+});
+
 // ---------- Voice panel wiring -------------------------------------------
 const voicePanel = $('#voicePanel');
 $('#voiceBtn').addEventListener('click', () => {
@@ -1531,6 +1643,9 @@ document.addEventListener('click', (e) => {
   //                  heap with 1200 requests/hour.
   setInterval(loadMe,   60_000);
   setInterval(loadRadio, 15_000);
+  // Show deployed build info + warn if browser HTML is stale vs firmware.
+  checkBuildVersion();
+  setInterval(checkBuildVersion, 5 * 60_000);
   // Fast tick only while Station sheet is open — observe via the open/close
   // events on #stationBtn so we don't have to monkey-patch openStation().
   let fastRadioTimer = null;

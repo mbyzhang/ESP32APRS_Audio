@@ -157,6 +157,7 @@ String event_chatMessage(bool gethtml=false);
 void publishRawPacket(const char *raw, int channel, int audioLvl, bool tx = false);
 void serveStaticChatUI(AsyncWebServerRequest *request, const char *path, const char *mime);
 void api_me(AsyncWebServerRequest *request);
+void api_version(AsyncWebServerRequest *request);
 void api_packets_recent(AsyncWebServerRequest *request);
 void api_tx_message(AsyncWebServerRequest *request);
 void api_tx_position(AsyncWebServerRequest *request);

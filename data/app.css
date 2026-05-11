@@ -141,6 +141,21 @@ a{color:#58a6ff;text-decoration:none}
   font-size:11px;padding:2px 12px 6px;background:#0d1117;color:#7d8590;
   display:flex;justify-content:space-between
 }
+#buildInfo{
+  font-size:10px;padding:2px 12px 6px;background:#0d1117;color:#6e7681;
+  font-variant-numeric:tabular-nums;cursor:pointer;
+  text-align:right
+}
+#buildInfo.stale{color:#f0883e}
+#buildInfo.stale::after{content:" ⚠ refresh page"}
+.msg.failed{border-left:3px solid #f85149}
+.msg .retry-btn{
+  margin-top:6px;background:#21262d;border:1px solid #f85149;color:#f85149;
+  border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;align-self:flex-end
+}
+.msg .retry-btn:active{background:#f8514922}
+.msg:not(.me){cursor:pointer}
+.msg:not(.me):active{filter:brightness(1.15)}
 #status.warn{color:#f0883e}
 #status.ok{color:#2ea043}
 #status.err{color:#f85149}
