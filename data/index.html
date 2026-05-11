@@ -72,9 +72,17 @@
         </label>
         <label style="flex:0 0 auto">modem
           <select id="stModem" title="AFSK demodulator tone set">
-            <option value="0">300 baud</option>
-            <option value="1">Bell 202 1200 (APRS)</option>
-            <option value="2">CCITT V.23 1200</option>
+            <!-- Values MUST match the ModemType enum in
+                 lib/LibAPRS_ESP32/modem.h:
+                   0 = MODEM_1200      (Bell 202, 1200/2200 Hz – APRS)
+                   1 = MODEM_1200_V23  (CCITT V.23, 1300/2100 Hz)
+                   2 = MODEM_300
+                   3 = MODEM_9600      (G3RUH)
+                 An earlier edit had these labels off by one which made
+                 users pick "Bell 202" and end up on V.23 (no RX). -->
+            <option value="0">Bell 202 1200 (APRS)</option>
+            <option value="1">CCITT V.23 1200</option>
+            <option value="2">300 baud</option>
             <option value="3">9600 baud G3RUH</option>
           </select>
         </label>

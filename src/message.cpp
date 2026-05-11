@@ -396,10 +396,16 @@ void sendAPRSMessage(const String &toCall, const String &message, bool encrypt, 
     if (message == "")
         return;
 
-    // Normalize FROM callsign (mycall)
+    // Normalize FROM callsign (mycall) and append the configured SSID so
+    // messages go out as e.g. M7JVI-1, not the legacy bare M7JVI.  The
+    // chat UI's identity setter mirrors aprs_ssid across all roles.
     String myCallUP = String(config.msg_mycall);
     myCallUP.trim();
     myCallUP.toUpperCase();
+    if (config.aprs_ssid > 0) {
+        myCallUP += "-";
+        myCallUP += String((unsigned)config.aprs_ssid);
+    }
 
     // Normalize TO callsign
     String toCallUP = toCall;
