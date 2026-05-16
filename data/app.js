@@ -172,15 +172,19 @@ async function loadPersistedPackets(limit = PACKETS_KEEP) {
     try {
       const tx = db.transaction('packets', 'readonly');
       const idx = tx.objectStore('packets').index('byTs');
-      idx.openCursor().onsuccess = (ev) => {
+      // Load newest first, then restore chronological order for rendering.
+      // The old forward cursor stopped after the first 500 rows, which meant
+      // a long-lived browser replayed stale history and never reached recent
+      // messages.
+      idx.openCursor(null, 'prev').onsuccess = (ev) => {
         const c = ev.target.result;
-        if (!c) return resolve(out);
+        if (!c) return resolve(out.reverse());
         out.push(c.value);
-        if (out.length >= limit) return resolve(out);
+        if (out.length >= limit) return resolve(out.reverse());
         c.continue();
       };
-      tx.onerror = () => resolve(out);
-    } catch (_) { resolve(out); }
+      tx.onerror = () => resolve(out.reverse());
+    } catch (_) { resolve(out.reverse()); }
   });
 }
 async function recordTrackPoint(pkt) {
@@ -403,6 +407,20 @@ function renderPacketInternal(pkt, recordSideEffects) {
   if (parsed.dir === 'tx' && isMsg && parsed.msgid) {
     const existing = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(String(parsed.msgid))}"]`);
     if (existing) return;
+    const local = findLocalPendingMessage({ to: parsed.addressee, text: parsed.message || '' });
+    if (local) {
+      local.dataset.msgid = String(parsed.msgid);
+      delete local.dataset.localPending;
+      updatePendingMessageStatus({
+        msgID: parsed.msgid,
+        status: 'pending',
+        to: parsed.addressee,
+        text: parsed.message || '',
+        retries_left: null,
+        retries_total: null,
+      });
+      return;
+    }
   }
   const headRight = headLabelForPacket(pkt);
 
@@ -431,6 +449,7 @@ function renderPacketInternal(pkt, recordSideEffects) {
       // it elsewhere.
       el.dataset.retryTo   = (parsed.addressee || '').trim();
       el.dataset.retryText = parsed.message || '';
+      el.dataset.retryPath = parsed.path || '';
     }
   }
   // Inbound message bubbles: stash sender callsign so a tap can open a
@@ -537,14 +556,17 @@ async function hydrate() {
   // 2. Then ask the device for its in-RAM RX ring; dedupe is handled by the
   //    `seen` Set inside renderPacket().
   try {
-    const r = await fetch('/api/packets/recent');
-    if (r.ok) {
-      const arr = await r.json();
-      arr.reverse().forEach((pkt) => renderPacket(pkt));
-    }
+    await catchUpRecentPackets();
   } catch (_) {}
 
   feed.scrollTop = feed.scrollHeight;
+}
+
+async function catchUpRecentPackets() {
+  const r = await fetch('/api/packets/recent', { cache: 'no-store' });
+  if (!r.ok) return;
+  const arr = await r.json();
+  arr.reverse().forEach((pkt) => renderPacket(pkt));
 }
 
 let es;
@@ -559,6 +581,11 @@ function connectStream() {
       renderPacket(pkt);
     } catch (_) {}
   });
+}
+
+function scheduleRecentCatchUp() {
+  catchUpRecentPackets().catch(() => {});
+  setTimeout(scheduleRecentCatchUp, document.hidden ? 60_000 : 20_000);
 }
 
 // ---------- TX -------------------------------------------------------------
@@ -611,14 +638,33 @@ async function sendCurrentMessage() {
   const to   = (toCall.value || '').trim().toUpperCase();
   const text = (msgIn.value  || '').trim();
   if (!to || !text) return;
+  const localId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  renderPendingMessage({
+    msgID: localId,
+    to,
+    text,
+    status: 'local-pending',
+    ack: null,
+    ts: Math.floor(Date.now() / 1000),
+    retries_left: null,
+    retries_total: null,
+    path: selectedPath,
+    local: true,
+  });
+  msgIn.value = '';
   sendBtn.disabled = true;
   setStatus('sending…', 'warn');
-  const res = await postForm('/api/tx/message', { to, text, path: selectedPath });
+  let res;
+  try {
+    res = await postForm('/api/tx/message', { to, text, path: selectedPath });
+  } catch (err) {
+    res = { ok: false, status: 0, err };
+  }
   sendBtn.disabled = false;
   if (res.ok) {
     setStatus('sent', 'ok');
     if (res.body?.msgID) {
-      renderPendingMessage({
+      promoteLocalPendingMessage(localId, {
         msgID: res.body.msgID,
         to,
         text,
@@ -630,13 +676,13 @@ async function sendCurrentMessage() {
         path: selectedPath,
       });
     }
-    msgIn.value = '';
     // Kick the pending-status poller so the just-sent bubble gets its
     // retry/ack badge populated quickly instead of waiting for the next
     // periodic tick.
     setTimeout(pollPendingMessages, 400);
   } else {
-    setStatus('send failed (' + res.status + ')', 'err');
+    markLocalPendingApiFailed(localId, res.status);
+    setStatus(res.status ? `send failed (${res.status})` : 'send failed: API offline', 'err');
   }
 }
 
@@ -706,7 +752,11 @@ function renderPendingMessage(entry) {
       audio: 0,
       dir: 'tx',
       raw: txRawFromPending(entry),
-    });
+    }, entry.local ? { skipPersist: true } : {});
+  }
+  if (entry.local) {
+    const el = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(id)}"]`);
+    if (el) el.dataset.localPending = '1';
   }
   updatePendingMessageStatus(entry);
 }
@@ -724,6 +774,12 @@ function updatePendingMessageStatus(entry) {
   } else if (entry.status === 'failed') {
     label = '✗ failed';
     cls   = 'err';
+  } else if (entry.status === 'api-failed') {
+    label = 'API failed';
+    cls   = 'err';
+  } else if (entry.status === 'local-pending') {
+    label = 'queued…';
+    cls   = 'warn';
   } else {
     const total = Number(entry.retries_total ?? 0);
     const left = Number(entry.retries_left ?? total);
@@ -739,7 +795,7 @@ function updatePendingMessageStatus(entry) {
   // the original to/text in dataset so a Retry click can resend the same
   // message — the firmware assigns a fresh msgID, and the bubble's
   // msgID/status get rewritten when the new TX comes back through SSE.
-  if (entry.status === 'failed') {
+  if (entry.status === 'failed' || entry.status === 'api-failed') {
     el.classList.add('failed');
     if (!el.querySelector('.retry-btn')) {
       const btn = document.createElement('button');
@@ -750,9 +806,10 @@ function updatePendingMessageStatus(entry) {
         ev.stopPropagation();
         const to   = el.dataset.retryTo   || entry.to;
         const text = el.dataset.retryText || entry.text;
+        const path = el.dataset.retryPath || entry.path || selectedPath;
         if (!to || !text) return;
         btn.disabled = true; btn.textContent = 'retrying…';
-        retrySendMessage(to, text, el);
+        retrySendMessage(to, text, path, el);
       });
       el.appendChild(btn);
     }
@@ -763,15 +820,56 @@ function updatePendingMessageStatus(entry) {
   }
 }
 
+function findLocalPendingMessage(entry) {
+  const to = String(entry.to || '').trim().toUpperCase();
+  const text = String(entry.text || '');
+  for (const el of feed.querySelectorAll('.msg.me[data-local-pending="1"]')) {
+    if ((el.dataset.retryTo || '').trim().toUpperCase() !== to) continue;
+    if ((el.dataset.retryText || '') !== text) continue;
+    return el;
+  }
+  return null;
+}
+
+function promoteLocalPendingMessage(localId, entry) {
+  const local = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(String(localId))}"]`) ||
+                findLocalPendingMessage(entry);
+  if (local) {
+    local.dataset.msgid = String(entry.msgID);
+    delete local.dataset.localPending;
+  }
+  renderPendingMessage(entry);
+}
+
+function markLocalPendingApiFailed(localId, statusCode) {
+  updatePendingMessageStatus({
+    msgID: localId,
+    status: 'api-failed',
+    retries_left: 0,
+    retries_total: 0,
+  });
+  const el = feed.querySelector(`.msg.me[data-msgid="${CSS.escape(String(localId))}"]`);
+  if (!el) return;
+  delete el.dataset.localPending;
+  const statusEl = el.querySelector('.status');
+  if (statusEl) statusEl.title = statusCode ? `HTTP ${statusCode}` : 'Could not reach /api/tx/message';
+}
+
 // Resend an outbound message that previously failed (retries exhausted).
 // The firmware allocates a new msgID, so the bubble we're retrying gets
 // its data-msgid updated when the new TX echo comes back via SSE.
-async function retrySendMessage(to, text, bubble) {
-  const r = await postForm('/api/tx/message', { to, text });
+async function retrySendMessage(to, text, path, bubble) {
+  let r;
+  try {
+    r = await postForm('/api/tx/message', { to, text, path });
+  } catch (err) {
+    r = { ok: false, status: 0, err };
+  }
   const newId = r.body && r.body.msgID != null ? String(r.body.msgID) : null;
-  if (newId) {
+  if (r.ok && newId) {
     bubble.dataset.msgid  = newId;
     bubble.dataset.status = 'pending';
+    bubble.dataset.retryPath = path || '';
     bubble.classList.remove('failed');
     const statusEl = bubble.querySelector('.status');
     if (statusEl) {
@@ -784,6 +882,12 @@ async function retrySendMessage(to, text, bubble) {
   } else {
     const btn = bubble.querySelector('.retry-btn');
     if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+    const statusEl = bubble.querySelector('.status');
+    if (statusEl) {
+      statusEl.textContent = r.status ? `send failed (${r.status})` : 'API failed';
+      statusEl.className = 'status err';
+    }
+    bubble.dataset.status = 'api-failed';
   }
 }
 
@@ -1635,6 +1739,7 @@ document.addEventListener('click', (e) => {
   await Promise.all([loadMe(), loadRadio()]);
   await hydrate();
   connectStream();
+  setTimeout(scheduleRecentCatchUp, 20_000);
   // Polling cadence:
   //   /api/me     — slow (heap/RX counter only changes meaningfully over
   //                  minutes).

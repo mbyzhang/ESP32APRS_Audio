@@ -4,9 +4,8 @@ build timestamp, so the firmware can advertise its version through
 /api/version and the chat UI can warn the user when the browser is
 running stale cached HTML.
 
-This script is idempotent: it does NOT rewrite the header if all three
-fields would be unchanged, so PlatformIO's incremental build doesn't
-recompile every dependent translation unit on every `pio run`.
+This script rewrites the header on every build so `/api/version` exposes
+the actual firmware build time, even when the git commit has not changed.
 
 Usage:
     python3 scripts/gen_build_info.py
@@ -53,14 +52,12 @@ def main():
         f'#define BUILD_TIME   "{build_time}"\n'
     )
 
-    # Skip rewriting if commit + branch haven't changed.  The build
-    # time always advances, so we only refresh when something else
-    # changed — keeps incremental builds fast.
+    # Rewrite whenever the generated body differs. BUILD_TIME changes on
+    # every run, intentionally making /api/version a reliable deploy marker.
     if os.path.isfile(OUT):
         with open(OUT) as f:
             existing = f.read()
-        if (f'#define BUILD_COMMIT "{commit}"' in existing and
-            f'#define BUILD_BRANCH "{branch}"'  in existing):
+        if existing == body:
             print(f"[build_info] unchanged ({commit} @ {branch})")
             return
 
